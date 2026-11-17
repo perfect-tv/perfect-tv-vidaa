@@ -11,6 +11,7 @@
 #include "core/relay.h"
 #include "core/ttx.h"
 #include "core/dvbsub.h"
+#include "core/cc.h"
 #include "core/webvtt.h"
 #include "core/util.h"
 #include "data/catchup.h"
@@ -1623,6 +1624,143 @@ static void test_webvtt(void) {
     EQI(vt_s[0], 90000);
 }
 
+/* ---------- закрытые субтитры CEA-608 / 708 ---------- */
+static uint8_t par(uint8_t b) { int n = 0; for (int i = 0; i < 7; i++) n += (b >> i) & 1; return (uint8_t)(b | (n % 2 ? 0 : 0x80)); }   /* нечётная чётность */
+/* кадр: одна пара 608 (поле f) и пустой 708 */
+static int64_t ccpts;
+static void f608(ccdec *d, int f, uint8_t b1, uint8_t b2) {
+    uint8_t t[3] = {(uint8_t)(0xFC | f), par(b1), par(b2)};
+    cc_feed(d, ccpts, t, 1);
+    ccpts += 3003;
+}
+static void ctl2(ccdec *d, uint8_t b1, uint8_t b2) { f608(d, 0, b1, b2); f608(d, 0, b1, b2); }   /* команды — дважды */
+static void txt608(ccdec *d, const char *s) { for (; *s; s += s[1] ? 2 : 1) f608(d, 0, (uint8_t)s[0], s[1] ? (uint8_t)s[1] : 0); }
+
+static void test_cc(void) {
+    ccdec *d = cc_new();
+    cc_show sh;
+    /* pop-on: текст копится в невидимой памяти, EOC — показать */
+    ccpts = 900000;
+    cc_select(d, CC_608, 1);
+    ctl2(d, 0x14, 0x20);           /* RCL */
+    ctl2(d, 0x14, 0x60);           /* PAC: строка 15, белый */
+    txt608(d, "HELLO");
+    ctl2(d, 0x11, 0x37);           /* ♪ */
+    int64_t before = ccpts;
+    ctl2(d, 0x14, 0x2F);           /* EOC */
+    int64_t shown = ccpts - 3003;  /* второй EOC — повтор, показ — по первому */
+    cc_flush(d);
+    CHECK(!cc_at(d, before - 1, &sh));
+    CHECK(cc_at(d, shown, &sh));
+    EQI(sh.n, 1);
+    EQS(sh.row[0].text, "HELLO♪");
+    CHECK(sh.row[0].y > 0.9f && sh.row[0].x == 0);
+    CHECK(cc_present608(d) == 1u);
+    /* roll-up на 2 строки, PAC с отступом 4, расширенный знак вместо предыдущего (e → É) */
+    ctl2(d, 0x14, 0x25);           /* RU2 (стирает показанное) */
+    ctl2(d, 0x14, 0x2D);           /* CR */
+    txt608(d, "AB");
+    ctl2(d, 0x14, 0x2D);
+    ctl2(d, 0x14, 0x72);           /* PAC строка 15, отступ 4 */
+    txt608(d, "Ce");
+    ctl2(d, 0x12, 0x21);           /* É */
+    cc_flush(d);
+    CHECK(cc_at(d, ccpts, &sh));
+    EQI(sh.n, 2);
+    if (sh.n == 2) {
+        EQS(sh.row[0].text, "AB");
+        EQS(sh.row[1].text, "CÉ");
+        CHECK(sh.row[1].x > 0.1f);   /* 4 из 32 */
+    }
+    /* EDM — пусто */
+    ctl2(d, 0x14, 0x2C);
+    cc_flush(d);
+    CHECK(!cc_at(d, ccpts, &sh));
+    /* CC3 во втором поле: замечен, а показ CC1 не трогает */
+    { uint8_t t[6] = {0xFD, par(0x15), par(0x20), 0xFD, par(0x15), par(0x20)}; cc_feed(d, ccpts, t, 2); ccpts += 3003; }
+    { uint8_t t[3] = {0xFD, par('X'), par('Y')}; cc_feed(d, ccpts, t, 1); ccpts += 3003; }
+    cc_flush(d);
+    EQI(cc_present608(d), 1u | 4u);
+    /* B-кадры: пары приходят не по порядку показа — склеиваются по PTS */
+    cc_select(d, CC_608, 1);
+    ccpts = 2000000;
+    ctl2(d, 0x14, 0x29);           /* RDC: сразу на экран */
+    ctl2(d, 0x14, 0x60);
+    int64_t p0 = ccpts;
+    uint8_t a[3] = {0xFC, par('A'), par('B')}, b[3] = {0xFC, par('C'), par('D')}, c[3] = {0xFC, par('E'), par('F')};
+    cc_feed(d, p0 + 6006, c, 1);
+    cc_feed(d, p0, a, 1);
+    cc_feed(d, p0 + 3003, b, 1);
+    cc_flush(d);
+    CHECK(cc_at(d, p0 + 6006, &sh) && !strcmp(sh.row[0].text, "ABCDEF"));
+    CHECK(cc_at(d, p0 + 3003, &sh) && !strcmp(sh.row[0].text, "ABCD"));
+    /* 708: окно 0 (видно, отн. позиция 90 % / 50 %, привязка — низ по центру, 2 × 32), текст, CR, ещё строка */
+    cc_select(d, CC_708, 1);
+    ccpts = 3000000;
+    uint8_t blk[] = {0x98, 0x20, 0x80 | 90, 50, (7 << 4) | 1, 31, 0, 'H', 'i', ' ', '7', '0', '8', 0x0D, 'L', 0xE9, 0x7F};
+    uint8_t pk[64] = {0};
+    int bl = (int)sizeof blk, tot = 2 + bl;
+    int code = (tot + 1) / 2;
+    pk[0] = (uint8_t)code;   /* последовательность 0, размер */
+    pk[1] = (uint8_t)(1 << 5 | bl);
+    memcpy(pk + 2, blk, (size_t)bl);
+    uint8_t tr[96];
+    int nt = 0;
+    for (int i = 0; i < code * 2; i += 2, nt++) { tr[nt * 3] = i ? 0xFE : 0xFF; tr[nt * 3 + 1] = pk[i]; tr[nt * 3 + 2] = pk[i + 1]; }
+    cc_feed(d, ccpts, tr, nt);
+    cc_flush(d);
+    CHECK(cc_present708(d) & 2);
+    CHECK(cc_at(d, ccpts, &sh));
+    EQI(sh.n, 2);
+    if (sh.n == 2) {
+        EQS(sh.row[0].text, "Hi 708");
+        EQS(sh.row[1].text, "Lé♪");
+        EQI(sh.row[0].align, 1);
+        CHECK(sh.row[0].y > 0.7f && sh.row[1].y > sh.row[0].y);
+    }
+    cc_free(d);
+
+    /* сквозь ретранслятор: TS с H.264 (PMT 0x1B), SEI с cc_data в начале каждого PES видео */
+    relay_reset();
+    sbuf ts = {0};
+    uint8_t pat[] = {0, 0x00, 0xB0, 13, 0, 1, 0xC1, 0, 0, 0, 1, 0xE1, 0x00, 0, 0, 0, 0};
+    ts_put(&ts, 0, 1, pat, sizeof pat);
+    /* PMT: видео 0x102 с caption_service_descriptor: 608 поле 1 — eng */
+    uint8_t pmt[] = {0, 0x02, 0xB0, 27, 0, 1, 0xC1, 0, 0, 0xE1, 0x02, 0xF0, 0,
+                     0x1B, 0xE1, 0x02, 0xF0, 9, 0x86, 7, 0xC1, 'e', 'n', 'g', 0x3E, 0x3F, 0xFF,
+                     0, 0, 0, 0};
+    ts_put(&ts, 0x100, 1, pmt, sizeof pmt);
+    const char *pairs[][2] = {{"\x14", "\x29"}, {"\x14", "\x29"}, {"\x14", "\x60"}, {"\x14", "\x60"}, {"SE", "I!"}};
+    for (int k = 0; k < 20; k++) {   /* после текста — пустые пары: окно упорядочивания (0,3 с) проходит */
+        uint8_t b1 = k < 5 ? (uint8_t)pairs[k][0][0] : 0x80, b2 = k < 5 ? (uint8_t)pairs[k][1][0] : 0x80;
+        if (k == 4) { b1 = 'S'; b2 = 'E'; }
+        if (k == 5) { b1 = 'I'; b2 = '!'; }
+        /* AUD, SEI (t35: B5 0031 GA94 03, cc_data: 1 тройка), срез IDR */
+        uint8_t es[] = {0, 0, 0, 1, 0x09, 0xF0,
+                        0, 0, 0, 1, 0x06, 4, 15, 0xB5, 0x00, 0x31, 'G', 'A', '9', '4', 3, 0x41, 0xFF, 0xFC, par(b1), par(b2), 0xFF, 0x80,
+                        0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00};
+        sbuf v = {0};
+        pes(&v, 0xE0, 900000 + 3600 * k, es, sizeof es);
+        ts_put(&ts, 0x102, 1, (const uint8_t *)v.s, v.n);
+        sb_free(&v);
+        if (k == 0) {   /* выбор — как только канал замечен */
+            relay_tap((const uint8_t *)ts.s, ts.n);
+            ts.n = 0;
+            relay_cc_select(CC_608, 1);
+        }
+    }
+    relay_tap((const uint8_t *)ts.s, ts.n);
+    relay_cc cl[8];
+    int ncl = relay_cc_list(cl, 8);
+    CHECK(ncl >= 1 && cl[0].kind == CC_608 && cl[0].num == 1 && !strcmp(cl[0].lang, "eng"));
+    /* последние кадры ждут упорядочивания — показ уже есть по пройденным */
+    CHECK(relay_cc_at(900000 + 3600 * 6, &sh));
+    if (sh.n) EQS(sh.row[0].text, "SEI!");
+    CHECK(relay_cc_at(900000 + 3600 * 4, &sh) && !strcmp(sh.row[0].text, "SE"));   /* по времени кадра */
+    relay_reset();
+    sb_free(&ts);
+}
+
 static void test_ttml(void) {
     /* тики, кадры, вложенные div (время — от родителя), br, span, сущности, пробелы */
     const char *x = "<?xml version=\"1.0\"?><!-- c --><tt xmlns=\"http://www.w3.org/ns/ttml\" xmlns:ttp=\"http://www.w3.org/ns/ttml#parameter\" "
@@ -1759,6 +1897,7 @@ int main(void) {
     test_backup();
     test_tmdb();
     test_ttml();
+    test_cc();
     test_teletext();
     test_dvbsub();
     test_webvtt();

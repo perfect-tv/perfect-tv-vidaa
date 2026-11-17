@@ -15,6 +15,7 @@
 #include "core/webvtt.h"
 #include "player/player.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
@@ -74,6 +75,26 @@ int subs_tracks(subtrack *out, int max) {
             snprintf(t->key, sizeof t->key, "dvb:%s:%d", lc, hoh);
             snprintf(t->label, sizeof t->label, "%s · DVB%s%s", lang_label(d[i].lang), hoh ? " · " : "", hoh ? tr(S_SUB_HOH) : "");
         }
+        /* закрытые субтитры в видео: CC1…CC4 (608), сервисы 708 */
+        relay_cc cc[16];
+        int ncc = relay_cc_list(cc, 16);
+        for (int i = 0; i < ncc && n < max; i++) {
+            subtrack *t = &out[n++];
+            *t = (subtrack){ST_CC, i, 1, "", ""};
+            int known = lang_find(cc[i].lang) >= 0 || (cc[i].lang[0] && strcmp(cc[i].lang, "und"));
+            if (cc[i].kind == CC_608) {
+                char ch[8];
+                snprintf(ch, sizeof ch, "CC%d", cc[i].num);
+                snprintf(t->key, sizeof t->key, "cc:%s", ch);
+                if (known) snprintf(t->label, sizeof t->label, "%s · %s", lang_label(cc[i].lang), ch);
+                else snprintf(t->label, sizeof t->label, "%s", trf(S_SUB_CC_CHANNEL, ch));
+            } else {
+                snprintf(t->key, sizeof t->key, "cc:S%d", cc[i].num);
+                if (known && cc[i].num == 1) snprintf(t->label, sizeof t->label, "%s · CEA-708", lang_label(cc[i].lang));
+                else if (known) snprintf(t->label, sizeof t->label, "%s · %s", lang_label(cc[i].lang), trf(S_SUB_CC_SERVICE, cc[i].num));
+                else snprintf(t->label, sizeof t->label, "%s", trf(S_SUB_CC_SERVICE, cc[i].num));
+            }
+        }
         static relay_vtt v[8];
         int nv = relay_vtt_list(v, 8);
         for (int i = 0; i < nv && n < max; i++) {
@@ -132,7 +153,7 @@ void subs_select(const char *key) {
     snprintf(T.sub_key, sizeof T.sub_key, "%s", key ? key : "");
     T.subs = T.sub_key[0] != 0;
     if (T.cur) store_set(store_key(), T.subs ? T.sub_key : NULL);
-    if (!T.subs) { relay_dvb_select(-1); webvtt_stop(); }
+    if (!T.subs) { relay_dvb_select(-1); relay_cc_select(0, 0); webvtt_stop(); }
     app_dirty();
 }
 
@@ -166,8 +187,13 @@ void subs_apply(void) {
     if (!T.subs || !T.relayed) {
         if (relay_dvb_selected() >= 0) relay_dvb_select(-1);
         if (webvtt_running()) { webvtt_stop(); vtt_url[0] = 0; }
+        relay_cc_select(0, 0);
         return;
     }
+    /* закрытые субтитры: ключ — канал / сервис, а не язык */
+    if (!strncmp(T.sub_key, "cc:CC", 5)) relay_cc_select(CC_608, atoi(T.sub_key + 5));
+    else if (!strncmp(T.sub_key, "cc:S", 4)) relay_cc_select(CC_708, atoi(T.sub_key + 4));
+    else relay_cc_select(0, 0);
     static subtrack t[16];
     int n = subs_tracks(t, 16);
     int kind = !strncmp(T.sub_key, "dvb:", 4) ? ST_DVB : !strncmp(T.sub_key, "vtt:", 4) ? ST_VTT : !strcmp(T.sub_key, "ttx") ? ST_TTX : 0;
@@ -217,6 +243,24 @@ void subs_draw(gfx_t *g, int bottom) {
         if (ttx_subtitle_text(&gr, text, sizeof text)) draw_text(g, text, bottom);
     } else if (!strncmp(T.sub_key, "vtt:", 4)) {
         if (webvtt_text_at(pts, text, sizeof text)) draw_text(g, text, bottom);
+    } else if (!strncmp(T.sub_key, "cc:", 3)) {
+        /* CEA-608 / 708: строки на своих местах — сетка 15 строк в безопасной зоне 80 % экрана */
+        static cc_show s;
+        if (!relay_cc_at(pts, &s)) return;
+        int ax = SW / 10, aw = SW * 8 / 10, ay = SH / 10, ah = SH * 8 / 10, rh = ah / 15;
+        double em = rh * 0.62 / EM;
+        for (int i = 0; i < s.n; i++) {
+            cc_row *r = &s.row[i];
+            int w = d_text_w(em, F_S, r->text) + E(1.0);
+            if (w > aw) w = aw;
+            int x = ax + (int)(r->x * aw), y = ay + (int)(r->y * ah);
+            if (r->align == 1) x -= w / 2;
+            else if (r->align == 2) x -= w;
+            if (x + w > ax + aw) x = ax + aw - w;
+            if (x < ax) x = ax;
+            d_fill(g, x, y, w, rh, 0xc0000000u);
+            d_text_c(g, x, w, y + (rh - d_line_h(em, F_S)) / 2, em, F_S, r->color, r->text);
+        }
     } else if (!strncmp(T.sub_key, "dvb:", 4)) {
         /* картинки DVB: свой экран (обычно 720×576) растягивается на весь; копия — только при новом показе */
         static dvbsub_show cache;

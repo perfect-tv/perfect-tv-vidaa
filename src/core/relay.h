@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include "ttx.h"
 #include "dvbsub.h"
+#include "cc.h"
 
 /* Поднять сервер (один раз); 0 — работает. */
 int relay_start(void);
@@ -42,6 +43,12 @@ dvbsub *relay_dvbsub(void);
  * канала — для core/webvtt.c; вид (WebVTT / TTML) — по CODECS вариантов с этой группой субтитров. */
 typedef struct { char name[64], lang[16], url[4096], hdr[2048], group[64], codec[16]; } relay_vtt;   /* codec: wvtt, stpp или «» */
 int relay_vtt_list(relay_vtt *out, int max);
+/* Закрытые субтитры CEA-608 / 708 в видео: что есть (по данным, PMT 0x86 и CLOSED-CAPTIONS HLS), выбор и показ на
+ * кадре (копия под замком — можно из главного потока). kind — CC_608 (num 1…4 — CC1…CC4) или CC_708 (сервис). */
+typedef struct { int kind, num; char lang[16]; } relay_cc;
+int relay_cc_list(relay_cc *out, int max);
+void relay_cc_select(int kind, int num);   /* kind 0 — выключить */
+int relay_cc_at(int64_t pts, cc_show *out);
 /* разбор TS (для тестов): кусок байтов как из сети */
 void relay_tap(const uint8_t *d, size_t n);
 #endif

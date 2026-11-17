@@ -50,7 +50,7 @@ typedef void (*file_fn)(const char *path, int epg, void *ctx);
 void files_open(file_fn done, void *ctx);
 
 /* subs.c — субтитры (телетекст, DVB, WebVTT) */
-enum { ST_TTX = 1, ST_DVB, ST_VTT, ST_OTHER };
+enum { ST_TTX = 1, ST_DVB, ST_VTT, ST_CC, ST_OTHER };
 typedef struct { int kind, idx, supported; char key[48], label[160]; } subtrack;   /* idx — в списке ретранслятора, -1 — из плеера */
 int subs_tracks(subtrack *out, int max);
 int subs_available(void);

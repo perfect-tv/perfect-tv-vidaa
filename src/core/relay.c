@@ -45,15 +45,26 @@ static struct {
     int dvb_sel, dvb_idx; /* PID и номер выбранных DVB-субтитров (-1 — нет) */
     dvbsub *dvbd;
     pesbuf pt, pd;        /* телетекст, DVB-субтитры */
+    /* закрытые субтитры CEA-608/708 в видео: PID и вид видео, начало PES (до 16 КБ), языки из PMT (0x86) и HLS */
+    int vid_pid, vid_codec, pv_done;
+    uint8_t *pv;
+    size_t pv_n;
+    ccdec *cc;
+    char cc_lang608[4][16], cc_lang708[8][16];
+    unsigned cc_decl608;
+    unsigned cc_decl708;
     int64_t base_pts;
     long long bytes;
     int gen;   /* растёт при relay_reset: соединения прежней ссылки разбор не трогают */
-} D = {.mu = PTHREAD_MUTEX_INITIALIZER, .ttx_pid = -1, .dvb_sel = -1, .dvb_idx = -1, .base_pts = -1};
+} D = {.mu = PTHREAD_MUTEX_INITIALIZER, .ttx_pid = -1, .dvb_sel = -1, .dvb_idx = -1, .base_pts = -1, .vid_pid = -1};
+#define PV_MAX (16 * 1024)
 
 static void init_once(void) {
     if (!D.t) D.t = ttx_new();
     if (!D.pt.buf) D.pt.buf = malloc(PES_MAX);
     if (!D.pd.buf) D.pd.buf = malloc(PES_MAX);
+    if (!D.pv) D.pv = malloc(PV_MAX);
+    if (!D.cc) D.cc = cc_new();
 }
 
 void relay_reset(void) {
@@ -69,6 +80,15 @@ void relay_reset(void) {
     D.dvb_sel = D.dvb_idx = -1;
     D.base_pts = -1;
     D.bytes = 0;
+    D.vid_pid = -1;
+    D.vid_codec = 0;
+    D.pv_n = 0;
+    D.pv_done = 0;
+    cc_select(D.cc, 0, 0);
+    cc_reset(D.cc);
+    memset(D.cc_lang608, 0, sizeof D.cc_lang608);
+    memset(D.cc_lang708, 0, sizeof D.cc_lang708);
+    D.cc_decl608 = D.cc_decl708 = 0;
     D.gen++;
     pthread_mutex_unlock(&D.mu);
 }
@@ -141,7 +161,9 @@ static void parse_pmt(const uint8_t *pl, size_t n) {
     if (!s || len < 12) return;
     size_t pil = (size_t)((s[10] & 0x0F) << 8 | s[11]), i = 12 + pil;
     while (i + 5 <= len) {
-        int pid = (s[i + 1] & 0x1F) << 8 | s[i + 2];
+        int pid = (s[i + 1] & 0x1F) << 8 | s[i + 2], st = s[i];
+        int vc = st == 0x1B ? CC_VIDEO_H264 : st == 0x24 ? CC_VIDEO_HEVC : st == 0x01 || st == 0x02 ? CC_VIDEO_MPEG2 : 0;
+        if (vc && D.vid_pid < 0) { D.vid_pid = pid; D.vid_codec = vc; D.pv_n = 0; fprintf(stderr, "relay_video pid=%d type=0x%02x\n", pid, st); }
         size_t el = (size_t)((s[i + 3] & 0x0F) << 8 | s[i + 4]), d = i + 5, end = d + el;
         if (end > len) break;
         while (d + 2 <= end) {
@@ -160,6 +182,16 @@ static void parse_pmt(const uint8_t *pl, size_t n) {
                 D.pt.n = D.pt.want = 0;
                 ttx_declare(D.t, lang, subs, ns);
                 fprintf(stderr, "relay_teletext pid=%d lang=%s subtitle_pages=%d\n", pid, lang, ns);
+            }
+            /* ATSC caption_service_descriptor: язык каждого канала 608 / сервиса 708 */
+            if (tag == 0x86 && dl >= 1 && pid == D.vid_pid) {
+                int ns = v[0] & 0x1F;
+                for (int k = 0; k < ns && 1 + 6 * k + 6 <= dl; k++) {
+                    const uint8_t *e6 = v + 1 + 6 * k;
+                    char lg[4] = {(char)e6[0], (char)e6[1], (char)e6[2], 0};
+                    if (e6[3] & 0x80) { int sn = e6[3] & 0x3F; if (sn >= 1 && sn <= 7) { snprintf(D.cc_lang708[sn], 16, "%s", lg); D.cc_decl708 |= 1u << sn; } }
+                    else { int f = e6[3] & 1; snprintf(D.cc_lang608[f * 2], 16, "%s", lg); D.cc_decl608 |= 1u << (f * 2); }   /* поле 1 — CC1, 2 — CC3 */
+                }
             }
             /* DVB-субтитры: по записи на дорожку (язык, тип, страница композиции и вспомогательная); у одного PID
                их бывает несколько — обычные и для слабослышащих на разных страницах */
@@ -184,6 +216,24 @@ static void parse_pmt(const uint8_t *pl, size_t n) {
     }
 }
 
+/* видео: нужно только начало PES (SEI / user_data стоят перед срезами кадра) */
+static void video_done(void) {
+    if (D.pv_n && !D.pv_done) {
+        size_t hdr;
+        int64_t pts = pes_pts(D.pv, D.pv_n, &hdr);
+        if (pts != -2 && hdr < D.pv_n) cc_video(D.cc, D.vid_codec, D.pv + hdr, D.pv_n - hdr, pts);
+    }
+    D.pv_done = 1;
+}
+static void video_add(const uint8_t *pl, size_t n, int pusi) {
+    if (pusi) { video_done(); D.pv_n = 0; D.pv_done = 0; }
+    else if (!D.pv_n || D.pv_done) return;
+    size_t k = PV_MAX - D.pv_n < n ? PV_MAX - D.pv_n : n;
+    memcpy(D.pv + D.pv_n, pl, k);
+    D.pv_n += k;
+    if (D.pv_n == PV_MAX) video_done();
+}
+
 static void packet(const uint8_t *p) {
     int pid = (p[1] & 0x1F) << 8 | p[2], pusi = p[1] & 0x40, afc = (p[3] >> 4) & 3;
     if (!(afc & 1)) return;
@@ -200,6 +250,7 @@ static void packet(const uint8_t *p) {
         int64_t pts = pes_pts(pl, n, &hdr);
         if (pts >= 0 && pl[3] >= 0xC0 && pl[3] <= 0xEF) D.base_pts = pts;   /* видео или звук */
     }
+    if (pid == D.vid_pid) video_add(pl, n, pusi);
     if (pid == D.ttx_pid) pes_add(&D.pt, pl, n, pusi);
     else if (pid == D.dvb_sel && D.dvbd) pes_add(&D.pd, pl, n, pusi);
 }
@@ -223,6 +274,32 @@ void relay_dvb_select(int i) {
     pthread_mutex_unlock(&D.mu);
 }
 int relay_dvb_selected(void) { return D.dvb_idx; }
+
+int relay_cc_list(relay_cc *out, int max) {
+    pthread_mutex_lock(&D.mu);
+    init_once();
+    int n = 0;
+    unsigned p608 = cc_present608(D.cc) | D.cc_decl608;
+    uint64_t p708 = cc_present708(D.cc) | D.cc_decl708;
+    for (int k = 0; k < 4 && n < max; k++)
+        if (p608 & (1u << k)) { out[n] = (relay_cc){CC_608, k + 1, ""}; snprintf(out[n].lang, sizeof out[n].lang, "%s", D.cc_lang608[k]); n++; }
+    for (int sn = 1; sn < 64 && n < max; sn++)
+        if (p708 & (1ull << sn)) { out[n] = (relay_cc){CC_708, sn, ""}; if (sn < 8) snprintf(out[n].lang, sizeof out[n].lang, "%s", D.cc_lang708[sn]); n++; }
+    pthread_mutex_unlock(&D.mu);
+    return n;
+}
+void relay_cc_select(int kind, int num) {
+    pthread_mutex_lock(&D.mu);
+    init_once();
+    cc_select(D.cc, kind, num);
+    pthread_mutex_unlock(&D.mu);
+}
+int relay_cc_at(int64_t pts, cc_show *out) {
+    pthread_mutex_lock(&D.mu);
+    int r = D.cc ? cc_at(D.cc, pts, out) : 0;
+    pthread_mutex_unlock(&D.mu);
+    return r;
+}
 dvbsub *relay_dvbsub(void) { return D.dvbd; }
 
 static void tap_locked(const uint8_t *d, size_t n) {
@@ -338,6 +415,16 @@ static void note_subtitles(const char *line, const char *base, const char *heade
         if (!g[0] || !c) return;
         pthread_mutex_lock(&D.mu);
         for (int i = 0; i < D.nvtt; i++) if (!strcmp(D.vtt[i].group, g)) snprintf(D.vtt[i].codec, sizeof D.vtt[i].codec, "%s", c);
+        pthread_mutex_unlock(&D.mu);
+        return;
+    }
+    if (!strncmp(line, "#EXT-X-MEDIA:", 13) && strstr(line, "TYPE=CLOSED-CAPTIONS")) {   /* язык каналов 608 / сервисов 708 */
+        char id[32], lg[16];
+        hls_attr(line, "INSTREAM-ID", id, sizeof id);
+        hls_attr(line, "LANGUAGE", lg, sizeof lg);
+        pthread_mutex_lock(&D.mu);
+        if (!strncmp(id, "CC", 2) && id[2] >= '1' && id[2] <= '4') { int k = id[2] - '1'; snprintf(D.cc_lang608[k], 16, "%s", lg); D.cc_decl608 |= 1u << k; }
+        else if (!strncmp(id, "SERVICE", 7)) { int sn = atoi(id + 7); if (sn >= 1 && sn <= 7) { snprintf(D.cc_lang708[sn], 16, "%s", lg); D.cc_decl708 |= 1u << sn; } }
         pthread_mutex_unlock(&D.mu);
         return;
     }

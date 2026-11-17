@@ -21,6 +21,7 @@
     "src/core/usb.c",
     "src/core/ttx.c",
     "src/core/dvbsub.c",
+    "src/core/cc.c",
     "src/core/webvtt.c",
     "src/core/relay.c",
     "src/data/names.c",
