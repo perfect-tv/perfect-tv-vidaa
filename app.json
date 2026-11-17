@@ -16,6 +16,8 @@
     "src/core/prefs.c",
     "src/core/http.c",
     "src/core/unpack.c",
+    "src/core/qr.c",
+    "src/core/phone.c",
     "src/data/names.c",
     "src/data/m3u.c",
     "src/data/xmltv.c",
@@ -36,6 +38,7 @@
     "src/ui/pin.c",
     "src/ui/settings.c",
     "src/ui/form.c",
+    "src/ui/phone.c",
     "src/main.c"
   ],
   "shell": true,

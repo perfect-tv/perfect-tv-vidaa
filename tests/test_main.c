@@ -5,6 +5,8 @@
 #include "core/lang.h"
 #include "core/prefs.h"
 #include "core/unpack.h"
+#include "core/phone.h"
+#include "core/qr.h"
 #include "core/util.h"
 #include "data/catchup.h"
 #include "data/epg.h"
@@ -17,6 +19,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <zlib.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 extern const unsigned char ptv_font_regular[], ptv_font_regular_end[], ptv_font_bold[], ptv_font_bold_end[];
 
@@ -543,6 +548,63 @@ static void big_epg(int nch, int days, int desc, int bench) {
     clock_fake(0);
 }
 
+/* ---------- ввод с телефона ---------- */
+/* запрос к странице: ответ целиком (сервер опрашивается, пока не ответит) */
+static char *phone_req(int port, const char *req, phone_result *r, int *got) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa)) { close(fd); return NULL; }
+    if (send(fd, req, strlen(req), 0) < 0) {}
+    sbuf b = {0};
+    for (int i = 0; i < 200; i++) {
+        if (phone_poll(r)) *got = 1;
+        char buf[4096];
+        ssize_t n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+        if (n > 0) { sb_addn(&b, buf, (size_t)n); continue; }
+        if (n == 0) break;
+        usleep(5000);
+    }
+    close(fd);
+    return sb_take(&b);
+}
+
+static void test_phone(void) {
+    char url[200], err[100];
+    if (phone_start(url, sizeof url, err, sizeof err)) { printf("phone: нет сети (%s), пропуск\n", err); return; }
+    CHECK(phone_running());
+    const char *tok = strrchr(url, '/') + 1, *pc = strrchr(url, ':');
+    int port = atoi(pc + 1);
+    EQI(strlen(tok), 16);
+    uint8_t m[QR_SIZE][QR_SIZE];
+    EQI(qr_encode(url, m), 0);
+    phone_result r;
+    memset(&r, 0, sizeof r);
+    int got = 0;
+    char req[2000];
+    char *resp = phone_req(port, "GET /0000000000000000 HTTP/1.1\r\nHost: x\r\n\r\n", &r, &got);
+    CHECK(resp && strstr(resp, "404"));
+    free(resp);
+    snprintf(req, sizeof req, "GET /%s HTTP/1.1\r\nHost: x\r\n\r\n", tok);
+    resp = phone_req(port, req, &r, &got);
+    CHECK(resp && strstr(resp, "200 OK") && strstr(resp, "name=\"url\"") && strstr(resp, "Content-Security-Policy"));
+    free(resp);
+    const char *bad = "url=ftp%3A%2F%2Fx";
+    snprintf(req, sizeof req, "POST /%s HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: %zu\r\n\r\n%s", tok, strlen(bad), bad);
+    resp = phone_req(port, req, &r, &got);
+    CHECK(!got && resp && strstr(resp, "https://"));
+    free(resp);
+    const char *body = "url=https%3A%2F%2Fexample.com%2Fpl.m3u%3Fa%3D1%26b%3D2&name=%D0%9C%D0%BE%D0%B9+IPTV&epg=http%3A%2F%2Fe.ru%2Fepg.xml.gz";
+    snprintf(req, sizeof req, "POST /%s HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: %zu\r\n\r\n%s", tok, strlen(body), body);
+    resp = phone_req(port, req, &r, &got);
+    CHECK(got);
+    free(resp);
+    EQS(r.url, "https://example.com/pl.m3u?a=1&b=2");
+    EQS(r.name, "Мой IPTV");
+    EQS(r.epg, "http://e.ru/epg.xml.gz");
+    CHECK(!phone_running());   /* одноразовая */
+}
+
 static void test_lang(void) {
     lang_set(LANG_RU);
     EQS(trp(S_CHANNELS_N, 1), "1 канал");
@@ -603,6 +665,7 @@ int main(void) {
         printf("epg bench: генератор XML %.0f МБ/с\n", n / 1048576.0 / (mono_now() - t));
         big_epg(10000, 17, 300, 1);
     }
+    test_phone();
     test_lang();
     test_clock();
     char cmd[300];

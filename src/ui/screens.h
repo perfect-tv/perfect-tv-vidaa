@@ -43,4 +43,10 @@ void settings_open(void);
 void form_playlist(int index);                      /* -1 — новый */
 typedef void (*text_fn)(const char *text, void *ctx);
 void form_text(const char *title, const char *initial, int multiline, text_fn done, void *ctx);
+void form_playlist_phone(void);                     /* новый плейлист и сразу окно ввода с телефона */
+
+/* phone.c — ввод с телефона по QR */
+#include "core/phone.h"
+typedef void (*phone_fn)(const phone_result *r, void *ctx);
+void phone_open(phone_fn done, void *ctx);
 #endif

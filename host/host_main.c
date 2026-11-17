@@ -13,6 +13,7 @@
 #include "ui/keys.h"
 #include "ui/tv.h"
 #include "ui/u.h"
+#include "ui/screens.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -127,6 +128,8 @@ int main(int argc, char **argv) {
             else if (!strcmp(a + 5, "schedule")) tv_open_schedule(T.cur, 0);
             else if (!strcmp(a + 5, "recent")) tv_open_recent();
             else if (!strcmp(a + 5, "menu")) tv_open_menu(T.cur, T.group, 0);
+            else if (!strcmp(a + 5, "phone")) form_playlist_phone();
+            else if (!strcmp(a + 5, "form")) form_playlist(-1);
             run(0.1);
         } else if (!strncmp(a, "lang:", 5)) { P.lang = !strcmp(a + 5, "en") ? LANG_EN : LANG_RU; lang_set(P.lang); app_dirty(); }
         else if (!strncmp(a, "key:", 4) || !strncmp(a, "long:", 5) || !strncmp(a, "hold:", 5)) {

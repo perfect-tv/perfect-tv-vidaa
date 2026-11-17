@@ -286,8 +286,13 @@ static int welcome_focus;
 static layer WL;
 static int welcome_key(layer *l, int k, int ev) {
     (void)l;
-    if (k == KEY_LEFT || k == KEY_RIGHT || k == KEY_UP || k == KEY_DOWN) welcome_focus = !welcome_focus;
-    else if (k == KEY_OK && ev == EV_SHORT) { if (welcome_focus) app_quit(); else form_playlist(-1); }
+    if (k == KEY_LEFT || k == KEY_UP) welcome_focus = (welcome_focus + 2) % 3;
+    else if (k == KEY_RIGHT || k == KEY_DOWN) welcome_focus = (welcome_focus + 1) % 3;
+    else if (k == KEY_OK && ev == EV_SHORT) {
+        if (welcome_focus == 2) app_quit();
+        else if (welcome_focus == 1) form_playlist_phone();
+        else form_playlist(-1);
+    }
     else if (k == KEY_BACK && ev == EV_SHORT) app_quit();
     return 1;
 }
@@ -297,10 +302,11 @@ static void welcome_draw(layer *l, gfx_t *g) {
     int cy = SH / 2 - E(6);
     d_text_c(g, 0, SW, cy - E(4), 2.6, F_B, C_WHITE, tr(S_WELCOME));
     d_lines(g, SW / 2 - E(26), cy + E(0.4), E(52), 1.35, F_R, C_TEXT2, tr(S_WELCOME_HINT), 3, 0.2);
-    int w1 = d_text_w(1.25, F_S, tr(S_ADD_PLAYLIST)) + E(3), w2 = d_text_w(1.25, F_S, tr(S_EXIT)) + E(3);
-    int bx = (SW - w1 - w2 - E(1)) / 2;
-    bx += button(g, bx, cy + E(6), tr(S_ADD_PLAYLIST), welcome_focus == 0) + E(1);
-    button(g, bx, cy + E(6), tr(S_EXIT), welcome_focus == 1);
+    const char *b[3] = {tr(S_ADD_PLAYLIST), tr(S_PHONE), tr(S_EXIT)};
+    int tw = E(2);
+    for (int i = 0; i < 3; i++) tw += d_text_w(1.25, F_S, b[i]) + E(3);
+    int bx = (SW - tw) / 2;
+    for (int i = 0; i < 3; i++) bx += button(g, bx, cy + E(6), b[i], welcome_focus == i) + E(1);
 }
 void welcome_open(void) {
     WL.name = "welcome";
