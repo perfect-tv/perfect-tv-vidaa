@@ -10,7 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 repo R;
@@ -112,6 +111,7 @@ void repo_delete_playlist(int i) {
     if (R.cur == i) R.cur = -1;
     else if (R.cur > i) R.cur--;
     repo_save_playlists();
+    repo_gc_epg();
 }
 
 void repo_move_playlist(int i, int dir) {
@@ -231,6 +231,54 @@ static void group_add(group *g, channel *c) {
     g->ch[g->n++] = c;
 }
 
+/* Строка TSV каналов -> поля (на месте); число полей */
+static int split_tsv(char *line, char **fld, int max) {
+    int nf = 0;
+    char *p = line;
+    fld[nf++] = p;
+    for (; *p && nf < max; p++) {
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\t') { *p = 0; fld[nf++] = p + 1; }
+    }
+    for (int i = 0; i < nf; i++) unesc(fld[i]);
+    return nf;
+}
+
+/* Каналы плейлиста pl_id из его файла — для фильтра сборки программы. Только файлы: можно в рабочем потоке. */
+int repo_read_wants(int pl_id, int default_days, strpool *pool, epg_want **w, int *nw, int *cap) {
+    char path[700];
+    repo_channels_path(pl_id, path, sizeof path);
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    char *line = NULL;
+    size_t lcap = 0;
+    ssize_t len;
+    char k[400];
+    while ((len = getline(&line, &lcap, f)) > 0) {
+        if (line[len - 1] == '\n') line[--len] = 0;
+        char *fld[16];
+        if (split_tsv(line, fld, 16) < 15) continue;
+        if (*nw >= *cap) {
+            int nc = *cap ? *cap * 2 : 1024;
+            epg_want *n = realloc(*w, (size_t)nc * sizeof *n);
+            if (!n) break;
+            *w = n;
+            *cap = nc;
+        }
+        epg_want *e = &(*w)[(*nw)++];
+        e->tvg_id = sp_dup(pool, fld[5]);
+        names_match_key(fld[6], k, sizeof k);
+        e->tvg_name_key = sp_dup(pool, k);
+        names_match_key(fld[1], k, sizeof k);
+        e->name_key = sp_dup(pool, k);
+        int d = atoi(fld[11]);
+        e->archive_days = atoi(fld[8]) ? (d > 0 ? d : default_days) : 0;
+    }
+    free(line);
+    fclose(f);
+    return 0;
+}
+
 static int load_channels(int pl_id) {
     char path[700];
     repo_channels_path(pl_id, path, sizeof path);
@@ -244,15 +292,8 @@ static int load_channels(int pl_id) {
     while (R.ch && (len = getline(&line, &lcap, f)) > 0) {
         if (line[len - 1] == '\n') line[--len] = 0;
         char *fld[16];
-        int nf = 0;
-        char *p = line;
-        fld[nf++] = p;
-        for (; *p && nf < 16; p++) {
-            if (*p == '\\' && p[1]) { p++; continue; }
-            if (*p == '\t') { *p = 0; fld[nf++] = p + 1; }
-        }
+        int nf = split_tsv(line, fld, 16);
         if (nf < 15) continue;
-        for (int i = 0; i < nf; i++) unesc(fld[i]);
         if (R.nch >= cap) {
             cap *= 2;
             channel *n = realloc(R.ch, (size_t)cap * sizeof *n);
@@ -473,40 +514,92 @@ void repo_reset_scores(void) {
 }
 
 /* ---------- программа ---------- */
-/* Отображения прежних выгрузок не снимаются сразу: окна могли взять строки передачи этим кадром. */
-typedef struct { void *idx; size_t il; const char *str; size_t sl; } retired;
-static retired grave[6];
-static int ngrave;
-static void retire(epg_src *s) {
-    if (!s->idx && !s->str) return;
-    if (ngrave == (int)(sizeof grave / sizeof grave[0])) {
-        if (grave[0].idx) munmap(grave[0].idx, grave[0].il);
-        if (grave[0].str) munmap((void *)grave[0].str, grave[0].sl);
-        memmove(grave, grave + 1, sizeof grave - sizeof grave[0]);
-        ngrave--;
+/* Сопоставление каналов текущего плейлиста с каналами XMLTV источников (по порядку источников: первый, где канал
+ * нашёлся, — его). В источнике: tvg-id, затем tvg-name, затем имя; при равенстве — первый канал XMLTV. Каналы XMLTV
+ * читаются построчно из c<gen>.tsv, в памяти — только сопоставленные (слоты источника). */
+typedef struct { int ch, rank, next; } mref;
+typedef struct {
+    int src;
+    smap ids, keys;         /* tvg-id / ключ имени -> первая ссылка */
+    mref *ref; int nref;
+    int *best_src, *best_rank, *best_slot;
+} mctx;
+
+static void mref_add(mctx *m, smap *map, const char *key, int ch, int rank) {
+    if (!key || !*key) return;
+    mref *r = &m->ref[m->nref];
+    r->ch = ch;
+    r->rank = rank;
+    r->next = smap_get(map, key, -1);
+    smap_set(map, key, m->nref++);
+}
+
+static void m_assign(mctx *m, int ch, int rank, int *slot, const char *id, const char *icon) {
+    if (m->best_src[ch] >= 0 && m->best_src[ch] < m->src) return;   /* нашёлся в источнике раньше */
+    if (m->best_src[ch] == m->src && m->best_rank[ch] <= rank) return;
+    if (*slot < 0) *slot = epg_slot_add(&R.epg[m->src], id, icon);
+    if (*slot < 0) return;
+    m->best_src[ch] = m->src;
+    m->best_rank[ch] = rank;
+    m->best_slot[ch] = *slot;
+}
+
+static void m_chan(void *ctx, const char *id, const char *icon, const char *const *names, int n) {
+    mctx *m = ctx;
+    int slot = -1;
+    for (int r = smap_get(&m->ids, id, -1); r >= 0; r = m->ref[r].next) m_assign(m, m->ref[r].ch, 0, &slot, id, icon);
+    char key[300];
+    for (int k = 0; k < n; k++) {
+        names_match_key(names[k], key, sizeof key);
+        if (!key[0]) continue;
+        for (int r = smap_get(&m->keys, key, -1); r >= 0; r = m->ref[r].next) m_assign(m, m->ref[r].ch, m->ref[r].rank, &slot, id, icon);
     }
-    grave[ngrave++] = (retired){s->idx, s->idx_len, s->str, s->str_len};
-    s->idx = NULL;
-    s->str = NULL;
-    epg_close(s);
 }
 
 void repo_map_epg(void) {
-    for (int i = 0; i < R.nch; i++) {
-        channel *c = &R.ch[i];
-        c->epg_src = c->epg_ch = -1;
-        for (int s = 0; s < R.nepg && c->epg_src < 0; s++) {
-            int k = epg_find_id(&R.epg[s], c->tvg_id);
-            if (k < 0) k = epg_find_name(&R.epg[s], c->tkey);
-            if (k < 0) k = epg_find_name(&R.epg[s], c->mkey);
-            if (k >= 0) { c->epg_src = s; c->epg_ch = k; }
+    mctx m;
+    memset(&m, 0, sizeof m);
+    int n = R.nch;
+    m.ref = malloc((size_t)(n * 3 + 1) * sizeof *m.ref);
+    m.best_src = malloc((size_t)(n + 1) * sizeof(int));
+    m.best_rank = malloc((size_t)(n + 1) * sizeof(int));
+    m.best_slot = malloc((size_t)(n + 1) * sizeof(int));
+    for (int s = 0; s < R.nepg; s++) epg_slots_clear(&R.epg[s]);
+    if (m.ref && m.best_src && m.best_rank && m.best_slot) {
+        smap_init(&m.ids, n + 16);
+        smap_init(&m.keys, n * 2 + 16);
+        /* ссылки добавляются с конца: в списке ключа первым оказывается канал с меньшим номером */
+        for (int i = n - 1; i >= 0; i--) {
+            channel *c = &R.ch[i];
+            mref_add(&m, &m.ids, c->tvg_id, i, 0);
+            mref_add(&m, &m.keys, c->tkey, i, 1);
+            if (strcmp(c->mkey, c->tkey)) mref_add(&m, &m.keys, c->mkey, i, 2);
+            m.best_src[i] = -1;
+            m.best_rank[i] = 99;
+            m.best_slot[i] = -1;
         }
+        for (int s = 0; s < R.nepg; s++) {
+            m.src = s;
+            epg_scan(&R.epg[s], m_chan, &m);
+        }
+        smap_free(&m.ids);
+        smap_free(&m.keys);
     }
+    for (int i = 0; i < n; i++) {
+        channel *c = &R.ch[i];
+        int ok = m.best_src && m.best_slot && m.best_src[i] >= 0;
+        c->epg_src = ok ? m.best_src[i] : -1;
+        c->epg_ch = ok ? m.best_slot[i] : -1;
+    }
+    free(m.ref);
+    free(m.best_src);
+    free(m.best_rank);
+    free(m.best_slot);
     R.rev++;
 }
 
 void repo_open_epg(void) {
-    for (int i = 0; i < R.nepg; i++) retire(&R.epg[i]);
+    for (int i = 0; i < R.nepg; i++) epg_close(&R.epg[i]);
     R.nepg = 0;
     playlist *p = repo_cur();
     if (!p) return;
@@ -526,7 +619,6 @@ void repo_reopen_epg(int i) {
     char url[2048];
     snprintf(url, sizeof url, "%s", R.epg[i].url);
     int loading = R.epg[i].loading;
-    retire(&R.epg[i]);
     epg_open(&R.epg[i], url);
     R.epg[i].loading = loading;
     repo_map_epg();
@@ -537,42 +629,77 @@ int repo_epg_loading(void) {
     return 0;
 }
 
+/* Источники, на которые ссылается хоть один плейлист, остаются; остальное — удалить. */
+void repo_gc_epg(void) {
+    if (repo_epg_loading()) return;   /* недописанные файлы идущей сборки не трогать */
+    uint32_t keep[64 * MAX_EPG];
+    int n = 0;
+    strlist u = {0};
+    for (int i = 0; i < R.npl; i++) {
+        repo_epg_urls(&R.pl[i], &u);
+        for (int k = 0; k < u.n && n < COUNT(keep); k++) keep[n++] = hash_str(u.v[k]);
+    }
+    sl_clear(&u);
+    if (n == COUNT(keep)) return;   /* плейлистов слишком много — лучше ничего не удалять */
+    epg_gc(keep, n);
+}
+
+/* Плейлисты, у которых среди источников программы есть url (их каналы нужны выгрузке) */
+int repo_epg_users(const char *url, int *ids, int max) {
+    int n = 0;
+    strlist u = {0};
+    for (int i = 0; i < R.npl && n < max; i++) {
+        repo_epg_urls(&R.pl[i], &u);
+        if (sl_find(&u, url) >= 0) ids[n++] = R.pl[i].id;
+    }
+    sl_clear(&u);
+    return n;
+}
+
+/* Подпись плейлистов источника: сменилась (новый плейлист, перезагружен) — программу пора проверить: может, нужны
+ * другие каналы (решает сборка по хэшу каналов, иначе — условный запрос). */
+uint32_t repo_epg_users_sig(const char *url) {
+    uint32_t h = 2166136261u;
+    strlist u = {0};
+    char b[400];
+    for (int i = 0; i < R.npl; i++) {
+        playlist *p = &R.pl[i];
+        repo_epg_urls(p, &u);
+        if (sl_find(&u, url) < 0) continue;
+        int tag = p->etag[0] || p->last_modified[0];
+        snprintf(b, sizeof b, "%d|%d|%s|%s|%lld", p->id, p->count, p->etag, p->last_modified, tag ? 0LL : (long long)p->loaded_at);
+        h ^= hash_str(b);
+        h *= 16777619u;
+    }
+    sl_clear(&u);
+    return h ? h : 1;
+}
+
 int repo_prog_count(const channel *c) {
-    if (!c || c->epg_src < 0) return 0;
-    const epg_src *s = &R.epg[c->epg_src];
-    return c->epg_ch < (int)s->nch ? (int)s->ch[c->epg_ch].count : 0;
+    if (!c || c->epg_src < 0 || c->epg_src >= R.nepg) return 0;
+    return epg_count(&R.epg[c->epg_src], c->epg_ch);
 }
 prog repo_prog(const channel *c, int i) {
     prog r;
     memset(&r, 0, sizeof r);
     r.title = r.sub = r.desc = r.cat = r.icon = "";
-    if (i < 0 || i >= repo_prog_count(c)) return r;
-    const epg_src *s = &R.epg[c->epg_src];
-    const epg_prog *p = &s->pr[s->ch[c->epg_ch].first + (uint32_t)i];
+    if (!c || c->epg_src < 0 || c->epg_src >= R.nepg) return r;
+    epg_item it;
+    if (epg_get(&R.epg[c->epg_src], c->epg_ch, i, &it)) return r;
     int64_t sh = (int64_t)(c->tvg_shift * 3600);
-    r.start = (int64_t)p->start + sh;
-    r.stop = (int64_t)p->stop + sh;
-    r.title = epg_s(s, p->title);
-    r.sub = epg_s(s, p->sub);
-    r.desc = epg_s(s, p->desc);
-    r.cat = epg_s(s, p->cat);
-    r.icon = epg_s(s, p->icon);
+    r.start = it.start + sh;
+    r.stop = it.stop + sh;
+    r.title = it.title;
+    r.sub = it.sub;
+    r.desc = it.desc;
+    r.cat = it.cat;
+    r.icon = it.icon;
     return r;
 }
 /* первая передача с stop > t */
 static int lower(const channel *c, int64_t t) {
-    int n = repo_prog_count(c);
-    if (!n) return -1;
-    const epg_src *s = &R.epg[c->epg_src];
-    const epg_prog *p = &s->pr[s->ch[c->epg_ch].first];
-    int64_t sh = (int64_t)(c->tvg_shift * 3600);
-    int lo = 0, hi = n;
-    while (lo < hi) {
-        int m = (lo + hi) / 2;
-        if ((int64_t)p[m].stop + sh <= t) lo = m + 1;
-        else hi = m;
-    }
-    return lo;
+    if (!repo_prog_count(c)) return -1;
+    return epg_lower(&R.epg[c->epg_src], c->epg_ch, t - (int64_t)(c->tvg_shift * 3600));
 }
 int repo_prog_at(const channel *c, int64_t t) {
     int i = lower(c, t);
@@ -588,9 +715,8 @@ int repo_prog_after(const channel *c, int64_t t) {
     return i < n ? i : -1;
 }
 const char *repo_epg_icon(const channel *c) {
-    if (!c || c->epg_src < 0) return "";
-    const epg_src *s = &R.epg[c->epg_src];
-    return c->epg_ch < (int)s->nch ? epg_s(s, s->ch[c->epg_ch].icon) : "";
+    if (!c || c->epg_src < 0 || c->epg_src >= R.nepg) return "";
+    return epg_slot_icon(&R.epg[c->epg_src], c->epg_ch);
 }
 const char *repo_logo(const channel *c) {
     const char *a = c->logo, *b = repo_epg_icon(c);
@@ -730,6 +856,7 @@ void repo_init(void) {
     smap_init(&R.hidden_gr, 16);
     smap_init(&R.scores, 16);
     R.cur = -1;
+    repo_gc_epg();
     int idx = R.npl ? 0 : -1;
     for (int i = 0; i < R.npl; i++) if (R.pl[i].id == P.last_playlist) idx = i;
     repo_select(idx);

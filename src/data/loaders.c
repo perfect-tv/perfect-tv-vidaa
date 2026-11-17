@@ -183,16 +183,19 @@ int loaders_playlist_progress(int *channels) {
 
 /* ================= программа ================= */
 typedef struct {
-    int src;                      /* индекс в R.epg */
+    int src;                      /* индекс в R.epg на момент запуска */
     int pl_id;
-    uint32_t hash;
+    uint32_t hash, old_gen, new_gen, old_want, want, users_sig;
     char url[2048], etag[160], last_modified[64];
-    epg_want *w; int nw;
+    int users[64], nusers;        /* плейлисты с этим источником: их каналы нужны выгрузке */
+    int default_days;
+    epg_want *w; int nw, cap_w;
     strpool pool;
     char lang[4];
     int64_t now;
     char err[120], new_etag[160], new_lm[64];
     int ok, not_modified;
+    long stored;
     atomic_llong got, total;
     atomic_long progs;
     volatile int cancel;
@@ -203,6 +206,11 @@ static int epg_queue[MAX_EPG], epg_nqueue, epg_force;
 
 static void epg_work(void *p) {
     epg_job *j = p;
+    /* каналы всех плейлистов с этим источником: выгрузка общая */
+    for (int i = 0; i < j->nusers; i++) repo_read_wants(j->users[i], j->default_days, &j->pool, &j->w, &j->nw, &j->cap_w);
+    j->want = epg_want_hash(j->w, j->nw);
+    /* нужны другие каналы — условный запрос не годится: 304 оставил бы их без программы */
+    if (j->want != j->old_want) j->etag[0] = j->last_modified[0] = 0;
     hs_req rq = {.url = j->url, .etag = j->etag, .last_modified = j->last_modified, .cancel = &j->cancel};
     char e[120] = "";
     hs *h = hs_open(&rq, e, sizeof e);
@@ -212,7 +220,7 @@ static void epg_work(void *p) {
     snprintf(j->new_etag, sizeof j->new_etag, "%s", hs_etag(h));
     snprintf(j->new_lm, sizeof j->new_lm, "%s", hs_last_modified(h));
     up *u = up_new(hs_rd, h);
-    epg_build *b = epg_build_new(j->hash, j->w, j->nw, j->now, j->lang);
+    epg_build *b = epg_build_new(j->hash, j->old_gen, j->new_gen, j->w, j->nw, j->now, j->lang);
     if (!u || !b) { snprintf(j->err, sizeof j->err, "write"); goto out; }
     char *buf = malloc(1 << 16);
     long r = -1;
@@ -222,11 +230,16 @@ static void epg_work(void *p) {
         atomic_store(&j->progs, epg_build_programmes(b));
     }
     free(buf);
+    if (j->cancel) goto out;   /* отмена: недописанное удаляется, прежняя выгрузка остаётся */
     if (r < 0) snprintf(j->err, sizeof j->err, "%s", !strcmp(up_error(u), "format") ? "xz" : *hs_error(h) ? hs_error(h) : up_error(u));
     /* оборванный поток: то, что успели разобрать, всё равно пишется (старое прошлое переносится) */
     char fe[120] = "";
     if (epg_build_finish(b, fe, sizeof fe)) { if (!j->err[0]) snprintf(j->err, sizeof j->err, "%s", fe); }
-    else if (!j->err[0]) j->ok = 1;
+    else {
+        j->stored = epg_build_stored(b);
+        if (!j->err[0]) j->ok = 1;
+        else j->ok = 2;   /* записано, но поток оборван: выгрузка новая, ошибка показывается */
+    }
 out:
     epg_build_free(b);
     up_free(u);
@@ -238,26 +251,35 @@ static void epg_next(void);
 static void epg_done(void *p) {
     epg_job *j = p;
     epg_busy = NULL;
-    playlist *pl = repo_cur();
-    int same = pl && pl->id == j->pl_id && j->src < R.nepg && !strcmp(R.epg[j->src].url, j->url);
-    fprintf(stderr, "epg_load src=%d ok=%d not_modified=%d programmes=%ld err=%s\n", j->src, j->ok, j->not_modified, (long)atomic_load(&j->progs), j->err);
-    if (same) {
-        epg_src *s = &R.epg[j->src];
-        s->loading = 0;
-        if (j->ok) {
-            s->loaded_at = clock_now();
-            s->error[0] = 0;
-            if (!j->not_modified) {
-                snprintf(s->etag, sizeof s->etag, "%s", j->new_etag);
-                snprintf(s->last_modified, sizeof s->last_modified, "%s", j->new_lm);
-            }
-        } else if (!j->cancel) snprintf(s->error, sizeof s->error, "%s", j->err);
-        epg_save_meta(s);
-        if (j->ok && !j->not_modified) repo_reopen_epg(j->src);
-
+    fprintf(stderr, "epg_load src=%d ok=%d not_modified=%d programmes=%ld stored=%ld err=%s\n", j->src, j->ok, j->not_modified,
+            (long)atomic_load(&j->progs), j->stored, j->err);
+    /* источник мог смениться (другой плейлист): метаданные пишутся по адресу, открытый — переоткрывается */
+    int idx = -1;
+    for (int i = 0; i < R.nepg; i++) if (!strcmp(R.epg[i].url, j->url)) idx = i;
+    epg_src tmp, *s = idx >= 0 ? &R.epg[idx] : &tmp;
+    if (idx < 0) { memset(&tmp, 0, sizeof tmp); epg_open(&tmp, j->url); }
+    s->loading = 0;
+    int built = j->ok && !j->not_modified;
+    if (j->ok) {
+        s->loaded_at = clock_now();
+        s->want_hash = j->want;
+        s->users_sig = j->users_sig;
+        if (built) {
+            s->gen = j->new_gen;
+            s->programmes = j->stored;
+            snprintf(s->etag, sizeof s->etag, "%s", j->ok == 1 ? j->new_etag : "");
+            snprintf(s->last_modified, sizeof s->last_modified, "%s", j->ok == 1 ? j->new_lm : "");
+        }
+        snprintf(s->error, sizeof s->error, "%s", j->ok == 2 ? j->err : "");
+    } else if (!j->cancel) snprintf(s->error, sizeof s->error, "%s", j->err);
+    epg_save_meta(s);
+    if (built) {
+        if (idx >= 0) repo_reopen_epg(idx);
+        epg_prune(j->hash, j->new_gen);   /* прежнюю выгрузку: кэш кусков держит своё, файлы не нужны */
     }
+    if (idx < 0) epg_close(&tmp);
     int last = epg_nqueue == 0;
-    if (loaders_on_epg && same && !j->cancel && last) loaders_on_epg(j->ok, j->err);
+    if (loaders_on_epg && idx >= 0 && !j->cancel && last) loaders_on_epg(j->ok != 0, j->err);
     sp_free(&j->pool);
     free(j->w);
     free(j);
@@ -274,23 +296,20 @@ static void epg_start(int src) {
     j->src = src;
     j->pl_id = pl->id;
     j->hash = s->hash;
+    j->old_gen = epg_has_data(s) ? s->gen : 0;
+    j->new_gen = s->gen + 1;
+    j->old_want = s->want_hash;
     j->now = clock_now();
+    j->default_days = P.archive_days;
     snprintf(j->url, sizeof j->url, "%s", s->url);
-    if (!epg_force && s->idx) {
+    if (!epg_force && epg_has_data(s)) {
         snprintf(j->etag, sizeof j->etag, "%s", s->etag);
         snprintf(j->last_modified, sizeof j->last_modified, "%s", s->last_modified);
     }
     snprintf(j->lang, sizeof j->lang, "%s", lang_is_ru() ? "ru" : "en");
-    /* снимок каналов: в потоке нельзя трогать R */
-    j->w = calloc((size_t)(R.nch ? R.nch : 1), sizeof *j->w);
-    for (int i = 0; i < R.nch && j->w; i++) {
-        channel *c = &R.ch[i];
-        epg_want *w = &j->w[j->nw++];
-        w->tvg_id = sp_dup(&j->pool, c->tvg_id);
-        w->tvg_name_key = sp_dup(&j->pool, c->tkey);
-        w->name_key = sp_dup(&j->pool, c->mkey);
-        w->archive_days = c->cu_type ? c->archive_days : 0;
-    }
+    j->nusers = repo_epg_users(s->url, j->users, COUNT(j->users));
+    j->users_sig = repo_epg_users_sig(s->url);
+    if (!j->nusers) j->users[j->nusers++] = pl->id;
     s->loading = 1;
     epg_busy = j;
     pool_submit(epg_work, epg_done, j);   /* не в «низкой» полосе: она для логотипов */
@@ -307,7 +326,8 @@ void load_epg(int force) {
     if (force) epg_force = 1;
     for (int i = 0; i < R.nepg; i++) {
         epg_src *s = &R.epg[i];
-        int due = force || !s->idx || clock_now() - s->loaded_at > (int64_t)P.epg_hours * 3600;
+        int due = force || !epg_has_data(s) || clock_now() - s->loaded_at > (int64_t)P.epg_hours * 3600 ||
+                  s->users_sig != repo_epg_users_sig(s->url);
         if (!due) continue;
         int queued = s->loading;
         for (int k = 0; k < epg_nqueue; k++) if (epg_queue[k] == i) queued = 1;

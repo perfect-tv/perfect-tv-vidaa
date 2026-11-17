@@ -24,7 +24,7 @@ extern const unsigned char ptv_font_regular[], ptv_font_regular_end[], ptv_font_
 extern const unsigned char ptv_font_ui[], ptv_font_ui_end[], ptv_font_ui_semi[], ptv_font_ui_semi_end[], ptv_font_ui_bold[], ptv_font_ui_bold_end[];
 extern const unsigned char ptv_ca_pem[], ptv_ca_pem_end[];
 
-static void root_draw(screen *s, gfx_t *g) { (void)s; tv_draw(g); }
+static void root_draw(screen *s, gfx_t *g) { (void)s; epg_frame(); tv_draw(g); }
 static void root_tick(screen *s, double now) { (void)s; tv_tick(now); }
 static int root_key(screen *s, int k, int repeat) { (void)s; (void)k; (void)repeat; return 1; }
 static screen root = {.name = "tv", .draw = root_draw, .tick = root_tick, .key = root_key};

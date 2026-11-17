@@ -285,60 +285,261 @@ static void test_unpack(void) {
 }
 
 /* ---------- хранилище программы ---------- */
+static int build_xml(uint32_t h, uint32_t old_gen, uint32_t gen, const char *url, const epg_want *w, int nw, int64_t now,
+                     const char *xml, size_t len) {
+    epg_build *b = epg_build_new(h, old_gen, gen, w, nw, now, "ru");
+    if (!b) return -1;
+    /* кусками по 7 байт: элементы на границах */
+    for (size_t i = 0; i < len; i += 7) epg_build_push(b, xml + i, len - i < 7 ? len - i : 7);
+    char err[100] = "";
+    int rc = epg_build_finish(b, err, sizeof err);
+    long stored = epg_build_stored(b);
+    epg_build_free(b);
+    if (rc) { fprintf(stderr, "build: %s\n", err); return rc; }
+    epg_src m;
+    memset(&m, 0, sizeof m);
+    snprintf(m.url, sizeof m.url, "%s", url);
+    m.hash = h;
+    m.gen = gen;
+    m.programmes = stored;
+    epg_save_meta(&m);
+    return 0;
+}
+
+static const char *title_of(epg_src *s, int slot, int i) {
+    static epg_item it;
+    epg_get(s, slot, i, &it);
+    return it.title;
+}
+
+static int nscan;
+static void on_scan(void *ctx, const char *id, const char *icon, const char *const *names, int n) {
+    (void)ctx; (void)icon;
+    if (!strcmp(id, "a")) { CHECK(n == 1); if (n) EQS(names[0], "Первый"); }
+    nscan++;
+}
+
 static void test_epg(void) {
     int64_t now = 1700000000;
     clock_fake(now);
-    char a1[200], a2[200], b1[200];
+    char a1[200], b1[200];
     names_match_key("Первый", a1, sizeof a1);
-    names_match_key("Второй", a2, sizeof a2);
     names_match_key("B", b1, sizeof b1);
     epg_want w[2] = {{"", a1, a1, 3}, {"", b1, b1, 0}};
-    (void)a2;
     const char *xml1 =
         "<tv><channel id=\"a\"><display-name>Первый</display-name></channel><channel id=\"b\"><display-name>B</display-name></channel>"
-        "<programme start=\"20231114190000\" stop=\"20231114200000\" channel=\"a\"><title>Старая</title></programme>"
+        "<channel id=\"z\"><display-name>Не нужен</display-name></channel>"
+        "<programme start=\"20231114190000\" stop=\"20231114200000\" channel=\"a\"><title>Старая</title><desc>Описание</desc></programme>"
         "<programme start=\"20231114200000\" stop=\"20231114210000\" channel=\"a\"><title>Вторая</title></programme>"
         "<programme start=\"20231114200000\" stop=\"20231114203000\" channel=\"b\"><title>B1</title></programme>"
         "<programme start=\"20231114202000\" stop=\"20231114210000\" channel=\"b\"><title>B2</title></programme>"
         "<programme start=\"20201114200000\" stop=\"20201114210000\" channel=\"a\"><title>Слишком старая</title></programme>"
+        "<programme start=\"20231114200000\" stop=\"20231114210000\" channel=\"z\"><title>Чужая</title></programme>"
+        /* канал a ещё раз, не подряд: собирается с прежними кусками */
+        "<programme start=\"20231115230000\" stop=\"20231116010000\" channel=\"a\"><title>Завтра</title></programme>"
         "</tv>";
-    uint32_t h = hash_str("http://test/epg");
+    const char *url = "http://test/epg";
+    uint32_t h = hash_str(url);
     epg_remove_files(h);
-    epg_build *b = epg_build_new(h, w, 2, now, "ru");
-    epg_build_push(b, xml1, strlen(xml1));
-    char err[100] = "";
-    CHECK(!epg_build_finish(b, err, sizeof err));
-    epg_build_free(b);
+    CHECK(!build_xml(h, 0, 1, url, w, 2, now, xml1, strlen(xml1)));
     epg_src s;
     memset(&s, 0, sizeof s);
-    epg_open(&s, "http://test/epg");
-    EQI(s.nch, 2);
-    int ca = epg_find_id(&s, "a"), cb = epg_find_name(&s, b1);
-    CHECK(ca >= 0 && cb >= 0);
-    EQI(s.ch[ca].count, 2);
-    EQS(epg_s(&s, s.pr[s.ch[ca].first].title), "Старая");
-    EQI(s.ch[cb].count, 2);
-    EQI(s.pr[s.ch[cb].first].stop, 1699993200);   /* B1 обрезана по B2 (20:20) */
+    epg_open(&s, url);
+    CHECK(epg_has_data(&s));
+    EQI(s.gen, 1);
+    EQI(s.programmes, 5);
+    nscan = 0;
+    epg_scan(&s, on_scan, NULL);
+    EQI(nscan, 3);
+    int sa = epg_slot_add(&s, "a", ""), sb = epg_slot_add(&s, "b", "http://i/b.png"), sz = epg_slot_add(&s, "z", "");
+    EQI(epg_count(&s, sa), 3);
+    EQS(title_of(&s, sa, 0), "Старая");
+    epg_item it;
+    epg_get(&s, sa, 0, &it);
+    EQS(it.desc, "Описание");
+    EQS(it.sub, "");
+    EQS(title_of(&s, sa, 2), "Завтра");
+    EQI(epg_count(&s, sb), 2);
+    epg_get(&s, sb, 0, &it);
+    EQI(it.stop, 1699993200);   /* B1 обрезана по B2 (20:20) */
+    EQS(epg_slot_icon(&s, sb), "http://i/b.png");
+    EQI(epg_count(&s, sz), 0);   /* не нужен плейлистам — не хранится */
+    EQI(epg_count(&s, 99), 0);
+    CHECK(epg_get(&s, sa, 3, &it) != 0);
+    /* поиск по времени: первая с stop > t */
+    EQI(epg_lower(&s, sa, 1699988400 - 1), 0);
+    EQI(epg_lower(&s, sa, 1699992000), 1);        /* 20:00 — конец первой */
+    EQI(epg_lower(&s, sa, 1699995000), 1);        /* 20:50 — идёт вторая */
+    EQI(epg_lower(&s, sa, 1699995600), 2);
+    EQI(epg_lower(&s, sa, 1800000000), 3);
     epg_close(&s);
-    /* новая выгрузка без прошлого: прошлое канала a остаётся */
+    /* новая выгрузка без прошлого: прошлое канала a переносится, b пропал из XMLTV — его прошедшее тоже */
     const char *xml2 =
-        "<tv><channel id=\"a\"><display-name>Первый</display-name></channel>"
+        "<tv><channel id=\"a\"><display-name>Первый</display-name></channel><channel id=\"b\"><display-name>B</display-name></channel>"
         "<programme start=\"20231114200000\" stop=\"20231114210000\" channel=\"a\"><title>Вторая новая</title></programme>"
         "<programme start=\"20231114210000\" stop=\"20231114220000\" channel=\"a\"><title>Третья</title></programme></tv>";
-    b = epg_build_new(h, w, 2, now, "ru");
-    epg_build_push(b, xml2, strlen(xml2));
-    CHECK(!epg_build_finish(b, err, sizeof err));
-    epg_build_free(b);
-    epg_open(&s, "http://test/epg");
-    ca = epg_find_id(&s, "a");
-    CHECK(ca >= 0);
-    if (ca >= 0) {
-        EQI(s.ch[ca].count, 3);
-        EQS(epg_s(&s, s.pr[s.ch[ca].first].title), "Старая");
-        EQS(epg_s(&s, s.pr[s.ch[ca].first + 1].title), "Вторая новая");
-    }
+    CHECK(!build_xml(h, 1, 2, url, w, 2, now, xml2, strlen(xml2)));
+    epg_open(&s, url);
+    EQI(s.gen, 2);
+    sa = epg_slot_add(&s, "a", "");
+    sb = epg_slot_add(&s, "b", "");
+    EQI(epg_count(&s, sa), 3);
+    EQS(title_of(&s, sa, 0), "Старая");
+    EQS(title_of(&s, sa, 1), "Вторая новая");
+    EQS(title_of(&s, sa, 2), "Третья");
+    EQI(epg_count(&s, sb), 2);   /* прошедшие B1, B2 */
     epg_close(&s);
+    /* уборка: прежняя выгрузка, затем источник целиком */
+    char p1[800], d[700];
+    epg_dir(h, d, sizeof d);
+    snprintf(p1, sizeof p1, "%s/d1.bin", d);
+    CHECK(file_exists(p1));
+    epg_prune(h, 2);
+    CHECK(!file_exists(p1));
+    epg_open(&s, url);
+    CHECK(epg_has_data(&s));
+    epg_close(&s);
+    uint32_t keep[1] = {h};
+    epg_gc(keep, 1);
+    epg_open(&s, url);
+    CHECK(epg_has_data(&s));
+    epg_close(&s);
+    epg_gc(keep, 0);
+    epg_open(&s, url);
+    CHECK(!epg_has_data(&s));
+    epg_close(&s);
+    /* хэш нужных каналов */
+    CHECK(epg_want_hash(w, 2) != epg_want_hash(w, 1));
+    epg_cache_free();
+    clock_fake(0);
+}
+
+/* Синтетический XMLTV: nch каналов × days суток × 24 передачи, описание desc байт. Подаётся кусками. */
+typedef struct { epg_build *b; sbuf x; long bytes; } gen_ctx;
+static void gen_flush(gen_ctx *g, int force) {
+    if (g->x.n >= (1 << 16) || (force && g->x.n)) { if (g->b) epg_build_push(g->b, g->x.s, g->x.n); g->bytes += (long)g->x.n; sb_clear(&g->x); }
+}
+static void xml_time(char *out, int64_t t) {
+    time_t tt = (time_t)t;
+    struct tm m;
+    gmtime_r(&tt, &m);
+    snprintf(out, 32, "%04d%02d%02d%02d%02d%02d +0000", m.tm_year + 1900, m.tm_mon + 1, m.tm_mday, m.tm_hour, m.tm_min, m.tm_sec);
+}
+static long gen_xml(epg_build *b, int nch, int days, int desc, int64_t now) {
+    gen_ctx g = {b, {0}, 0};
+    static const char *words[] = {"фильм", "новости", "погода", "сериал", "герой", "город", "история", "события", "семья",
+                                  "детектив", "спорт", "матч", "ведущий", "гость", "студия", "выпуск", "жизнь", "тайна"};
+    uint32_t rnd = 12345;
+    sb_add(&g.x, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<tv>\n");
+    for (int c = 0; c < nch; c++) {
+        sb_printf(&g.x, "<channel id=\"ch%d\"><display-name>Канал %d</display-name><icon src=\"http://i/%d.png\"/></channel>\n", c, c, c);
+        gen_flush(&g, 0);
+    }
+    int64_t t0 = (now / 86400 - (days - 8)) * 86400;
+    for (int c = 0; c < nch; c++) {
+        for (int k = 0; k < days * 24; k++) {
+            char a[32], e[32];
+            xml_time(a, t0 + k * 3600);
+            xml_time(e, t0 + (k + 1) * 3600);
+            sb_printf(&g.x, "<programme start=\"%s\" stop=\"%s\" channel=\"ch%d\"><title>Передача %d канала %d</title>", a, e, c, k, c);
+            sb_add(&g.x, "<desc>");
+            for (size_t n0 = g.x.n; g.x.n - n0 < (size_t)desc;) {
+                rnd = rnd * 1103515245u + 12345u;
+                sb_add(&g.x, words[(rnd >> 16) % COUNT(words)]);
+                sb_printf(&g.x, " %u ", (rnd >> 8) % 100);
+            }
+            sb_add(&g.x, "</desc><category>Фильм</category></programme>\n");
+            gen_flush(&g, 0);
+        }
+    }
+    sb_add(&g.x, "</tv>\n");
+    gen_flush(&g, 1);
+    sb_free(&g.x);
+    return g.bytes;
+}
+
+static long rss_kb(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    char l[200];
+    long v = -1;
+    while (f && fgets(l, sizeof l, f)) if (!strncmp(l, "VmHWM:", 6)) v = atol(l + 6);
+    if (f) fclose(f);
+    return v;
+}
+
+static void big_epg(int nch, int days, int desc, int bench) {
+    int64_t now = 1700000000;
+    clock_fake(now);
+    strpool pool = {0};
+    epg_want *w = calloc((size_t)nch, sizeof *w);
+    char k[100];
+    for (int c = 0; c < nch; c++) {
+        snprintf(k, sizeof k, "ch%d", c);
+        w[c].tvg_id = sp_dup(&pool, k);
+        w[c].tvg_name_key = w[c].name_key = "";
+        w[c].archive_days = 7;
+    }
+    const char *url = "http://test/big";
+    uint32_t h = hash_str(url);
     epg_remove_files(h);
+    FILE *cr = fopen("/proc/self/clear_refs", "w");   /* сбросить пик памяти процесса */
+    if (cr) { fputs("5", cr); fclose(cr); }
+    long rss0 = rss_kb();
+    double t = mono_now();
+    epg_build *b = epg_build_new(h, 0, 1, w, nch, now, "ru");
+    CHECK(b != NULL);
+    if (!b) return;
+    long xml = gen_xml(b, nch, days, desc, now);
+    char err[100] = "";
+    CHECK(!epg_build_finish(b, err, sizeof err));
+    long stored = epg_build_stored(b);
+    epg_build_free(b);
+    double tb = mono_now() - t;
+    long rss1 = rss_kb();
+    epg_src m;
+    memset(&m, 0, sizeof m);
+    snprintf(m.url, sizeof m.url, "%s", url);
+    m.hash = h;
+    m.gen = 1;
+    epg_save_meta(&m);
+    /* окно: архив 7 + 1 сутки назад от начала суток … +8 суток */
+    CHECK(stored > (long)nch * 24 * 15 && stored <= (long)nch * days * 24);
+    epg_src s;
+    memset(&s, 0, sizeof s);
+    epg_open(&s, url);
+    for (int c = 0; c < nch; c++) { snprintf(k, sizeof k, "ch%d", c); epg_slot_add(&s, k, ""); }
+    /* все каналы по кадру, как листание гида: кэш не растёт */
+    long total = 0, maxc = 0, bad = 0;
+    t = mono_now();
+    for (int c = 0; c < nch; c++) {
+        epg_frame();
+        int n = epg_count(&s, c);
+        total += n;
+        int i = epg_lower(&s, c, now);
+        epg_item it;
+        if (epg_get(&s, c, i, &it) || !(it.start <= now && it.stop > now)) bad++;
+        snprintf(k, sizeof k, " канала %d", c);
+        if (!strstr(it.title, k)) bad++;
+        if (epg_cache_bytes() > maxc) maxc = epg_cache_bytes();
+    }
+    double tr_ = mono_now() - t;
+    EQI(total, stored);
+    EQI(bad, 0);
+    CHECK(maxc < (8L << 20));
+    char p[800], d[700];
+    epg_dir(h, d, sizeof d);
+    snprintf(p, sizeof p, "%s/d1.bin", d);
+    long long dsz = file_size(p);
+    if (bench)
+        printf("epg bench: %d каналов, XML %.0f МБ, передач %ld, сборка %.1f с (%.0f МБ/с), данные %.1f МБ, "
+               "пик памяти +%ld МБ, чтение %.2f мс/канал, кэш до %.1f МБ\n",
+               nch, xml / 1048576.0, stored, tb, xml / 1048576.0 / tb, dsz / 1048576.0, (rss1 - rss0) / 1024, tr_ * 1000 / nch,
+               maxc / 1048576.0);
+    epg_close(&s);
+    epg_cache_free();
+    epg_remove_files(h);
+    free(w);
+    sp_free(&pool);
     clock_fake(0);
 }
 
@@ -395,6 +596,13 @@ int main(void) {
     test_xmltv();
     test_unpack();
     test_epg();
+    big_epg(1000, 17, 60, 0);
+    if (getenv("PTV_BENCH")) {
+        double t = mono_now();
+        long n = gen_xml(NULL, 2000, 17, 300, 1700000000);
+        printf("epg bench: генератор XML %.0f МБ/с\n", n / 1048576.0 / (mono_now() - t));
+        big_epg(10000, 17, 300, 1);
+    }
     test_lang();
     test_clock();
     char cmd[300];

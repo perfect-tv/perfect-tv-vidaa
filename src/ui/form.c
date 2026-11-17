@@ -216,7 +216,7 @@ static void save(void) {
     if (idx == R.cur || R.cur < 0 || R.nch == 0) {
         if (R.cur != idx) { loaders_cancel(); repo_select(idx); }
         if (url_changed || !R.nch) load_playlist(idx, 1);
-        else if (epg_changed) { repo_open_epg(); load_epg(0); }
+        else if (epg_changed) { repo_open_epg(); repo_gc_epg(); load_epg(0); }
     }
 }
 static void del_yes(void *c) {

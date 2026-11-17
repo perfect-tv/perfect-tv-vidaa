@@ -87,7 +87,7 @@ static void build(void) {
             snprintf(when, sizeof when, "%s %s", d, hm);
             if (s->loading) snprintf(sub, sizeof sub, "%s", tr(S_EPG_STATUS_LOADING));
             else if (s->error[0]) snprintf(sub, sizeof sub, "%s", loaders_error_text(s->error));
-            else if (s->idx) snprintf(sub, sizeof sub, tr(S_EPG_STATUS_OK), trp(S_PROGRAMMES_N, s->programmes), when);
+            else if (epg_has_data(s)) snprintf(sub, sizeof sub, tr(S_EPG_STATUS_OK), trp(S_PROGRAMMES_N, s->programmes), when);
             else snprintf(sub, sizeof sub, "%s", tr(S_EPG_STATUS_NONE));
             add(I_EPG_SRC, s->url, sub, NULL, 0);
         }

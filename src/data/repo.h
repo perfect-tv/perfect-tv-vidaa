@@ -121,6 +121,11 @@ int repo_prog_after(const channel *c, int64_t t);     /* первая, начи�
 const char *repo_epg_icon(const channel *c);
 const char *repo_logo(const channel *c);              /* по приоритету логотипов; "" — нет */
 int repo_epg_loading(void);
+void repo_gc_epg(void);                  /* удалить программу источников, не нужных ни одному плейлисту */
+int repo_epg_users(const char *url, int *ids, int max);   /* id плейлистов с этим источником */
+uint32_t repo_epg_users_sig(const char *url);
+/* каналы плейлиста из файла (для сборки программы; можно в рабочем потоке) */
+int repo_read_wants(int pl_id, int default_days, strpool *pool, epg_want **w, int *nw, int *cap);
 
 /* воспроизведение */
 void repo_headers(const channel *c, char *out, size_t cap);     /* "Name: v\r\n"... */
