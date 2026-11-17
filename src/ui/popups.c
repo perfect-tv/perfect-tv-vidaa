@@ -193,7 +193,7 @@ void recent_open(void) {
 static int help_scroll;
 static layer HL;
 static const int HELP[] = {-S_HELP_PLAYER, S_HELP_P1, S_HELP_P2, S_HELP_P3, S_HELP_P4, S_HELP_P5, S_HELP_P6, S_HELP_P7, S_HELP_P8,
-                           -S_HELP_GUIDE, S_HELP_G1, S_HELP_G2, S_HELP_G3, -S_HELP_WINDOWS, S_HELP_W1, S_HELP_W2};
+                           -S_HELP_GUIDE, S_HELP_G1, S_HELP_G2, S_HELP_G3, -S_HELP_WINDOWS, S_HELP_W1, S_HELP_W3, S_HELP_W2};
 #define NHELP ((int)(sizeof HELP / sizeof HELP[0]))
 static int help_key(layer *l, int k, int ev) {
     (void)l;

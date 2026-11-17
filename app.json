@@ -25,6 +25,7 @@
     "src/data/epg.c",
     "src/data/repo.c",
     "src/data/loaders.c",
+    "src/data/search.c",
     "src/player/player.c",
     "src/ui/u.c",
     "src/ui/keys.c",
@@ -37,8 +38,10 @@
     "src/ui/popups.c",
     "src/ui/pin.c",
     "src/ui/settings.c",
+    "src/ui/kbd.c",
     "src/ui/form.c",
     "src/ui/phone.c",
+    "src/ui/search.c",
     "src/main.c"
   ],
   "shell": true,

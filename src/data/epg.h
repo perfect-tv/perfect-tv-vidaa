@@ -73,6 +73,15 @@ void epg_frame(void);
 void epg_cache_free(void);
 long epg_cache_bytes(void);
 
+/* ---- поиск по названиям (рабочий поток: своё открытие выгрузки, кэш главного потока не трогается) ---- */
+typedef struct { const char *id; int64_t from, to; int tag; } epg_sq;   /* канал XMLTV и окно [from, to) */
+typedef void (*epg_hit_cb)(void *ctx, int tag, const epg_item *it);
+/* Передачи, в названии которых есть все words (уже приведены search_fold); до max находок. Число находок. */
+int epg_search(uint32_t hash, uint32_t gen, const epg_sq *q, int nq, const char *const *words, int nw, int max,
+               epg_hit_cb cb, void *ctx, volatile int *cancel);
+/* Нижний регистр (латиница, кириллица), ё → е, всё, кроме букв и цифр, — пробел; пробелы схлопнуты. */
+void search_fold(const char *in, char *out, size_t cap);
+
 /* ---- построение (рабочий поток) ---- */
 typedef struct {
     const char *tvg_id, *tvg_name_key, *name_key;   /* ключи — names_match_key */

@@ -45,6 +45,10 @@ typedef void (*text_fn)(const char *text, void *ctx);
 void form_text(const char *title, const char *initial, int multiline, text_fn done, void *ctx);
 void form_playlist_phone(void);                     /* новый плейлист и сразу окно ввода с телефона */
 
+/* search.c — поиск */
+void search_open(void);
+void search_open_query(const char *q);              /* с готовым запросом */
+
 /* phone.c — ввод с телефона по QR */
 #include "core/phone.h"
 typedef void (*phone_fn)(const phone_result *r, void *ctx);

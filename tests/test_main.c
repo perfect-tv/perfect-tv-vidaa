@@ -472,6 +472,12 @@ static long rss_kb(void) {
     return v;
 }
 
+static void count_hit(void *ctx, int tag, const epg_item *it) {
+    (void)it;
+    int *c = ctx;
+    c[tag == 17 ? 0 : 1]++;
+}
+
 static void big_epg(int nch, int days, int desc, int bench) {
     int64_t now = 1700000000;
     clock_fake(now);
@@ -528,6 +534,21 @@ static void big_epg(int nch, int days, int desc, int bench) {
         if (epg_cache_bytes() > maxc) maxc = epg_cache_bytes();
     }
     double tr_ = mono_now() - t;
+    /* поиск: «канала 17» у ch17 за ±сутки — 49 передач (по часу; окно не по границе часа — с краёв по одной
+       частично), у ch18 в его окне — ни одной */
+    {
+        char f[100];
+        search_fold("Ёлка,  НОВОСТИ!  ", f, sizeof f);
+        EQS(f, "елка новости");
+        epg_sq q[2] = {{"ch17", now - 86400, now + 86400, 17}, {"ch18", now, now + 3600, 18}};
+        const char *words[2] = {"канала", "17"};
+        int cnt[2] = {0, 0};
+        int found = epg_search(h, 1, q, 2, words, 2, 1000, count_hit, cnt, NULL);
+        EQI(found, 49);
+        EQI(cnt[0], 49);
+        EQI(cnt[1], 0);
+        EQI(epg_search(h, 1, q, 1, words, 2, 10, count_hit, cnt, NULL), 10);   /* предел находок */
+    }
     EQI(total, stored);
     EQI(bad, 0);
     CHECK(maxc < (8L << 20));
@@ -641,6 +662,18 @@ static void test_clock(void) {
     char b[16];
     fmt_hm(t, b);
     EQS(b, "01:13");
+    clock_fake(t);
+    lang_set(LANG_RU);
+    char d[40];
+    fmt_day(t, d, sizeof d);
+    EQS(d, "Сегодня");
+    fmt_day(t - 86400, d, sizeof d);
+    EQS(d, "Вчера");
+    fmt_day(t + 86400, d, sizeof d);
+    EQS(d, "Завтра");
+    fmt_day(t - 2 * 86400, d, sizeof d);
+    EQS(d, "Пн, 13.11");
+    clock_fake(0);
     P.tz = TZ_AUTO;
 }
 

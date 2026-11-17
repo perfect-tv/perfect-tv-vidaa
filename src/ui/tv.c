@@ -354,6 +354,7 @@ int tv_key(int k, int ev) {
     case KEY_STOP: if (T.arc) tv_go_live(); else back(); return 1;
     case KEY_BACK: if (ev == EV_SHORT) back(); return 1;
     case KEY_GUIDE: case KEY_GREEN: tv_open_guide(); return 1;
+    case KEY_SEARCH: search_open(); return 1;
     case KEY_INFO: case KEY_BLUE: if (info_visible() && T.info_pinned) T.info_expanded = !T.info_expanded; else tv_show_info(1); return 1;
     case KEY_LIST: tv_open_recent(); return 1;
     case KEY_RED: tv_open_schedule(T.cur, 0); return 1;

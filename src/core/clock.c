@@ -77,7 +77,8 @@ static const int MON[12] = {S_MON_1, S_MON_2, S_MON_3, S_MON_4, S_MON_5, S_MON_6
 
 void fmt_day(int64_t t, char *out, int cap) {
     int64_t today = day_start(clock_now()), d = day_start(t);
-    long diff = (long)((d - today + 43200) / 86400);
+    int64_t x = d - today + 43200;   /* сутки бывают 23 и 25 ч; деление — вниз и для отрицательных */
+    long diff = (long)(x >= 0 ? x / 86400 : -((-x + 86399) / 86400));
     if (diff == 0) { snprintf(out, (size_t)cap, "%s", tr(S_TODAY)); return; }
     if (diff == -1) { snprintf(out, (size_t)cap, "%s", tr(S_YESTERDAY)); return; }
     if (diff == 1) { snprintf(out, (size_t)cap, "%s", tr(S_TOMORROW)); return; }

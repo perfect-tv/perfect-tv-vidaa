@@ -15,7 +15,7 @@
 #include <string.h>
 
 enum { A_WATCH = 1, A_LIVE, A_FROM_START, A_SCHEDULE, A_FAV, A_RECENT, A_ABOUT, A_AUDIO, A_ASPECT, A_SLEEP, A_FAV_UP, A_FAV_DOWN,
-       A_HIDE, A_LOCK, A_CATEGORY, A_GUIDE, A_REMINDERS, A_LIST, A_PLAYLIST_EPG, A_HELP, A_SETTINGS,
+       A_HIDE, A_LOCK, A_CATEGORY, A_GUIDE, A_SEARCH, A_REMINDERS, A_LIST, A_PLAYLIST_EPG, A_HELP, A_SETTINGS,
        A_CAT_HIDE, A_CAT_LOCK, A_VIEW, A_ADAPTIVE, A_HIDDEN, A_PLAYLIST, A_REFRESH_PL, A_REFRESH_EPG };
 enum { P_MAIN, P_CATEGORY, P_LIST, P_PLAYLIST };
 enum { E_TILE, E_HEAD, E_ITEM };
@@ -75,6 +75,7 @@ static void build(void) {
         add(E_ITEM, A_CATEGORY, -1, 1, trf(S_CATEGORY_Q, c->group[0] ? c->group : tr(S_NO_GROUP)), NULL);
         add(E_HEAD, 0, -1, 0, tr(S_GROUP_APP), NULL);
         if (!M.from_guide) add(E_ITEM, A_GUIDE, -1, 0, tr(S_GUIDE), NULL);
+        add(E_ITEM, A_SEARCH, -1, 0, tr(S_SEARCH), NULL);
         char nrem[16];
         snprintf(nrem, sizeof nrem, "%d", R.nrem);
         add(E_ITEM, A_REMINDERS, -1, 0, tr(S_REMINDERS), R.nrem ? nrem : NULL);
@@ -192,6 +193,7 @@ static void activate(ent *e, int dir) {
     case A_LOCK: lock_toggle(0); return;
     case A_CATEGORY: M.main_focus = M.focus; M.page = P_CATEGORY; M.focus = 0; break;
     case A_GUIDE: close_menu(); tv_open_guide(); break;
+    case A_SEARCH: close_menu(); search_open(); break;
     case A_REMINDERS: close_menu(); tv_open_schedule(c, 1); break;
     case A_LIST: M.main_focus = M.focus; M.page = P_LIST; M.focus = 0; break;
     case A_PLAYLIST_EPG: M.main_focus = M.focus; M.page = P_PLAYLIST; M.focus = 0; break;

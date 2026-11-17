@@ -526,6 +526,62 @@ uint32_t epg_want_hash(const epg_want *w, int nw) {
     return h ? h : 1;
 }
 
+/* ================= поиск ================= */
+void search_fold(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    int space = 1;
+    const char *p = in;
+    uint32_t cp;
+    while (cap && (cp = u8_next(&p))) {
+        cp = u8_lower(cp);
+        if (cp == 0x451) cp = 0x435;   /* ё -> е */
+        if (!u8_is_letter(cp)) {
+            if (!space && o + 1 < cap) { out[o++] = ' '; space = 1; }
+            continue;
+        }
+        char b[4];
+        int n = u8_put(b, cp);
+        if (o + (size_t)n + 1 >= cap) break;
+        memcpy(out + o, b, (size_t)n);
+        o += (size_t)n;
+        space = 0;
+    }
+    while (o && out[o - 1] == ' ') o--;
+    if (cap) out[o] = 0;
+}
+
+int epg_search(uint32_t hash, uint32_t gen, const epg_sq *q, int nq, const char *const *words, int nw, int max,
+               epg_hit_cb cb, void *ctx, volatile int *cancel) {
+    epg_store *st = store_open(hash, gen);
+    if (!st) return 0;
+    int found = 0;
+    char low[600];
+    for (int i = 0; i < nq && found < max && !(cancel && *cancel); i++) {
+        ech *c = find_ch(st, q[i].id);
+        if (!c || q[i].to <= q[i].from) continue;
+        for (int k = 0; k < c->n && found < max; k++) {
+            const ck *e = &c->c[k];
+            if ((int64_t)e->stop1 <= q[i].from || (int64_t)e->start0 >= q[i].to) continue;
+            uint32_t n;
+            unsigned char *raw = read_chunk(st->fd, e, &n);
+            for (uint32_t j = 0; raw && j < n && found < max; j++) {
+                epg_item it;
+                rec_at(raw, n, e->rlen, j, &it);
+                if (it.stop <= q[i].from || it.start >= q[i].to || !*it.title) continue;
+                search_fold(it.title, low, sizeof low);
+                int ok = 1;
+                for (int w = 0; w < nw && ok; w++) if (!strstr(low, words[w])) ok = 0;
+                if (!ok) continue;
+                cb(ctx, q[i].tag, &it);
+                found++;
+            }
+            free(raw);
+        }
+    }
+    store_close(st);
+    return found;
+}
+
 /* ================= построение ================= */
 typedef struct { uint32_t start, stop, off[5]; int is_new; } crec;
 typedef struct { ck *c; int n, cap; uint32_t total; int carried; } bslot;

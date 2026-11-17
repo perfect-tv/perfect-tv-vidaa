@@ -234,6 +234,7 @@ static int key(layer *l, int k, int ev) {
             for (int i = 0; i < n; i++) if (g->ch[i]->num == num) { G.ci = i; fit(); break; }
         } else if (k == KEY_BACK && ev == EV_SHORT) layer_pop(&L);
         else if (k == KEY_GREEN || k == KEY_GUIDE) layer_pop(&L);
+        else if (k == KEY_SEARCH) search_open();
         return 1;
     case Z_GRID:
         if (k == KEY_LEFT || k == KEY_RIGHT) grid_step(k == KEY_RIGHT ? 1 : -1);
