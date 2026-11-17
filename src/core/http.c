@@ -63,6 +63,9 @@ struct hs {
     char etag[160], last_modified[64], location[2048], error[120];
     char final_url[4096];         /* после редиректов (база для относительных адресов HLS) */
     char resp[8192]; size_t resp_n;   /* заголовки последнего ответа «Имя: значение\r\n» */
+    /* keep-alive */
+    int keepalive, reused, server_close, done;
+    char pkey[300];
     volatile int *cancel;
     /* буфер чтения сырых байтов */
     char buf[16384]; size_t bpos, blen;
@@ -253,7 +256,75 @@ static void resolve(const char *base, const char *loc, char *out, size_t cap) {
     snprintf(out, cap, "%s://%s%s%s", b.scheme, hostport, dir, loc);
 }
 
+/* ---------- пул открытых соединений (keep-alive) ----------
+ * Соединение возвращается в пул, только если ответ прочитан до конца и сервер не просил закрыть. Перед
+ * повторным использованием — проверка, что сервер его не закрыл (сокет не «читается»); не вышло запросом —
+ * один повтор на новом соединении. */
+#define POOL_MAX 8
+#define POOL_IDLE 20.0
+typedef struct { char key[300]; int fd; SSL *ssl; double t; } pooled;
+static pooled POOL[POOL_MAX];
+static pthread_mutex_t pool_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void pool_drop(pooled *p) {
+    if (p->ssl) SSL_free(p->ssl);
+    if (p->fd >= 0) close(p->fd);
+    p->key[0] = 0;
+    p->fd = -1;
+    p->ssl = NULL;
+}
+static int alive(int fd) {
+    struct pollfd p = {fd, POLLIN, 0};
+    return poll(&p, 1, 0) == 0;   /* читается — значит, сервер закрыл (или прислал лишнее) */
+}
+static int pool_take(const char *key, int *fd, SSL **ssl) {
+    int ok = 0;
+    double now = mono_now();
+    pthread_mutex_lock(&pool_mu);
+    for (int i = 0; i < POOL_MAX && !ok; i++) {
+        pooled *p = &POOL[i];
+        if (!p->key[0]) continue;
+        if (now - p->t > POOL_IDLE || !alive(p->fd)) { pool_drop(p); continue; }
+        if (strcmp(p->key, key)) continue;
+        *fd = p->fd;
+        *ssl = p->ssl;
+        p->key[0] = 0;
+        p->fd = -1;
+        p->ssl = NULL;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&pool_mu);
+    return ok;
+}
+static void pool_put(hs *h) {
+    pthread_mutex_lock(&pool_mu);
+    int slot = -1;
+    double oldest = 1e300;
+    for (int i = 0; i < POOL_MAX; i++) {
+        if (!POOL[i].key[0]) { slot = i; break; }
+        if (POOL[i].t < oldest) { oldest = POOL[i].t; slot = i; }
+    }
+    if (POOL[slot].key[0]) pool_drop(&POOL[slot]);
+    snprintf(POOL[slot].key, sizeof POOL[slot].key, "%s", h->pkey);
+    POOL[slot].fd = h->fd;
+    POOL[slot].ssl = h->ssl;
+    POOL[slot].t = mono_now();
+    pthread_mutex_unlock(&pool_mu);
+    h->fd = -1;
+    h->ssl = NULL;
+}
+/* ответ прочитан до конца — соединение можно отдать следующему запросу */
+static int reusable(hs *h) {
+    if (!h->keepalive || h->fd < 0 || h->server_close || h->bpos < h->blen) return 0;
+    if (h->status == 304 || h->status == 204) return 1;
+    if (h->chunked) return h->done;
+    return h->length >= 0 && h->received == h->length;
+}
+
 static int conn_open(hs *h, const url_t *u) {
+    snprintf(h->pkey, sizeof h->pkey, "%s://%s:%s|%d", u->scheme, u->host, u->port, P.any_cert);
+    h->reused = 0;
+    if (h->keepalive && pool_take(h->pkey, &h->fd, &h->ssl)) { h->reused = 1; return 0; }
     struct addrinfo hints = {0}, *res = NULL, *ai;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -313,10 +384,26 @@ static int header_is(const char *line, const char *name, const char **val) {
     return 1;
 }
 
+static int request1(hs *h, const char *url, const hs_req *rq, const url_t *uu);
 static int request(hs *h, const char *url, const hs_req *rq) {
     url_t u;
     if (parse_url(url, &u)) { snprintf(h->error, sizeof h->error, "bad url"); return -1; }
     if (conn_open(h, &u)) return -1;
+    int rc = request1(h, url, rq, &u);
+    if (rc == -2) {   /* соединение из пула оказалось закрытым сервером — один раз заново */
+        conn_close(h);
+        h->bpos = h->blen = 0;
+        h->error[0] = 0;
+        int ka = h->keepalive;
+        h->keepalive = 0;
+        if (conn_open(h, &u)) { h->keepalive = ka; return -1; }
+        h->keepalive = ka;
+        rc = request1(h, url, rq, &u);
+    }
+    return rc < 0 ? -1 : 0;
+}
+static int request1(hs *h, const char *url, const hs_req *rq, const url_t *uu) {
+    url_t u = *uu;
     sbuf b = {0};
     sb_printf(&b, "GET %s HTTP/1.1\r\nHost: %s", u.path, u.host);
     if ((!strcmp(u.scheme, "https") && strcmp(u.port, "443")) || (!strcmp(u.scheme, "http") && strcmp(u.port, "80"))) sb_printf(&b, ":%s", u.port);
@@ -325,7 +412,8 @@ static int request(hs *h, const char *url, const hs_req *rq) {
     if (!has_ua) sb_add(&b, "User-Agent: PerfectTV/" PTV_VERSION " (VIDAA; native)\r\n");
     if (!(rq->headers && strcasestr(rq->headers, "\naccept:")) && !(rq->headers && !strncasecmp(rq->headers, "accept:", 7))) sb_add(&b, "Accept: */*\r\n");
     /* raw (ретранслятор): тело как есть, без сжатия — байты уходят плееру, плейлист переписывается */
-    sb_add(&b, rq->raw ? "Accept-Encoding: identity\r\nConnection: close\r\n" : "Accept-Encoding: gzip\r\nConnection: close\r\n");
+    sb_add(&b, rq->raw ? "Accept-Encoding: identity\r\n" : "Accept-Encoding: gzip\r\n");
+    sb_add(&b, h->keepalive ? "Connection: keep-alive\r\n" : "Connection: close\r\n");
     if (u.auth[0]) sb_printf(&b, "Authorization: Basic %s\r\n", u.auth);
     if (rq->etag && *rq->etag) sb_printf(&b, "If-None-Match: %s\r\n", rq->etag);
     if (rq->last_modified && *rq->last_modified) sb_printf(&b, "If-Modified-Since: %s\r\n", rq->last_modified);
@@ -333,11 +421,13 @@ static int request(hs *h, const char *url, const hs_req *rq) {
     sb_add(&b, "\r\n");
     int rc = raw_write(h, b.s, b.n);
     sb_free(&b);
-    if (rc) { snprintf(h->error, sizeof h->error, "write failed"); return -1; }
+    if (rc) { snprintf(h->error, sizeof h->error, "write failed"); return h->reused ? -2 : -1; }
     char line[4200];
-    if (getline_(h, line, sizeof line) < 0) { if (!h->error[0]) snprintf(h->error, sizeof h->error, "no response"); return -1; }
+    if (getline_(h, line, sizeof line) < 0) { if (!h->error[0]) snprintf(h->error, sizeof h->error, "no response"); return h->reused && !cancelled(h) ? -2 : -1; }
     if (strncmp(line, "HTTP/", 5) || !strchr(line, ' ')) { snprintf(h->error, sizeof h->error, "bad response"); return -1; }
     h->status = atoi(strchr(line, ' ') + 1);
+    h->server_close = !strncmp(line, "HTTP/1.0", 8);
+    h->done = 0;
     h->resp_n = 0;
     h->resp[0] = 0;
     h->length = -1;
@@ -352,6 +442,7 @@ static int request(hs *h, const char *url, const hs_req *rq) {
         const char *v;
         if (header_is(line, "Content-Length", &v)) h->length = atoll(v);
         else if (header_is(line, "Transfer-Encoding", &v)) h->chunked = strcasestr(v, "chunked") != NULL;
+        else if (header_is(line, "Connection", &v)) h->server_close = strcasestr(v, "close") != NULL;
         else if (header_is(line, "Location", &v)) resolve(url, v, h->location, sizeof h->location);
         else if (header_is(line, "ETag", &v)) snprintf(h->etag, sizeof h->etag, "%s", v);
         else if (header_is(line, "Last-Modified", &v)) snprintf(h->last_modified, sizeof h->last_modified, "%s", v);
@@ -368,6 +459,7 @@ hs *hs_open(const hs_req *rq, char *err, size_t errn) {
     h->fd = -1;
     h->timeout = rq->timeout_ms > 0 ? rq->timeout_ms : 30000;
     h->cancel = rq->cancel;
+    h->keepalive = rq->keepalive;
     const char *u = rq->url;
     if (!strncasecmp(u, "file://", 7) || u[0] == '/') {   /* файл на ТВ (USB) */
         const char *path = u[0] == '/' ? u : u + 7;
@@ -439,7 +531,13 @@ long hs_read(hs *h, void *buf, size_t n) {
             if (h->chunk_left == 0 && getline_(h, line, sizeof line) < 0) return -1;   /* CRLF после куска */
             if (getline_(h, line, sizeof line) < 0) { snprintf(h->error, sizeof h->error, "chunk cut"); return -1; }
             h->chunk_left = strtoll(line, NULL, 16);
-            if (h->chunk_left <= 0) { h->eof = 1; return 0; }
+            if (h->chunk_left <= 0) {   /* последний кусок: дочитать трейлеры до пустой строки */
+                int n;
+                while ((n = getline_(h, line, sizeof line)) > 0) {}
+                h->done = n == 0;
+                h->eof = 1;
+                return 0;
+            }
         }
         if ((long long)n > h->chunk_left) n = (size_t)h->chunk_left;
         long r = body_raw(h, buf, n);
@@ -466,6 +564,7 @@ long hs_read(hs *h, void *buf, size_t n) {
 void hs_close(hs *h) {
     if (!h) return;
     if (h->file) fclose(h->file);
+    if (reusable(h)) pool_put(h);
     conn_close(h);
     free(h);
 }

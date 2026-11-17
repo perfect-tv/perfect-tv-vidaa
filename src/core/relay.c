@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -367,52 +368,47 @@ static const char *reason(int code) {
     }
 }
 
-static void *client(void *arg) {
-    int fd = (int)(intptr_t)arg;
-    struct timeval tv = {15, 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    char req[16384];
-    size_t rl = 0;
-    while (rl + 1 < sizeof req) {
-        ssize_t r = recv(fd, req + rl, sizeof req - 1 - rl, 0);
-        if (r <= 0) break;
-        rl += (size_t)r;
-        req[rl] = 0;
-        if (strstr(req, "\r\n\r\n")) break;
-    }
-    req[rl] = 0;
+#define MAX_CONN 16
+static atomic_int active;
+
+static int send_chunk(int fd, const char *d, size_t n) {
+    char h[24];
+    snprintf(h, sizeof h, "%zx\r\n", n);
+    return send_all(fd, h, strlen(h)) || send_all(fd, d, n) || send_all(fd, "\r\n", 2);
+}
+
+/* Один запрос плеера (заголовки — до пустой строки, без неё). 1 — соединение можно оставить для следующего. */
+static int serve(int fd, char *req) {
     char path[12000] = "";
-    if (sscanf(req, "GET %11999s", path) != 1 || strncmp(path, "/s?", 3)) { reply_status(fd, 404); close(fd); return NULL; }
+    if (sscanf(req, "GET %11999s", path) != 1 || strncmp(path, "/s?", 3)) { reply_status(fd, 404); return 0; }
+    int client_close = strcasestr(req, "\nConnection: close") != NULL;
     char *url = malloc(4096), *hdr = malloc(4096);
     query_get(path + 3, "u", url, 4096);
     query_get(path + 3, "h", hdr, 4096);
     /* заголовки запроса плеера (после строки запроса) — провайдеру, кроме заголовков соединения */
     sbuf fwd = {0};
     sb_add(&fwd, hdr);
-    char *hs0 = strstr(req, "\r\n"), *he = strstr(req, "\r\n\r\n");
-    if (hs0 && he && he > hs0) {
-        *he = 0;
-        each_line(hs0 + 2, req_fn, &fwd, hdr);
-    }
+    char *hs0 = strstr(req, "\r\n");
+    if (hs0) each_line(hs0 + 2, req_fn, &fwd, hdr);
     pthread_mutex_lock(&D.mu);
     int gen = D.gen;
     pthread_mutex_unlock(&D.mu);
     volatile int cancel = 0;
-    hs_req rq = {.url = url, .headers = fwd.n ? fwd.s : NULL, .timeout_ms = 20000, .cancel = &cancel, .raw = 1};
+    hs_req rq = {.url = url, .headers = fwd.n ? fwd.s : NULL, .timeout_ms = 20000, .cancel = &cancel, .raw = 1, .keepalive = 1};
     char err[120] = "";
     hs *h = hs_open(&rq, err, sizeof err);
     if (!h) {
         int code = !strncmp(err, "http_", 5) ? atoi(err + 5) : 502;
         reply_status(fd, code >= 300 && code < 600 ? code : 502);
         fprintf(stderr, "relay_open_failed %s\n", strncmp(err, "http_", 5) ? "network" : err);
-        sb_free(&fwd); free(url); free(hdr); close(fd);
-        return NULL;
+        sb_free(&fwd); free(url); free(hdr);
+        return 0;
     }
-    int status = hs_status(h);
+    int status = hs_status(h), keep = 0;
     sbuf head = {0};
     sb_printf(&head, "HTTP/1.1 %d %s\r\n", status, reason(status));
     each_line(hs_headers(h), resp_fn, &head, NULL);
+    const char *conn = client_close ? "Connection: close\r\n\r\n" : "Connection: keep-alive\r\n\r\n";
     char *buf = malloc(65536);
     long n = buf && status != 304 ? hs_read(h, buf, 65536) : 0;
     const char *enc = strcasestr(hs_headers(h), "\nContent-Encoding:");
@@ -423,30 +419,65 @@ static void *client(void *arg) {
         sb_addn(&body, buf, (size_t)n);
         while ((n = hs_read(h, buf, 65536)) > 0 && body.n < PLAYLIST_MAX) sb_addn(&body, buf, (size_t)n);
         rewrite_playlist(&out, body.s, body.n, hs_url(h), hdr);
-        sb_printf(&head, "Content-Length: %zu\r\nConnection: close\r\n\r\n", out.n);
-        if (!send_all(fd, head.s, head.n)) send_all(fd, out.s ? out.s : "", out.n);
+        sb_printf(&head, "Content-Length: %zu\r\n%s", out.n, conn);
+        keep = !send_all(fd, head.s, head.n) && !send_all(fd, out.s ? out.s : "", out.n) && n == 0;
         sb_free(&body);
         sb_free(&out);
     } else if (n >= 0) {
-        long long len = hs_length(h);
-        if (status == 304) sb_add(&head, "Content-Length: 0\r\n");
-        else if (len >= 0) sb_printf(&head, "Content-Length: %lld\r\n", len);
-        sb_add(&head, "Connection: close\r\n\r\n");
+        long long len = status == 304 ? 0 : hs_length(h);
+        int chunked = len < 0;   /* длина неизвестна — куски, чтобы соединение пережило ответ */
+        if (chunked) sb_add(&head, "Transfer-Encoding: chunked\r\n");
+        else sb_printf(&head, "Content-Length: %lld\r\n", len);
+        sb_add(&head, conn);
         int ok = !send_all(fd, head.s, head.n);
         while (ok && n > 0) {
             pthread_mutex_lock(&D.mu);
             if (D.gen == gen) tap_locked((const uint8_t *)buf, (size_t)n);   /* прежняя ссылка — не разбирать */
             pthread_mutex_unlock(&D.mu);
-            if (send_all(fd, buf, (size_t)n)) break;   /* плеер закрыл соединение */
+            if (chunked ? send_chunk(fd, buf, (size_t)n) : send_all(fd, buf, (size_t)n)) { ok = 0; break; }   /* плеер закрыл */
             n = hs_read(h, buf, 65536);
         }
+        if (ok && n == 0 && chunked) ok = !send_all(fd, "0\r\n\r\n", 5);
+        keep = ok && n == 0;
     }
     sb_free(&head);
     sb_free(&fwd);
     free(buf);
-    hs_close(h);
+    hs_close(h);   /* дочитанное соединение к провайдеру — в пул */
     free(url);
     free(hdr);
+    return keep && !client_close;
+}
+
+static void *client(void *arg) {
+    int fd = (int)(intptr_t)arg;
+    struct timeval tv = {15, 0};   /* и предел простоя между запросами плеера */
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    if (atomic_fetch_add(&active, 1) >= MAX_CONN) {
+        const char *busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        send_all(fd, busy, strlen(busy));
+    } else {
+        char req[16384];
+        size_t rl = 0;
+        for (;;) {   /* keep-alive: запросы плеера один за другим */
+            char *end;
+            while (!(req[rl] = 0, end = strstr(req, "\r\n\r\n"))) {
+                if (rl + 1 >= sizeof req) { rl = 0; break; }
+                ssize_t r = recv(fd, req + rl, sizeof req - 1 - rl, 0);
+                if (r <= 0) { rl = 0; break; }
+                rl += (size_t)r;
+            }
+            if (!rl || !end) break;
+            size_t used = (size_t)(end - req) + 4;
+            *end = 0;
+            int keep = serve(fd, req);
+            memmove(req, req + used, rl - used);
+            rl -= used;
+            if (!keep) break;
+        }
+    }
+    atomic_fetch_sub(&active, 1);
     close(fd);
     return NULL;
 }

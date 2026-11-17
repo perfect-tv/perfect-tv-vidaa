@@ -29,6 +29,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include "core/http.h"
 
 extern const unsigned char ptv_font_regular[], ptv_font_regular_end[], ptv_font_bold[], ptv_font_bold_end[];
@@ -839,40 +840,84 @@ static void pes(sbuf *out, int sid, int64_t pts, const uint8_t *data, size_t n) 
     sb_addn(out, (const char *)h, 14);
     sb_addn(out, (const char *)data, n);
 }
-/* поддельный «провайдер» для ретранслятора: плейлист HLS и сегмент */
-static struct { int fd, port; sbuf seg; } UP;
+/* поддельный «провайдер» для ретранслятора: плейлист HLS и сегмент; keep-alive, после 3 запросов на соединении
+ * молча закрывает его (как сервер по пределу или простою) */
+static struct { int fd, port; sbuf seg; atomic_int conns, reqs; } UP;
+static void up_answer(int c, const char *req) {
+    char head[400];
+    if (strstr(req, "GET /live/pl.m3u8")) {
+        const char *pl = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:6,\nseg1.ts?x=1\n";
+        snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nSet-Cookie: sid=abc; Domain=.provider.tv; Path=/; Secure; HttpOnly\r\n\r\n", strlen(pl));
+        if (send(c, head, strlen(head), 0) < 0 || send(c, pl, strlen(pl), 0) < 0) {}
+    } else if (strstr(req, "GET /live/seg1.ts?x=1") && strstr(req, "User-Agent: Test/1") && !strstr(req, "PerfectTV/") &&
+               !strstr(req, "Accept-Encoding: gzip")) {
+        const char *rg = strstr(req, "Range: bytes=");
+        if (rg && strstr(req, "Cookie: sid=abc")) {   /* часть — 206, как у настоящего сервера */
+            size_t a0 = (size_t)atol(rg + 13), b0 = (size_t)atol(strchr(rg, '-') + 1);
+            snprintf(head, sizeof head, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes %zu-%zu/%zu\r\nContent-Length: %zu\r\n\r\n",
+                     a0, b0, UP.seg.n, b0 - a0 + 1);
+            if (send(c, head, strlen(head), 0) < 0 || send(c, UP.seg.s + a0, b0 - a0 + 1, 0) < 0) {}
+        } else {
+            snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", UP.seg.n);
+            if (send(c, head, strlen(head), 0) < 0 || send(c, UP.seg.s, UP.seg.n, 0) < 0) {}
+        }
+    } else if (strstr(req, "GET /live/chunked.ts")) {   /* длина неизвестна: куски */
+        const char *h0 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        if (send(c, h0, strlen(h0), 0) < 0) {}
+    } else {
+        const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        if (send(c, nf, strlen(nf), 0) < 0) {}
+    }
+}
+static void *up_conn(void *a) {
+    int c = (int)(intptr_t)a;
+    char req[4096];
+    for (int k = 0; k < 3; k++) {
+        size_t n = 0;
+        req[0] = 0;
+        while (n < sizeof req - 1 && !strstr(req, "\r\n\r\n")) { ssize_t r = recv(c, req + n, sizeof req - 1 - n, 0); if (r <= 0) { close(c); return NULL; } n += (size_t)r; req[n] = 0; }
+        atomic_fetch_add(&UP.reqs, 1);
+        up_answer(c, req);
+    }
+    close(c);
+    return NULL;
+}
 static void *upstream(void *a) {
     (void)a;
-    for (int k = 0; k < 9; k++) {
+    for (;;) {
         int c = accept(UP.fd, NULL, NULL);
         if (c < 0) break;
-        char req[4096] = "";
-        size_t n = 0;
-        while (n < sizeof req - 1 && !strstr(req, "\r\n\r\n")) { ssize_t r = recv(c, req + n, sizeof req - 1 - n, 0); if (r <= 0) break; n += (size_t)r; req[n] = 0; }
-        char head[256];
-        if (strstr(req, "GET /live/pl.m3u8")) {
-            const char *pl = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:6,\nseg1.ts?x=1\n";
-            snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nSet-Cookie: sid=abc; Domain=.provider.tv; Path=/; Secure; HttpOnly\r\nConnection: close\r\n\r\n", strlen(pl));
-            if (send(c, head, strlen(head), 0) < 0 || send(c, pl, strlen(pl), 0) < 0) {}
-        } else if (strstr(req, "GET /live/seg1.ts?x=1") && strstr(req, "User-Agent: Test/1") && !strstr(req, "PerfectTV/") &&
-                   !strstr(req, "Accept-Encoding: gzip")) {
-            const char *rg = strstr(req, "Range: bytes=");
-            if (rg && strstr(req, "Cookie: sid=abc")) {   /* часть — 206, как у настоящего сервера */
-                size_t a0 = (size_t)atol(rg + 13), b0 = (size_t)atol(strchr(rg, '-') + 1);
-                snprintf(head, sizeof head, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes %zu-%zu/%zu\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
-                         a0, b0, UP.seg.n, b0 - a0 + 1);
-                if (send(c, head, strlen(head), 0) < 0 || send(c, UP.seg.s + a0, b0 - a0 + 1, 0) < 0) {}
-            } else {
-                snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", UP.seg.n);
-                if (send(c, head, strlen(head), 0) < 0 || send(c, UP.seg.s, UP.seg.n, 0) < 0) {}
-            }
-        } else {
-            const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            if (send(c, nf, strlen(nf), 0) < 0) {}
-        }
-        close(c);
+        atomic_fetch_add(&UP.conns, 1);
+        pthread_t t;
+        if (!pthread_create(&t, NULL, up_conn, (void *)(intptr_t)c)) pthread_detach(t);
     }
     return NULL;
+}
+/* несколько запросов в одном соединении с ретранслятором (keep-alive со стороны плеера) */
+static int two_on_one(const char *relay_url_a, const char *relay_url_b) {
+    const char *pa = strstr(relay_url_a + 7, "/"), *pb = strstr(relay_url_b + 7, "/");
+    int port = atoi(strchr(relay_url_a + 7, ':') + 1);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa)) { close(fd); return -1; }
+    char q[9000];
+    snprintf(q, sizeof q, "GET %s HTTP/1.1\r\nHost: x\r\n\r\nGET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", pa, pb);
+    if (send(fd, q, strlen(q), 0) < 0) {}
+    sbuf b = {0};
+    char buf[8192];
+    ssize_t r;
+    struct timeval tv = {5, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    while ((r = recv(fd, buf, sizeof buf, 0)) > 0) sb_addn(&b, buf, (size_t)r);
+    close(fd);
+    int n = 0;   /* в теле — двоичный TS с нулями: искать memmem, не strstr */
+    for (const char *p = b.s, *e = b.s + b.n; p && p < e && (p = memmem(p, (size_t)(e - p), "HTTP/1.1 200", 12)); p++) n++;
+    static const char want[] = "\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    const char *hw = b.n ? memmem(b.s, b.n, want, sizeof want - 1) : NULL;
+    int ok = n == 2 && hw;   /* второй ответ — кусками, как и пришёл от провайдера без длины */
+    sb_free(&b);
+    return ok;
 }
 static char resp_hdr[8192];
 static char *fetch_h(const char *url, const char *headers, size_t *len) {
@@ -899,6 +944,8 @@ static void test_relay_http(void) {
     UP.port = ntohs(sa.sin_port);
     pthread_t th;
     pthread_create(&th, NULL, upstream, NULL);
+    atomic_store(&UP.conns, 0);
+    atomic_store(&UP.reqs, 0);
     relay_reset();
     char src[200], url[4096];
     snprintf(src, sizeof src, "http://127.0.0.1:%d/live/pl.m3u8", UP.port);
@@ -926,11 +973,24 @@ static void test_relay_http(void) {
     CHECK(body && n == 188 && !memcmp(body, UP.seg.s + 188, 188));
     CHECK(starts_with(resp_hdr, "206\n") && strstr(resp_hdr, "Content-Range: bytes 188-375/"));
     free(body);
+    /* keep-alive к провайдеру: 3 запроса — одно соединение (дальше провайдер его закрыл — новое, без ошибки) */
+    EQI(atomic_load(&UP.reqs), 3);
+    EQI(atomic_load(&UP.conns), 1);
+    body = segurl[0] ? fetch(segurl, &n) : NULL;
+    CHECK(body && n == UP.seg.n);
+    free(body);
+    EQI(atomic_load(&UP.conns), 2);
+    /* keep-alive к плееру: два запроса в одном соединении, второй — кусками (длина у провайдера неизвестна) */
+    char churl[300], rch[4096];
+    snprintf(churl, sizeof churl, "http://127.0.0.1:%d/live/chunked.ts", UP.port);
+    CHECK(!relay_url(churl, "User-Agent: Test/1\r\n", rch, sizeof rch));
+    CHECK(two_on_one(segurl, rch) == 1);
     CHECK(relay_has_teletext());   /* и попутно разобраны */
     CHECK(relay_ts_bytes() >= (long long)UP.seg.n);
     shutdown(UP.fd, SHUT_RDWR);
     close(UP.fd);
     pthread_join(th, NULL);
+    usleep(100000);   /* потоки соединений провайдера дочитывают и закрываются */
 }
 
 static void test_teletext(void) {
