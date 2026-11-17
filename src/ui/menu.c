@@ -66,10 +66,9 @@ static void build(void) {
         if (pi >= 0) add(E_ITEM, A_ABOUT, -1, 0, tr(S_ABOUT_PROGRAMME), NULL);
         if (playing && pl_audio_count() > 1) add(E_ITEM, A_AUDIO, -1, 0, tr(S_AUDIO_TRACKS), pl_audio_label(pl_audio_selected()));
         if (playing && !pl_software()) add(E_ITEM, A_ASPECT, -1, 0, tr(S_ASPECT), aspect_name(P.aspect));
-        /* через ретранслятор дорожки известны: нет телетекста — нет и пунктов; напрямую — неизвестно, пункты есть */
-        int ttx_maybe = playing && (!T.relayed || tv_has_teletext());
-        if (ttx_maybe) add(E_ITEM, A_TELETEXT, -1, 0, tr(S_TELETEXT), NULL);
-        if (ttx_maybe && (!T.relayed || tv_has_subtitles() || T.subs)) add(E_ITEM, A_SUBS, -1, 0, tr(S_SUBTITLES), tr(T.subs ? S_ON : S_OFF));
+        /* дорожки известны (через ретранслятор — из его разбора, напрямую — от системного плеера): нет — нет и пункта */
+        if (playing && tv_has_teletext()) add(E_ITEM, A_TELETEXT, -1, 0, tr(S_TELETEXT), NULL);
+        if (playing && (tv_has_subtitles() || T.subs)) add(E_ITEM, A_SUBS, -1, 1, tr(S_SUBTITLES_MENU), subs_current_label());
         add(E_ITEM, A_SLEEP, -1, 0, tr(S_SLEEP), sleep_name());
         add(E_HEAD, 0, -1, 0, tr(S_GROUP_CHANNEL), NULL);
         group *g = repo_group(M.group);
@@ -199,7 +198,7 @@ static void activate(ent *e, int dir) {
     case A_GUIDE: close_menu(); tv_open_guide(); break;
     case A_SEARCH: close_menu(); search_open(); break;
     case A_TELETEXT: close_menu(); tv_teletext(); break;
-    case A_SUBS: tv_set_subtitles(!T.subs); build(); break;
+    case A_SUBS: close_menu(); subs_menu_open(); break;
     case A_REMINDERS: close_menu(); tv_open_schedule(c, 1); break;
     case A_LIST: M.main_focus = M.focus; M.page = P_LIST; M.focus = 0; break;
     case A_PLAYLIST_EPG: M.main_focus = M.focus; M.page = P_PLAYLIST; M.focus = 0; break;

@@ -10,6 +10,8 @@
 #include "core/usb.h"
 #include "core/relay.h"
 #include "core/ttx.h"
+#include "core/dvbsub.h"
+#include "core/webvtt.h"
 #include "core/util.h"
 #include "data/catchup.h"
 #include "data/backup.h"
@@ -847,7 +849,8 @@ static struct { int fd, port; sbuf seg; atomic_int conns, reqs; atomic_llong big
 static void up_answer(int c, const char *req) {
     char head[400];
     if (strstr(req, "GET /live/pl.m3u8")) {
-        const char *pl = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:6,\nseg1.ts?x=1\n";
+        const char *pl = "#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"s\",NAME=\"Русские\",LANGUAGE=\"ru\",URI=\"subs/ru.m3u8\"\n"
+                         "#EXT-X-TARGETDURATION:6\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:6,\nseg1.ts?x=1\n";
         snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nSet-Cookie: sid=abc; Domain=.provider.tv; Path=/; Secure; HttpOnly\r\n\r\n", strlen(pl));
         if (send(c, head, strlen(head), 0) < 0 || send(c, pl, strlen(pl), 0) < 0) {}
     } else if (strstr(req, "GET /live/seg1.ts?x=1") && strstr(req, "User-Agent: Test/1") && !strstr(req, "PerfectTV/") &&
@@ -873,6 +876,14 @@ static void up_answer(int c, const char *req) {
             sent += w;
             atomic_store(&UP.big_sent, sent);
         }
+    } else if (strstr(req, "GET /live/subs/ru.m3u8") && strstr(req, "User-Agent: Test/1")) {
+        const char *pl = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nru0.vtt\n#EXT-X-ENDLIST\n";
+        snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", strlen(pl));
+        if (send(c, head, strlen(head), 0) < 0 || send(c, pl, strlen(pl), 0) < 0) {}
+    } else if (strstr(req, "GET /live/subs/ru0.vtt")) {
+        const char *v = "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:03.000\nПривет из WebVTT\n";
+        snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", strlen(v));
+        if (send(c, head, strlen(head), 0) < 0 || send(c, v, strlen(v), 0) < 0) {}
     } else if (strstr(req, "GET /live/chunked.ts")) {   /* длина неизвестна: куски */
         const char *h0 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
         if (send(c, h0, strlen(h0), 0) < 0) {}
@@ -917,7 +928,7 @@ static int threads_now(void) {
         snprintf(p, sizeof p, "/proc/self/task/%s/comm", e->d_name);
         FILE *f = fopen(p, "r");
         if (f) { if (!fgets(name, sizeof name, f)) name[0] = 0; fclose(f); }
-        if (!strncmp(name, "ptv-", 4)) n++;
+        if (!strncmp(name, "ptv-relay", 9) || !strncmp(name, "ptv-dns", 7)) n++;
     }
     if (d) closedir(d);
     return n;
@@ -1066,6 +1077,26 @@ static void test_relay_http(void) {
     snprintf(churl, sizeof churl, "http://127.0.0.1:%d/live/chunked.ts", UP.port);
     CHECK(!relay_url(churl, "User-Agent: Test/1\r\n", rch, sizeof rch));
     CHECK(two_on_one(segurl, rch) == 1);
+    /* субтитры WebVTT из главного плейлиста: ретранслятор запомнил, загрузчик забрал реплики */
+    relay_vtt vt[4];
+    EQI(relay_vtt_list(vt, 4), 1);
+    if (relay_vtt_list(vt, 4) == 1) {
+        EQS(vt[0].lang, "ru");
+        EQS(vt[0].name, "Русские");
+        char want[200];
+        snprintf(want, sizeof want, "http://127.0.0.1:%d/live/subs/ru.m3u8", UP.port);
+        EQS(vt[0].url, want);
+        webvtt_clock(900000, 0);
+        webvtt_start(vt[0].url, vt[0].hdr);
+        for (int i = 0; i < 100 && !webvtt_cues(); i++) usleep(20000);
+        char txt[200];
+        EQI(webvtt_cues(), 1);
+        CHECK(!webvtt_text_at(900000 + 45000, txt, sizeof txt));      /* до 1 с — ничего */
+        webvtt_text_at(900000 + 90000 * 2, txt, sizeof txt);
+        EQS(txt, "Привет из WebVTT");
+        webvtt_stop();
+        EQI(webvtt_cues(), 0);
+    }
     relay_many(segurl);
     char bigsrc[300], bigurl[4096];
     snprintf(bigsrc, sizeof bigsrc, "http://127.0.0.1:%d/live/big.ts", UP.port);
@@ -1186,6 +1217,124 @@ static void test_teletext(void) {
     sb_free(&ts); sb_free(&v); sb_free(&t); sb_free(&tp);
 }
 
+/* ---------- DVB-субтитры: набор сегментов вручную ---------- */
+static void seg(sbuf *b, int type, int page, const uint8_t *d, int n) {
+    uint8_t h[6] = {0x0F, (uint8_t)type, (uint8_t)(page >> 8), (uint8_t)page, (uint8_t)(n >> 8), (uint8_t)n};
+    sb_addn(b, (const char *)h, 6);
+    sb_addn(b, (const char *)d, (size_t)n);
+}
+static void test_dvbsub(void) {
+    dvbsub *d = dvbsub_new(1, 0);
+    sbuf b = {0};
+    sb_addn(&b, "\x20\x00", 2);
+    const uint8_t pcs[] = {5, (0 << 4) | (2 << 2), 0, 0, 0, 10, 0, 20};   /* 5 с, смена режима, область 0 в (10, 20) */
+    seg(&b, 0x10, 1, pcs, sizeof pcs);
+    const uint8_t rcs[] = {0, 0x08, 0, 8, 0, 3, (2 << 5) | (2 << 2), 0, 0, 0,   /* 8×3, глубина 4 бита, палитра 0, заливка 0 */
+                           0, 1, 0x00, 0, 0, 0};                                  /* объект 1 в (0, 0) */
+    seg(&b, 0x11, 1, rcs, sizeof rcs);
+    const uint8_t clut[] = {0, 0, 1, 0x40 | 1, 235, 128, 128, 0};   /* код 1 (4 бита) — белый, непрозрачный */
+    seg(&b, 0x12, 1, clut, sizeof clut);
+    /* объект: строка «1 1 1 1» (4 бита), конец строки; нижнее поле — как верхнее */
+    const uint8_t ods[] = {0, 1, 0x00, 0, 5, 0, 0, 0x11, 0x11, 0x11, 0x00, 0xF0};
+    seg(&b, 0x13, 1, ods, sizeof ods);
+    seg(&b, 0x80, 1, NULL, 0);
+    sb_addc(&b, (char)0xFF);
+    dvbsub_feed(d, (const uint8_t *)b.s, b.n, 900000);
+    EQI(dvbsub_count(d), 1);
+    dvbsub_show s;
+    memset(&s, 0, sizeof s);
+    CHECK(dvbsub_at(d, 899999, 0, &s) == -1);   /* раньше показа — ничего */
+    EQI(dvbsub_at(d, 900000 + 90000, 0, &s), 1);
+    EQI(s.nreg, 1);
+    if (s.nreg == 1) {
+        EQI(s.reg[0].x, 10); EQI(s.reg[0].y, 20); EQI(s.reg[0].w, 8); EQI(s.reg[0].h, 3);
+        EQI(s.reg[0].px[0], 0xffffffff);          /* строка 0 — верхнее поле */
+        EQI(s.reg[0].px[8 + 3], 0xffffffff);      /* строка 1 — нижнее (копия) */
+        EQI(s.reg[0].px[4], 0);                   /* дальше — заливка 0, прозрачно */
+    }
+    CHECK(dvbsub_at(d, 900000 + 90000, s.id, &s) == 0);   /* тот же показ — без копии */
+    CHECK(dvbsub_at(d, 900000 + 5 * 90000, 0, &s) == -1);  /* page_time_out истёк */
+    dvbsub_show_clear(&s);
+    sb_free(&b);
+    dvbsub_free(d);
+}
+
+/* ---------- DVB-субтитры на записанном потоке (PTV_DVBSUB_SAMPLE=файл.ts; без него — пропуск) ---------- */
+static void dvbsub_sample(void) {
+    const char *path = getenv("PTV_DVBSUB_SAMPLE"), *out = getenv("PTV_DVBSUB_OUT");
+    if (!path) return;
+    FILE *f = fopen(path, "rb");
+    if (!f) { printf("dvbsub: нет файла\n"); return; }
+    relay_reset();
+    static uint8_t buf[188 * 512];
+    size_t n;
+    int selected = 0;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
+        relay_tap(buf, n);
+        relay_dvb tr[8];
+        if (!selected && relay_dvb_list(tr, 8) > 0) { relay_dvb_select(0); selected = 1; }
+    }
+    fclose(f);
+    dvbsub *d = relay_dvbsub();
+    int shows = d ? dvbsub_count(d) : 0;
+    printf("dvbsub: показов %d\n", shows);
+    CHECK(shows > 0);
+    if (!d || !out) return;
+    /* несколько показов — картинками (подложка серая, как у ffmpeg-сравнения) */
+    int written = 0, have = 0;
+    dvbsub_show s;
+    memset(&s, 0, sizeof s);
+    for (int64_t pts = relay_base_pts(); written < 6 && pts < relay_base_pts() + 90000LL * 600; pts += 90000) {
+        if (dvbsub_at(d, pts, have, &s) != 1) continue;
+        have = s.id;
+        char fn[600];
+        snprintf(fn, sizeof fn, "%s/dvb%d.ppm", out, written++);
+        FILE *o = fopen(fn, "wb");
+        fprintf(o, "P6\n%d %d\n255\n", s.dw, s.dh);
+        for (int y = 0; y < s.dh; y++)
+            for (int x = 0; x < s.dw; x++) {
+                uint32_t c = 0;
+                for (int r = 0; r < s.nreg; r++) {
+                    dvbsub_region *g = &s.reg[r];
+                    if (x >= g->x && x < g->x + g->w && y >= g->y && y < g->y + g->h) c = g->px[(y - g->y) * g->w + (x - g->x)];
+                }
+                unsigned a = c >> 24, bgc = 96;
+                unsigned char px[3] = {(unsigned char)((((c >> 16) & 255) * a + bgc * (255 - a)) / 255), (unsigned char)((((c >> 8) & 255) * a + bgc * (255 - a)) / 255), (unsigned char)(((c & 255) * a + bgc * (255 - a)) / 255)};
+                fwrite(px, 1, 3, o);
+            }
+        fclose(o);
+        printf("dvbsub: %s pts=+%.1f с, областей %d\n", fn, (s.pts - relay_base_pts()) / 90000.0, s.nreg);
+    }
+    dvbsub_show_clear(&s);
+}
+
+/* ---------- WebVTT ---------- */
+static int64_t vt_s[8], vt_e[8];
+static char vt_t[8][200];
+static int vt_n;
+static void vt_cb(void *ctx, int64_t s, int64_t e, const char *t) {
+    (void)ctx;
+    if (vt_n < 8) { vt_s[vt_n] = s; vt_e[vt_n] = e; snprintf(vt_t[vt_n], 200, "%s", t); vt_n++; }
+}
+static void test_webvtt(void) {
+    const char *v = "WEBVTT\r\nX-TIMESTAMP-MAP=LOCAL:00:00:10.000,MPEGTS:1800000\r\n\r\n"
+                    "NOTE это комментарий\r\n\r\n"
+                    "1\r\n00:00:11.500 --> 00:00:13.000 align:center\r\n<i>Первая</i> строка\r\nвторая &amp; конец\r\n\r\n"
+                    "intro\r\n00:12.000 --> 00:14.250\r\n<v Иван>Реплика</v>\r\n";
+    vt_n = 0;
+    EQI(webvtt_parse(v, strlen(v), vt_cb, NULL), 2);
+    EQI(vt_n, 2);
+    EQI(vt_s[0], 1800000 + 135000);   /* MPEGTS + (11,5 − 10) × 90000 */
+    EQI(vt_e[0], 1800000 + 270000);
+    EQS(vt_t[0], "Первая строка\nвторая & конец");
+    EQI(vt_s[1], 1800000 + 180000);   /* «мм:сс.ттт» без часов */
+    EQI(vt_e[1], 1800000 + 382500);
+    EQS(vt_t[1], "Реплика");
+    vt_n = 0;
+    EQI(webvtt_parse("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nбез карты\n", 46, vt_cb, NULL), 1);
+    EQI(vt_s[0], 90000);
+}
+
 static void test_lang(void) {
     lang_set(LANG_RU);
     EQS(trp(S_CHANNELS_N, 1), "1 канал");
@@ -1263,6 +1412,9 @@ int main(void) {
     test_backup();
     test_tmdb();
     test_teletext();
+    test_dvbsub();
+    test_webvtt();
+    dvbsub_sample();
     test_lang();
     test_clock();
     char cmd[300];

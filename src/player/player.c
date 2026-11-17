@@ -225,6 +225,12 @@ int pl_audio_select(int i) {
     return rc < 0 ? -1 : 0;
 }
 
+/* дорожки субтитров, которые видит системный плеер (сам он их не показывает): подпись — язык или название,
+ * кодек — имя FFmpeg (dvb_teletext, dvb_subtitle, webvtt…) */
+int pl_sub_count(void) { return S.h ? (S.snap.sub_count < PL_TRACKS ? S.snap.sub_count : PL_TRACKS) : 0; }
+const char *pl_sub_label(int i) { return i >= 0 && i < pl_sub_count() ? S.snap.sub_tracks[i].label : ""; }
+const char *pl_sub_codec(int i) { return i >= 0 && i < pl_sub_count() ? S.snap.sub_tracks[i].meta : ""; }
+
 void pl_draw_video(gfx_t *g) {
     if (S.sw && !S.busy && S.state == PL_PLAYING) swp_draw(S.sw, g->px, g->w, g->h, g->stride);
     else for (int y = 0; y < g->h; y++) memset(g->px + (size_t)y * g->stride, 0, (size_t)g->w * 4);

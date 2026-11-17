@@ -20,6 +20,8 @@
     "src/core/phone.c",
     "src/core/usb.c",
     "src/core/ttx.c",
+    "src/core/dvbsub.c",
+    "src/core/webvtt.c",
     "src/core/relay.c",
     "src/data/names.c",
     "src/data/m3u.c",
@@ -49,6 +51,7 @@
     "src/ui/files.c",
     "src/ui/search.c",
     "src/ui/teletext.c",
+    "src/ui/subs.c",
     "src/main.c"
   ],
   "shell": true,

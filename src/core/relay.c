@@ -28,6 +28,8 @@
 #define PLAYLIST_MAX (4 << 20)
 
 /* ================= разбор MPEG-TS ================= */
+/* PES одной дорожки: готов, когда набрана длина из заголовка (или пришло начало следующего) */
+typedef struct { int pid; uint8_t *buf; size_t n, want; } pesbuf;
 static struct {
     pthread_mutex_t mu;
     ttx *t;
@@ -35,26 +37,35 @@ static struct {
     int carry_n;
     int pmt_pid[16], npmt;
     int ttx_pid, dvbsub;
-    uint8_t *pes;
-    size_t pes_n;
-    int64_t pes_pts;
+    relay_dvb dvb[8];
+    int ndvb;
+    relay_vtt vtt[8];     /* субтитры WebVTT из главного плейлиста HLS */
+    int nvtt;
+    int dvb_sel, dvb_idx; /* PID и номер выбранных DVB-субтитров (-1 — нет) */
+    dvbsub *dvbd;
+    pesbuf pt, pd;        /* телетекст, DVB-субтитры */
     int64_t base_pts;
     long long bytes;
     int gen;   /* растёт при relay_reset: соединения прежней ссылки разбор не трогают */
-} D = {.mu = PTHREAD_MUTEX_INITIALIZER, .ttx_pid = -1, .base_pts = -1};
+} D = {.mu = PTHREAD_MUTEX_INITIALIZER, .ttx_pid = -1, .dvb_sel = -1, .dvb_idx = -1, .base_pts = -1};
 
 static void init_once(void) {
     if (!D.t) D.t = ttx_new();
-    if (!D.pes) D.pes = malloc(PES_MAX);
+    if (!D.pt.buf) D.pt.buf = malloc(PES_MAX);
+    if (!D.pd.buf) D.pd.buf = malloc(PES_MAX);
 }
 
 void relay_reset(void) {
     pthread_mutex_lock(&D.mu);
     init_once();
     ttx_reset(D.t);
-    D.carry_n = D.npmt = D.dvbsub = 0;
+    D.carry_n = D.npmt = D.dvbsub = D.ndvb = D.nvtt = 0;
     D.ttx_pid = -1;
-    D.pes_n = 0;
+    D.pt.n = D.pd.n = 0;
+    D.pt.want = D.pd.want = 0;
+    dvbsub_free(D.dvbd);   /* выбор субтитров — заново по новому потоку (tv.c выберет снова) */
+    D.dvbd = NULL;
+    D.dvb_sel = D.dvb_idx = -1;
     D.base_pts = -1;
     D.bytes = 0;
     D.gen++;
@@ -76,13 +87,26 @@ static int64_t pes_pts(const uint8_t *p, size_t n, size_t *hdr) {
     return -1;
 }
 
-static void flush_pes(void) {
-    if (D.pes_n) {
+/* PES набран: данные после заголовка — декодеру дорожки */
+static void pes_done(pesbuf *b) {
+    if (b->n) {
         size_t hdr;
-        int64_t pts = pes_pts(D.pes, D.pes_n, &hdr);
-        if (pts != -2 && hdr < D.pes_n) ttx_feed(D.t, D.pes + hdr, D.pes_n - hdr, pts);
+        int64_t pts = pes_pts(b->buf, b->n, &hdr);
+        if (pts != -2 && hdr < b->n) {
+            if (b == &D.pt) ttx_feed(D.t, b->buf + hdr, b->n - hdr, pts);
+            else if (D.dvbd) dvbsub_feed(D.dvbd, b->buf + hdr, b->n - hdr, pts);
+        }
     }
-    D.pes_n = 0;
+    b->n = b->want = 0;
+}
+static void pes_add(pesbuf *b, const uint8_t *pl, size_t n, int pusi) {
+    if (pusi) {
+        pes_done(b);
+        /* PES_packet_length: 0 — до начала следующего */
+        if (n >= 6 && !pl[0] && !pl[1] && pl[2] == 1) { size_t l = (size_t)(pl[4] << 8 | pl[5]); b->want = l ? l + 6 : 0; }
+    } else if (!b->n) return;   /* хвост PES без начала */
+    if (b->n + n <= PES_MAX) { memcpy(b->buf + b->n, pl, n); b->n += n; }
+    if (b->want && b->n >= b->want) { b->n = b->want; pes_done(b); }   /* сразу, не дожидаясь следующего */
 }
 
 /* секция PSI с указателем; tid — ожидаемая таблица */
@@ -132,11 +156,27 @@ static void parse_pmt(const uint8_t *pl, size_t n) {
                     if ((type == 2 || type == 5) && ns < 8) subs[ns++] = ((mag ? mag : 8) << 8) | v[k + 4];
                 }
                 D.ttx_pid = pid;
-                D.pes_n = 0;
+                D.pt.n = D.pt.want = 0;
                 ttx_declare(D.t, lang, subs, ns);
                 fprintf(stderr, "relay_teletext pid=%d lang=%s subtitle_pages=%d\n", pid, lang, ns);
             }
-            if (tag == 0x59 && !D.dvbsub) { D.dvbsub = 1; fprintf(stderr, "relay_dvbsub pid=%d\n", pid); }
+            /* DVB-субтитры: по записи на дорожку (язык, тип, страница композиции и вспомогательная); у одного PID
+               их бывает несколько — обычные и для слабослышащих на разных страницах */
+            for (int k = 0; tag == 0x59 && k + 8 <= dl; k += 8) {
+                const uint8_t *e8 = v + k;
+                int comp = e8[4] << 8 | e8[5], known = 0;
+                for (int q = 0; q < D.ndvb; q++) known |= D.dvb[q].pid == pid && D.dvb[q].comp == comp;
+                if (known || D.ndvb >= 8) continue;
+                relay_dvb *e = &D.dvb[D.ndvb++];
+                e->pid = pid;
+                memcpy(e->lang, e8, 3);
+                e->lang[3] = 0;
+                e->type = e8[3];
+                e->comp = comp;
+                e->anc = e8[6] << 8 | e8[7];
+                D.dvbsub = 1;
+                fprintf(stderr, "relay_dvbsub pid=%d lang=%s type=0x%02x page=%d\n", pid, e->lang, e->type, comp);
+            }
             d += 2 + (size_t)dl;
         }
         i = end;
@@ -159,11 +199,30 @@ static void packet(const uint8_t *p) {
         int64_t pts = pes_pts(pl, n, &hdr);
         if (pts >= 0 && pl[3] >= 0xC0 && pl[3] <= 0xEF) D.base_pts = pts;   /* видео или звук */
     }
-    if (pid != D.ttx_pid) return;
-    if (pusi) flush_pes();
-    else if (!D.pes_n) return;   /* хвост PES без начала */
-    if (D.pes_n + n <= PES_MAX) { memcpy(D.pes + D.pes_n, pl, n); D.pes_n += n; }
+    if (pid == D.ttx_pid) pes_add(&D.pt, pl, n, pusi);
+    else if (pid == D.dvb_sel && D.dvbd) pes_add(&D.pd, pl, n, pusi);
 }
+
+int relay_dvb_list(relay_dvb *out, int max) {
+    pthread_mutex_lock(&D.mu);
+    int n = D.ndvb < max ? D.ndvb : max;
+    memcpy(out, D.dvb, (size_t)n * sizeof *out);
+    pthread_mutex_unlock(&D.mu);
+    return n;
+}
+void relay_dvb_select(int i) {
+    pthread_mutex_lock(&D.mu);
+    if (i != D.dvb_idx) {
+        dvbsub_free(D.dvbd);
+        D.dvbd = NULL;
+        D.pd.n = D.pd.want = 0;
+        D.dvb_sel = D.dvb_idx = -1;
+        if (i >= 0 && i < D.ndvb) { D.dvbd = dvbsub_new(D.dvb[i].comp, D.dvb[i].anc); D.dvb_sel = D.dvb[i].pid; D.dvb_idx = i; }
+    }
+    pthread_mutex_unlock(&D.mu);
+}
+int relay_dvb_selected(void) { return D.dvb_idx; }
+dvbsub *relay_dvbsub(void) { return D.dvbd; }
 
 static void tap_locked(const uint8_t *d, size_t n) {
     init_once();
@@ -245,6 +304,49 @@ static void rewrite_uri(sbuf *o, const char *base, const char *ref, const char *
     make_url(o, abs, headers);
 }
 
+/* значение атрибута тега HLS: NAME="…" или NAME=… */
+static void hls_attr(const char *line, const char *name, char *out, size_t cap) {
+    out[0] = 0;
+    size_t nl = strlen(name);
+    for (const char *p = line; (p = strstr(p, name)); p++) {
+        if (p != line && p[-1] != ',' && p[-1] != ':') continue;
+        if (p[nl] != '=') continue;
+        const char *v = p + nl + 1, *e;
+        if (*v == '"') { v++; e = strchr(v, '"'); }
+        else e = strchr(v, ',');
+        size_t l = e ? (size_t)(e - v) : strlen(v);
+        if (l >= cap) l = cap - 1;
+        memcpy(out, v, l);
+        out[l] = 0;
+        return;
+    }
+}
+/* #EXT-X-MEDIA:TYPE=SUBTITLES — запомнить (адрес провайдера, не ретранслятора) */
+static void note_subtitles(const char *line, const char *base, const char *headers) {
+    if (strncmp(line, "#EXT-X-MEDIA:", 13) || !strstr(line, "TYPE=SUBTITLES")) return;
+    char uri[4096];
+    hls_attr(line, "URI", uri, sizeof uri);
+    if (!uri[0]) return;
+    relay_vtt v;
+    memset(&v, 0, sizeof v);
+    http_resolve(base, uri, v.url, sizeof v.url);
+    hls_attr(line, "NAME", v.name, sizeof v.name);
+    hls_attr(line, "LANGUAGE", v.lang, sizeof v.lang);
+    snprintf(v.hdr, sizeof v.hdr, "%s", headers ? headers : "");
+    pthread_mutex_lock(&D.mu);
+    int known = 0;
+    for (int i = 0; i < D.nvtt; i++) known |= !strcmp(D.vtt[i].url, v.url);
+    if (!known && D.nvtt < 8) { D.vtt[D.nvtt++] = v; fprintf(stderr, "relay_webvtt lang=%s\n", v.lang); }
+    pthread_mutex_unlock(&D.mu);
+}
+int relay_vtt_list(relay_vtt *out, int max) {
+    pthread_mutex_lock(&D.mu);
+    int n = D.nvtt < max ? D.nvtt : max;
+    memcpy(out, D.vtt, (size_t)n * sizeof *out);
+    pthread_mutex_unlock(&D.mu);
+    return n;
+}
+
 static void rewrite_playlist(sbuf *o, const char *text, size_t n, const char *base, const char *headers) {
     const char *p = text, *end = text + n;
     while (p < end) {
@@ -257,6 +359,7 @@ static void rewrite_playlist(sbuf *o, const char *text, size_t n, const char *ba
         while (*t == ' ' || *t == '\t') t++;
         if (!*t) sb_add(o, line);
         else if (*t == '#') {
+            note_subtitles(t, base, headers);
             /* URI="…" в тегах (ключи, карты, варианты звука) */
             char *u = strstr(t, "URI=\"");
             if (u) {

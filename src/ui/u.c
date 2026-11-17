@@ -433,6 +433,21 @@ void d_fade_edges(gfx_t *g, int x, int y, int w, int h, int top, int bottom, uin
 }
 
 /* ---------- картинки и логотипы ---------- */
+/* Картинка ARGB (src: sw×sh) в прямоугольник x, y, w, h — масштаб ближайшим пикселем, честная прозрачность. */
+void d_bitmap(gfx_t *g, const uint32_t *src, int sw, int sh, int x, int y, int w, int h) {
+    if (!src || sw <= 0 || sh <= 0 || w <= 0 || h <= 0) return;
+    int x0 = clipx0(g, x), x1 = clipx1(g, x + w), y0 = clipy0(g, y), y1 = clipy1(g, y + h);
+    for (int j = y0; j < y1; j++) {
+        const uint32_t *s = src + (size_t)((long)(j - y) * sh / h) * (size_t)sw;
+        uint32_t *r = g->px + (size_t)j * g->stride;
+        for (int i = x0; i < x1; i++) {
+            uint32_t c = s[(long)(i - x) * sw / w];
+            unsigned a = c >> 24;
+            if (a) r[i] = over(r[i], c & 0xffffffu, a);
+        }
+    }
+}
+
 int d_image(gfx_t *g, const char *url, int x, int y, int w, int h, int r, int cover) {
     if (!url || !*url || w <= 0 || h <= 0) return 0;
     const gfx_image *im = img_get(url, w, h, cover ? IMG_COVER : IMG_FIT);

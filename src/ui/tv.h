@@ -40,9 +40,11 @@ typedef struct {
     double sleep_until;
     int sleep_warned;
     /* телетекст и субтитры: поток через ретранслятор (core/relay.c) */
-    int tap, subs;
+    int tap, subs;                   /* tap — поток через ретранслятор по просьбе (телетекст, субтитры); subs — субтитры вкл. */
+    char sub_key[48];                /* выбранные субтитры: «ttx», «dvb:rus:0», «vtt:eng» (subs.c) */
     int relayed;                     /* текущий поток идёт через ретранслятор */
     int direct;                      /* у канала — прямое подключение (через ретранслятор не открылся) */
+    int direct_pending;              /* через ретранслятор не открылся — запомнить, если заиграет напрямую */
     /* PIN */
     int pin_passed;
     char last_unlocked[160];
@@ -71,7 +73,8 @@ int tv_sleep_minutes(void);
 void tv_playlist_changed(int keep_channel);
 void tv_restart(void);               /* после восстановления копии */
 void tv_teletext(void);              /* открыть телетекст (поток — через ретранслятор) */
-void tv_set_subtitles(int on);       /* субтитры телетекста поверх видео (запоминается за каналом) */
+void tv_set_subtitles(int on);       /* вкл. — запомненные или первые доступные субтитры, выкл. */
+void tv_subtitles_need_relay(void);  /* выбраны субтитры — поток (если напрямую) через ретранслятор */
 int tv_direct_count(void);           /* каналов с прямым подключением */
 int64_t tv_frame_pts(void);          /* время кадра в метках потока (90 кГц); -1 — неизвестно */
 /* в потоке есть телетекст / субтитры телетекста (поток через ретранслятор и уже разобран) */

@@ -87,6 +87,7 @@ static void open_url(const char *url, const char *hdr, double start) {
         static char r[16384];
         if (!relay_url(url, hdr, r, sizeof r)) {
             relay_reset();
+            subs_stream_changed();
             T.relayed = 1;
             fprintf(stderr, "stream via relay\n");
             pl_open(r, NULL, start);
@@ -102,8 +103,8 @@ static void start_stream(void);
 static void relay_fallback(void) {
     fprintf(stderr, "relay_fallback explicit=%d\n", T.tap);
     if (T.tap) { T.tap = T.subs = 0; tv_toast(tr(S_TTX_RELAY_FAILED)); }
-    else if (T.cur) set_direct(T.cur);
     T.direct = 1;
+    T.direct_pending = !T.tap;   /* в список — только если напрямую заиграет (иначе канал просто недоступен) */
     if (T.arc) T.arc_target = tv_position();
     start_stream();
 }
@@ -164,10 +165,11 @@ static void really_play(channel *c, const char *gkey, int arc, int64_t t, double
         T.scored = 0;
         repo_add_history(c);
         /* субтитры включали на этом канале — поток сразу через ретранслятор */
-        char k[200];
-        snprintf(k, sizeof k, "subs.%s", c->key);
-        T.subs = T.tap = store_get(k) != NULL;
+        T.cur = c;
+        subs_load();   /* субтитры, выбранные на этом канале, — поток сразу через ретранслятор */
+        T.tap = T.subs;
         T.direct = is_direct(c);
+        T.direct_pending = 0;
     }
     T.cur = c;
     group *g = repo_group_of(c, gkey ? gkey : T.group[0] ? T.group : NULL);
@@ -422,7 +424,7 @@ int tv_key(int k, int ev) {
     case KEY_GUIDE: case KEY_GREEN: tv_open_guide(); return 1;
     case KEY_SEARCH: search_open(); return 1;
     case KEY_TEXT: tv_teletext(); return 1;
-    case KEY_SUBTITLE: tv_set_subtitles(!T.subs); tv_toast(tr(T.subs ? S_SUBS_ON : S_SUBS_OFF)); return 1;
+    case KEY_SUBTITLE: subs_toggle(); return 1;
     case KEY_INFO: case KEY_BLUE: if (info_visible() && T.info_pinned) T.info_expanded = !T.info_expanded; else tv_show_info(1); return 1;
     case KEY_LIST: tv_open_recent(); return 1;
     case KEY_RED: tv_open_schedule(T.cur, 0); return 1;
@@ -451,8 +453,13 @@ int tv_sleep_minutes(void) {
 }
 
 /* ---------- телетекст и субтитры ---------- */
-int tv_has_teletext(void) { return T.relayed && relay_has_teletext(); }
-int tv_has_subtitles(void) { return tv_has_teletext() && ttx_subtitles_known(relay_ttx()); }
+/* телетекст: через ретранслятор — по его разбору; напрямую — по дорожкам системного плеера */
+int tv_has_teletext(void) {
+    if (T.relayed && relay_ts_bytes() > 0) return relay_has_teletext();
+    for (int i = 0; i < pl_sub_count(); i++) if (!strcmp(pl_sub_codec(i), "dvb_teletext")) return 1;
+    return 0;
+}
+int tv_has_subtitles(void) { return subs_available() > 0; }
 static void reopen_with_tap(void) {
     if (T.tap || !T.cur) return;
     T.tap = 1;
@@ -469,40 +476,14 @@ void tv_teletext(void) {
 }
 void tv_set_subtitles(int on) {
     if (!T.cur) return;
-    T.subs = on;
-    char k[200];
-    snprintf(k, sizeof k, "subs.%s", T.cur->key);
-    store_set(k, on ? "1" : NULL);
-    if (on) reopen_with_tap();
-    app_dirty();
+    if (on != T.subs) subs_toggle();
 }
+void tv_subtitles_need_relay(void) { if (T.subs) reopen_with_tap(); }
 
 /* время кадра в метках потока: первая метка, что видел ретранслятор, + позиция плеера */
 int64_t tv_frame_pts(void) {
     int64_t base = relay_base_pts();
     return base < 0 ? -1 : base + (int64_t)(pl_position() * 90000.0);
-}
-
-static void draw_subtitles(gfx_t *g, int bottom) {
-    if (!T.subs || !T.tap || !pl_has_picture()) return;
-    static ttx_page pg;
-    static ttx_grid gr;
-    static char text[2048];
-    int64_t pts = tv_frame_pts();
-    if (pts < 0 || ttx_subtitle_at(relay_ttx(), pts, &pg)) return;
-    ttx_layout(&pg, NULL, &gr);
-    if (!ttx_subtitle_text(&gr, text, sizeof text)) return;
-    /* строки снизу вверх, каждая — на тёмной плашке */
-    const char *lines[8];
-    int n = 0;
-    for (char *p = text; *p && n < 8;) { lines[n++] = p; char *e = strchr(p, '\n'); if (!e) break; *e = 0; p = e + 1; }
-    int lh = d_line_h(1.9, F_S) + E(0.6), y = bottom - n * lh;
-    for (int i = 0; i < n; i++, y += lh) {
-        int w = d_text_w(1.9, F_S, lines[i]) + E(1.6);
-        if (w > SW - E(8)) w = SW - E(8);
-        d_round(g, (SW - w) / 2, y, w, lh - E(0.3), E(0.4), 0xc0000000u);
-        d_text_c(g, (SW - w) / 2, w, y + E(0.3), 1.9, F_S, C_WHITE, lines[i]);
-    }
 }
 
 /* ---------- плейлист ---------- */
@@ -602,7 +583,8 @@ void tv_tick(double now) {
     layer_tick_all(now);
     if (T.open_at && now >= T.open_at) { T.open_at = 0; start_stream(); }
     if (T.dig[0] && now - T.dig_at > DIGIT_SECONDS) digits_apply();
-    if (T.subs && T.tap) {   /* субтитры меняются по времени кадра */
+    subs_apply();
+    if (T.subs && T.relayed) {   /* субтитры меняются по времени кадра */
         static double next;
         if (now >= next) { next = now + 0.25; app_dirty(); }
     }
@@ -610,7 +592,12 @@ void tv_tick(double now) {
     int st = pl_state();
     if (T.cur && !T.open_at) {
         if (st == PL_PLAYING) {
-            if (!T.playing_since) { T.playing_since = now; app_dirty(); }
+            if (!T.playing_since) {
+                T.playing_since = now;
+                if (T.direct_pending && !T.relayed && T.cur) { set_direct(T.cur); fprintf(stderr, "relay_direct_saved\n"); }
+                T.direct_pending = 0;
+                app_dirty();
+            }
             if (now - T.playing_since > 30) T.attempts = 0;
             if (!T.scored && now - T.playing_since > 300) { T.scored = 1; repo_add_score(T.cur); }
         }
@@ -759,7 +746,7 @@ void tv_draw(gfx_t *g) {
             d_round(g, SW - E(4) - E(5), E(2.4), E(5), E(5), E(1), C_PANEL);
             d_spinner(g, SW - E(4) - E(2.5), E(4.9), E(1.4), now);
         }
-        draw_subtitles(g, info_visible() ? info_top() - E(1.2) : SH - E(4));
+        subs_draw(g, info_visible() ? info_top() - E(1.2) : SH - E(4));
         if (!layer_count() || (layer_top() && layer_top()->name && !strcmp(layer_top()->name, "menu"))) {
             if (info_visible()) info_draw(g);
             if (T.carousel_until && !layer_count()) draw_carousel(g);

@@ -28,6 +28,9 @@ int pl_audio_count(void);
 const char *pl_audio_label(int i);
 int pl_audio_selected(void);
 int pl_audio_select(int i);
+int pl_sub_count(void);              /* дорожки субтитров в потоке (системный плеер их не показывает) */
+const char *pl_sub_label(int i);     /* язык или название */
+const char *pl_sub_codec(int i);     /* dvb_teletext, dvb_subtitle, webvtt… */
 /* Кадр программного плеера в холст (под интерфейсом); для системного — прозрачная «дыра». */
 void pl_draw_video(gfx_t *g);
 int pl_has_picture(void);            /* видео уже идёт (первый кадр) */

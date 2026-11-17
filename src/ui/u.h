@@ -50,6 +50,7 @@ enum { F_R = TX_UI, F_S = TX_UI_SEMI, F_B = TX_UI_BOLD };
 
 /* --- заливки с честной прозрачностью --- */
 void d_fill(gfx_t *g, int x, int y, int w, int h, uint32_t c);
+void d_bitmap(gfx_t *g, const uint32_t *src, int sw, int sh, int x, int y, int w, int h);   /* ARGB, масштаб */
 void d_round(gfx_t *g, int x, int y, int w, int h, int r, uint32_t c);
 void d_stroke(gfx_t *g, int x, int y, int w, int h, int r, int t, uint32_t c);
 void d_vgrad(gfx_t *g, int x, int y, int w, int h, uint32_t top, uint32_t bottom);

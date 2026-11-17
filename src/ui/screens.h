@@ -49,6 +49,20 @@ void form_playlist_phone(void);                     /* новый плейлис
 typedef void (*file_fn)(const char *path, int epg, void *ctx);
 void files_open(file_fn done, void *ctx);
 
+/* subs.c — субтитры (телетекст, DVB, WebVTT) */
+enum { ST_TTX = 1, ST_DVB, ST_VTT, ST_OTHER };
+typedef struct { int kind, idx, supported; char key[48], label[160]; } subtrack;   /* idx — в списке ретранслятора, -1 — из плеера */
+int subs_tracks(subtrack *out, int max);
+int subs_available(void);
+void subs_load(void);                 /* выбор канала из хранилища */
+void subs_select(const char *key);    /* NULL — выкл. */
+const char *subs_current_label(void);
+void subs_apply(void);                /* каждый кадр */
+void subs_stream_changed(void);
+void subs_draw(gfx_t *g, int bottom);
+void subs_menu_open(void);
+void subs_toggle(void);
+
 /* teletext.c — телетекст */
 void teletext_open(void);
 
