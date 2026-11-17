@@ -28,6 +28,7 @@
     "src/data/loaders.c",
     "src/data/search.c",
     "src/data/backup.c",
+    "src/data/tmdb.c",
     "src/player/player.c",
     "src/ui/u.c",
     "src/ui/keys.c",
@@ -63,5 +64,5 @@
   "shared": ["freetype", "z", "avformat", "avcodec", "avutil", "swscale", "swresample"],
   "shipExtra": ["asound", "ssl", "crypto"],
   "icon": "assets/icon-400.png",
-  "credits": "Perfect TV for VIDAA (GPL-3.0, https://github.com/perfect-tv). Built with FreeType (FreeType License), zlib (zlib License), OpenSSL (Apache-2.0), FFmpeg (LGPL-2.1+), stb_image (public domain), Noto Sans and Onest (SIL OFL)."
+  "credits": "Perfect TV for VIDAA (GPL-3.0, https://github.com/perfect-tv). Built with FreeType (FreeType License), zlib (zlib License), OpenSSL (Apache-2.0), FFmpeg (LGPL-2.1+), stb_image (public domain), Noto Sans and Onest (SIL OFL). Uses the TMDB API but is not endorsed or certified by TMDB."
 }

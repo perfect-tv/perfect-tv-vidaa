@@ -46,6 +46,12 @@ void prefs_load(void) {
     }
     const char *s = store_get("pin");
     snprintf(P.pin, sizeof P.pin, "%s", s ? s : "");
+    s = store_get("tmdb_key");
+    snprintf(P.tmdb_key, sizeof P.tmdb_key, "%s", s ? s : "");
+    s = store_get("tmdb_api");
+    snprintf(P.tmdb_api, sizeof P.tmdb_api, "%s", s ? s : "");
+    s = store_get("tmdb_img");
+    snprintf(P.tmdb_img, sizeof P.tmdb_img, "%s", s ? s : "");
     s = store_get("last_channel");
     snprintf(P.last_channel, sizeof P.last_channel, "%s", s ? s : "");
     s = store_get("last_group");
@@ -64,6 +70,9 @@ void prefs_save(void) {
         store_set(t[i].key, b);
     }
     store_set("pin", P.pin[0] ? P.pin : NULL);
+    store_set("tmdb_key", P.tmdb_key[0] ? P.tmdb_key : NULL);
+    store_set("tmdb_api", P.tmdb_api[0] ? P.tmdb_api : NULL);
+    store_set("tmdb_img", P.tmdb_img[0] ? P.tmdb_img : NULL);
     store_set("last_channel", P.last_channel[0] ? P.last_channel : NULL);
     store_set("last_group", P.last_group);
 }

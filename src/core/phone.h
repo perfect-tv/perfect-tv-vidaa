@@ -7,10 +7,16 @@
 #define PTV_PHONE_H
 #include <stddef.h>
 
-typedef struct { char url[2048], name[160], epg[2048]; } phone_result;
+enum { PHONE_PLAYLIST = 0, PHONE_TMDB };
+typedef struct {
+    int kind;
+    char url[2048], name[160], epg[2048];     /* плейлист */
+    char key[300], api[300], img[300];        /* TMDB */
+} phone_result;
 
-/* Запустить (или перезапустить с новым ключом); url — адрес для QR. 0 — слушаем; -1 — нет сети (err). */
-int phone_start(char *url, size_t cap, char *err, size_t errn);
+/* Запустить (или перезапустить с новым ключом); url — адрес для QR. 0 — слушаем; -1 — нет сети (err).
+ * PHONE_TMDB: поля «Ключ», «Адрес API», «Адрес картинок» (адреса — с текущими значениями, ключ — пустой). */
+int phone_start(int kind, char *url, size_t cap, char *err, size_t errn);
 void phone_stop(void);
 int phone_running(void);
 /* Обработать соединения. 1 — пришёл ответ (r заполнен, сервер остановлен). */

@@ -13,6 +13,7 @@
 #include "data/epg.h"
 #include "data/loaders.h"
 #include "data/backup.h"
+#include "data/tmdb.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -21,8 +22,8 @@
 #define PTV_VERSION "dev"
 #endif
 
-enum { SEC_PLAYLISTS, SEC_VIEW, SEC_LOOK, SEC_LIST, SEC_LOCK, SEC_DATA, SEC_ABOUT, NSEC };
-static const int SEC_NAMES[NSEC] = {S_SEC_PLAYLISTS, S_SEC_VIEW, S_SEC_LOOK, S_SEC_LIST, S_SEC_LOCK, S_SEC_DATA, S_SEC_ABOUT};
+enum { SEC_PLAYLISTS, SEC_VIEW, SEC_LOOK, SEC_LIST, SEC_LOCK, SEC_TMDB, SEC_DATA, SEC_ABOUT, NSEC };
+static const int SEC_NAMES[NSEC] = {S_SEC_PLAYLISTS, S_SEC_VIEW, S_SEC_LOOK, S_SEC_LIST, S_SEC_LOCK, S_SEC_TMDB, S_SEC_DATA, S_SEC_ABOUT};
 
 enum {
     I_PL = 1000,   /* I_PL + индекс плейлиста */
@@ -31,6 +32,7 @@ enum {
     I_LANG, I_TZ, I_SCALE, I_NUMBER, I_GUIDE_VIEW, I_GUIDE_HEADER, I_HINTS_P, I_LOGO_PRIO,
     I_ADAPTIVE_P, I_RESET_SCORES, I_HIDDEN_P,
     I_PIN_SET, I_PIN_CLEAR, I_PIN_ASK, I_PIN_INPUT,
+    I_TMDB_KEY, I_TMDB_PHONE, I_TMDB_API, I_TMDB_IMG, I_TMDB_TEST, I_TMDB_REMOVE,
     I_BACKUP_SAVE, I_BACKUP_RESTORE, I_CLEAR_LOGOS, I_CLEAR_EPG, I_DATA_DIR,
     I_VERSION, I_SOURCE, I_LICENSE,
 };
@@ -128,6 +130,16 @@ static void build(void) {
         add(I_PIN_ASK, tr(S_PIN_ASK), NULL, tr(P.pin_ask == PIN_ONCE ? S_PIN_ONCE : S_PIN_EACH), 1);
         add(I_PIN_INPUT, tr(S_PIN_INPUT), NULL, tr(P.pin_input == PIN_IN_RING ? S_PIN_RING : P.pin_input == PIN_IN_KEYS ? S_PIN_KEYS : S_PIN_ROWS), 1);
         break;
+    case SEC_TMDB:
+        add(I_TMDB_KEY, tr(S_TMDB_KEY), tr(S_TMDB_KEY_SUB), tr(tmdb_enabled() ? S_TMDB_SET : S_TMDB_NOT_SET), 0);
+        add(I_TMDB_PHONE, tr(S_TMDB_FROM_PHONE), NULL, NULL, 0);
+        add(I_TMDB_API, tr(S_TMDB_API), P.tmdb_api[0] ? P.tmdb_api : TMDB_API_DEFAULT, P.tmdb_api[0] ? NULL : tr(S_TMDB_DEFAULT), 0);
+        add(I_TMDB_IMG, tr(S_TMDB_IMG), P.tmdb_img[0] ? P.tmdb_img : TMDB_IMG_DEFAULT, P.tmdb_img[0] ? NULL : tr(S_TMDB_DEFAULT), 0);
+        if (tmdb_enabled()) {
+            add(I_TMDB_TEST, tr(S_TMDB_TEST), NULL, NULL, 0);
+            add(I_TMDB_REMOVE, tr(S_TMDB_REMOVE), NULL, NULL, 0);
+        }
+        break;
     case SEC_DATA:
         add(I_BACKUP_SAVE, tr(S_BACKUP_SAVE), tr(S_BACKUP_SAVE_SUB), NULL, 0);
         add(I_BACKUP_RESTORE, tr(S_BACKUP_RESTORE), NULL, NULL, 0);
@@ -204,6 +216,30 @@ static void save_backup(void) {
     else tv_toast(trf(S_BACKUP_SAVED, where));
 }
 
+/* ---- TMDB ---- */
+static int is_default(const char *v, const char *def) {
+    char a[300], b[300];
+    snprintf(a, sizeof a, "%s", v);
+    snprintf(b, sizeof b, "%s", def);
+    size_t n = strlen(a);
+    while (n && a[n - 1] == '/') a[--n] = 0;
+    return !strcmp(a, b);
+}
+static void tmdb_changed(void) { tmdb_cache_clear(); prefs_save(); build(); app_dirty(); }
+static void set_tmdb_key(const char *t, void *c) { (void)c; snprintf(P.tmdb_key, sizeof P.tmdb_key, "%s", t); trim(P.tmdb_key); tmdb_changed(); }
+static void set_tmdb_api(const char *t, void *c) { (void)c; snprintf(P.tmdb_api, sizeof P.tmdb_api, "%s", is_default(t, TMDB_API_DEFAULT) ? "" : t); tmdb_changed(); }
+static void set_tmdb_img(const char *t, void *c) { (void)c; snprintf(P.tmdb_img, sizeof P.tmdb_img, "%s", is_default(t, TMDB_IMG_DEFAULT) ? "" : t); tmdb_changed(); }
+static void tmdb_from_phone(const phone_result *r, void *c) {
+    (void)c;
+    if (r->kind != PHONE_TMDB) return;
+    snprintf(P.tmdb_key, sizeof P.tmdb_key, "%s", r->key);
+    if (r->api[0]) set_tmdb_api(r->api, NULL);
+    if (r->img[0]) set_tmdb_img(r->img, NULL);
+    tmdb_changed();
+}
+static void tmdb_tested(const char *err) { tv_toast(err ? err : tr(S_TMDB_OK)); }
+static void tmdb_remove_yes(void *c) { (void)c; P.tmdb_key[0] = 0; tmdb_changed(); }
+
 static void change(item *it, int dir) {
     int d = dir ? dir : 1;
 #define CYCLE(arr, field) do { int n_ = (int)(sizeof arr / sizeof arr[0]); P.field = arr[((sel_of(arr, n_, P.field) + d) % n_ + n_) % n_]; } while (0)
@@ -250,6 +286,12 @@ static void action(item *it) {
     case I_HIDDEN_P: hidden_open(); break;
     case I_PIN_SET: if (P.pin[0]) pin_ask(after_pin_ok, NULL, NULL); else pin_create(NULL, NULL); break;
     case I_PIN_CLEAR: pin_ask(after_pin_clear, NULL, NULL); break;
+    case I_TMDB_KEY: form_text(tr(S_TMDB_KEY), P.tmdb_key, 0, set_tmdb_key, NULL); break;
+    case I_TMDB_PHONE: phone_open_kind(PHONE_TMDB, tmdb_from_phone, NULL); break;
+    case I_TMDB_API: form_text(tr(S_TMDB_API), P.tmdb_api[0] ? P.tmdb_api : TMDB_API_DEFAULT, 0, set_tmdb_api, NULL); break;
+    case I_TMDB_IMG: form_text(tr(S_TMDB_IMG), P.tmdb_img[0] ? P.tmdb_img : TMDB_IMG_DEFAULT, 0, set_tmdb_img, NULL); break;
+    case I_TMDB_TEST: tv_toast(tr(S_TMDB_CHECKING)); tmdb_test(tmdb_tested); break;
+    case I_TMDB_REMOVE: confirm_open(tr(S_TMDB_REMOVE), tr(S_DELETE), tmdb_remove_yes, NULL); break;
     case I_BACKUP_SAVE: save_backup(); break;
     case I_BACKUP_RESTORE: restore_open(); break;
     case I_CLEAR_LOGOS: img_cache_clear(); tv_toast(tr(S_LOGOS_CLEARED)); break;

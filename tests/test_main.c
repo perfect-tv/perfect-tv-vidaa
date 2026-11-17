@@ -11,6 +11,7 @@
 #include "core/util.h"
 #include "data/catchup.h"
 #include "data/backup.h"
+#include "data/tmdb.h"
 #include "data/epg.h"
 #include "data/m3u.h"
 #include "data/names.h"
@@ -595,7 +596,7 @@ static char *phone_req(int port, const char *req, phone_result *r, int *got) {
 
 static void test_phone(void) {
     char url[200], err[100];
-    if (phone_start(url, sizeof url, err, sizeof err)) { printf("phone: нет сети (%s), пропуск\n", err); return; }
+    if (phone_start(PHONE_PLAYLIST, url, sizeof url, err, sizeof err)) { printf("phone: нет сети (%s), пропуск\n", err); return; }
     CHECK(phone_running());
     const char *tok = strrchr(url, '/') + 1, *pc = strrchr(url, ':');
     int port = atoi(pc + 1);
@@ -698,6 +699,72 @@ static void test_backup(void) {
     store_set("pin", NULL);
 }
 
+/* ---------- TMDB (те же случаи, что TmdbTest Android-версии) ---------- */
+static tmdb_hit th(const char *title, const char *date, const char *type, const char *orig, const char *backdrop) {
+    tmdb_hit h;
+    memset(&h, 0, sizeof h);
+    snprintf(h.title, sizeof h.title, "%s", title);
+    snprintf(h.date, sizeof h.date, "%s", date);
+    snprintf(h.type, sizeof h.type, "%s", type);
+    snprintf(h.original, sizeof h.original, "%s", orig);
+    snprintf(h.backdrop, sizeof h.backdrop, "%s", backdrop);
+    return h;
+}
+static void test_tmdb(void) {
+    char q[300];
+    tmdb_query("т/с Белые волки 2. 9 с.", q, sizeof q);
+    CHECK(q[0] != 0);
+    tmdb_query("Шерлок (2010) 16+", q, sizeof q);
+    EQS(q, "шерлок");
+    tmdb_query("«Брат 2». Фильм", q, sizeof q);
+    EQS(q, "брат 2");
+    tmdb_query("Тайны следствия. 5 сезон. 12 серия", q, sizeof q);
+    EQS(q, "тайны следствия");
+    tmdb_query("Склифосовский (с. 7)", q, sizeof q);
+    EQS(q, "склифосовский");
+    tmdb_query("Новости. Дайджест", q, sizeof q);
+    EQS(q, "новости");
+    tmdb_query("Мультфильмы. Сборник 3", q, sizeof q);
+    EQS(q, "мультфильмы");
+    tmdb_query("Ирония судьбы, или С лёгким паром!", q, sizeof q);
+    EQS(q, "ирония судьбы, или с лёгким паром!");
+    EQI(tmdb_year("Шерлок (2010)", ""), 2010);
+    EQI(tmdb_year("Брат", "Россия, 1997 г. Режиссёр..."), 1997);
+    EQI(tmdb_year("Новости", "Главные события дня"), 0);
+    EQI(tmdb_year("Фильм", "Комедия 2003, США"), 2003);
+    EQI(tmdb_year("Фильм", "Тел. 12003456"), 0);
+    CHECK(tmdb_similarity("Ёлки!", "елки") > 0.999);
+    CHECK(tmdb_similarity("Верить и ждать", "Верить и ждать 2") > 0.8);
+    CHECK(tmdb_similarity("Новости", "Новый Человек-паук") < 0.72);
+    tmdb_hit r[3] = {th("Брат 2", "2000-05-11", "movie", "", "/a.jpg"), th("Брат", "1997-12-12", "movie", "", "/b.jpg"), th("Брат", "", "person", "", "")};
+    EQI(tmdb_pick(r, 3, "Брат", 1997), 1);
+    EQI(tmdb_pick(r, 3, "Брат 2", 2000), 0);
+    tmdb_hit np = th("Новый Человек-паук", "", "tv", "", "");
+    EQI(tmdb_pick(&np, 1, "Новости", 0), -1);
+    tmdb_hit today = th("Сегодня", "1952-01-14", "tv", "Today", "");
+    tmdb_hit two[2] = {today, th("Сегодня вечером", "", "movie", "", "")};
+    EQI(tmdb_pick(two, 2, "Сегодня", 0), -1);
+    EQI(tmdb_pick(&today, 1, "Сегодня", 0), 0);
+    tmdb_hit ev = th("Сегодня вечером", "", "movie", "", "");
+    EQI(tmdb_pick(&ev, 1, "Сегодня", 0), -1);
+    const char *js = "{\"page\":1,\"results\":[{\"media_type\":\"person\",\"name\":\"X\"},"
+                     "{\"media_type\":\"tv\",\"name\":\"Шерлок\",\"original_name\":\"Sherlock\",\"first_air_date\":\"2010-07-25\","
+                     "\"backdrop_path\":\"/b.jpg\",\"poster_path\":null,\"overview\":\"Детектив\",\"vote_average\":8.5}]}";
+    tmdb_hit *h;
+    int n = tmdb_parse(js, strlen(js), &h);
+    EQI(n, 1);
+    if (n == 1) {
+        EQS(h[0].title, "Шерлок");
+        EQS(h[0].original, "Sherlock");
+        EQS(h[0].date, "2010-07-25");
+        EQS(h[0].backdrop, "/b.jpg");
+        EQS(h[0].poster, "");
+        CHECK(h[0].vote > 8.4 && h[0].vote < 8.6);
+        EQI(tmdb_pick(h, n, "шерлок", 2010), 0);
+    }
+    free(h);
+}
+
 static void test_lang(void) {
     lang_set(LANG_RU);
     EQS(trp(S_CHANNELS_N, 1), "1 канал");
@@ -773,6 +840,7 @@ int main(void) {
     test_phone();
     test_usb(dir);
     test_backup();
+    test_tmdb();
     test_lang();
     test_clock();
     char cmd[300];

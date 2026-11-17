@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "phone.h"
 #include "lang.h"
+#include "prefs.h"
 #include "util.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -25,7 +26,7 @@
 typedef struct { int fd; char *buf; size_t len; double t0; } conn;
 static struct {
     int lfd;
-    int port;
+    int port, kind;
     char token[24];
     double t_start;
     conn c[MAX_CONN];
@@ -82,8 +83,9 @@ static void make_token(char *out) {
     for (int i = 0; i < 8; i++) sprintf(out + i * 2, "%02x", r[i]);
 }
 
-int phone_start(char *url, size_t cap, char *err, size_t errn) {
+int phone_start(int kind, char *url, size_t cap, char *err, size_t errn) {
     phone_stop();
+    S.kind = kind;
     char ip[INET_ADDRSTRLEN];
     if (phone_lan_ip(ip, sizeof ip)) { snprintf(err, errn, "no_network"); return -1; }
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -153,7 +155,23 @@ static void page(sbuf *b, const char *msg, int form) {
               "button{width:100%;margin-top:26px;padding:15px;border:0;border-radius:8px;background:#ebebeb;color:#101010;font:700 17px sans-serif}"
               "</style></head><body><main><h1>Perfect TV</h1>");
     if (msg) { sb_add(b, "<p class=\"m\">"); html_esc(b, msg); sb_add(b, "</p>"); }
-    if (form) {
+    if (form && S.kind == PHONE_TMDB) {
+        sb_add(b, "<p>");
+        html_esc(b, tr(S_PH_TMDB_INTRO));
+        sb_printf(b, "</p><form action=\"/%s\" method=\"post\" accept-charset=\"utf-8\"><label for=\"key\">", S.token);
+        html_esc(b, tr(S_TMDB_KEY));
+        sb_add(b, "</label><input id=\"key\" name=\"key\" required maxlength=\"290\" autocomplete=\"off\" autofocus><label for=\"api\">");
+        html_esc(b, tr(S_TMDB_API));
+        sb_add(b, "</label><input id=\"api\" name=\"api\" type=\"url\" maxlength=\"290\" value=\"");
+        html_esc(b, P.tmdb_api[0] ? P.tmdb_api : "https://api.themoviedb.org/3");
+        sb_add(b, "\"><label for=\"img\">");
+        html_esc(b, tr(S_TMDB_IMG));
+        sb_add(b, "</label><input id=\"img\" name=\"img\" type=\"url\" maxlength=\"290\" value=\"");
+        html_esc(b, P.tmdb_img[0] ? P.tmdb_img : "https://image.tmdb.org");
+        sb_add(b, "\"><button type=\"submit\">");
+        html_esc(b, tr(S_PH_PAGE_SEND));
+        sb_add(b, "</button></form>");
+    } else if (form) {
         sb_add(b, "<p>");
         html_esc(b, tr(S_PH_PAGE_INTRO));
         sb_printf(b, "</p><form action=\"/%s\" method=\"post\" accept-charset=\"utf-8\">", S.token);
@@ -227,6 +245,24 @@ static int handle(conn *c, phone_result *r, int *got) {
     } else if (!strcmp(method, "GET")) {
         page(&b, NULL, 1);
         respond(c->fd, 200, b.s);
+    } else if (!strcmp(method, "POST") && S.kind == PHONE_TMDB) {
+        const char *body = c->buf + hl;
+        form_get(body, blen, "key", r->key, sizeof r->key);
+        form_get(body, blen, "api", r->api, sizeof r->api);
+        form_get(body, blen, "img", r->img, sizeof r->img);
+        int ok = r->key[0] != 0;
+        for (const char *q = r->key; *q && ok; q++)
+            ok = (*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') || (*q >= '0' && *q <= '9') || *q == '.' || *q == '_' || *q == '-';
+        if (!ok || (r->api[0] && !valid_url(r->api)) || (r->img[0] && !valid_url(r->img))) {
+            page(&b, tr(ok ? S_PH_PAGE_BAD : S_PH_TMDB_BAD), 1);
+            respond(c->fd, 200, b.s);
+            memset(r, 0, sizeof *r);
+        } else {
+            r->kind = PHONE_TMDB;
+            page(&b, tr(S_PH_PAGE_DONE_TMDB), 0);
+            respond(c->fd, 200, b.s);
+            *got = 1;
+        }
     } else if (!strcmp(method, "POST")) {
         const char *body = c->buf + hl;
         form_get(body, blen, "url", r->url, sizeof r->url);
@@ -281,6 +317,6 @@ int phone_poll(phone_result *r) {
     if (!got) return 0;
     *r = res;
     phone_stop();
-    fprintf(stderr, "phone_received epg=%d\n", r->epg[0] != 0);
+    fprintf(stderr, "phone_received kind=%d epg=%d\n", r->kind, r->epg[0] != 0);
     return 1;
 }

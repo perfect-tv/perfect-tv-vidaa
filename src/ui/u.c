@@ -232,7 +232,21 @@ static int seg_draw(gfx_t *g, int x, int y, double em, int f, uint32_t c, const 
     return x - x0;
 }
 int d_text(gfx_t *g, int x, int y, double em, int f, uint32_t c, const char *s, int maxw) {
-    if (s && has_arrow(s, NULL)) return seg_draw(g, x, y, em, f, c, s, s + strlen(s));
+    if (s && has_arrow(s, NULL)) {
+        const char *end = s + strlen(s);
+        if (maxw <= 0 || seg_w(em, f, s, end) <= maxw) return seg_draw(g, x, y, em, f, c, s, end);
+        /* не помещается: самое длинное начало + «…» (стрелки — значками, поэтому мерить кусками) */
+        int ell = text_width(px(em), f, "…");
+        const char *e = s, *fit = s;
+        while (*e) {
+            const char *q = e;
+            if (arrow_at(q) >= 0) q += 3; else { q++; while ((*q & 0xc0) == 0x80) q++; }
+            if (seg_w(em, f, s, q) + ell > maxw) break;
+            fit = e = q;
+        }
+        int w = seg_draw(g, x, y, em, f, c, s, fit);
+        return w + text_draw(g, x + w, y, px(em), f, c, "…", 0);
+    }
     return text_draw(g, x, y, px(em), f, c, s, maxw);
 }
 int d_text_w(double em, int f, const char *s) {

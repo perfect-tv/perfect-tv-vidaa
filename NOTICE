@@ -28,5 +28,7 @@ FFmpeg (libavformat, libavcodec, libavutil, libswscale, libswresample) — LGPL 
 ALSA (libasound) — LGPL 2.1.
 stb_image — public domain / MIT.
 Шрифты Noto Sans и Onest — SIL Open Font License 1.1 (LICENSE-fonts.txt в пакете).
+TMDB — описания и картинки по ключу пользователя: «This product uses the TMDB API but is not endorsed or certified
+  by TMDB» (условия API TMDB; строка — и в «О программе → Лицензия»).
 
 Сторонний код сменился — обновить этот файл, строку S_LICENSE_TEXT (src/core/strings.def) и credits в app.json.

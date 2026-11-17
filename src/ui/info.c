@@ -4,6 +4,7 @@
 #include "screens.h"
 #include "tv.h"
 #include "u.h"
+#include "data/tmdb.h"
 #include "keys.h"
 #include "app.h"
 #include "core/clock.h"
@@ -143,7 +144,12 @@ void info_draw(gfx_t *g) {
         d_fill(g, x, y, w, 1, C_LINE_STRONG);
         y += E(1.2);
         int iw = w * 25 / 100, ih = exp_h - E(0.4), nwid = w * 27 / 100;
+        /* TMDB (если задан ключ): картинка — после EPG, описание — если в EPG его нет */
+        int tst = TMDB_OFF;
+        const tmdb_result *tm = has ? tmdb_get(p.title, p.desc, &tst) : NULL;
         int shown = has && p.icon[0] && d_image(g, p.icon, x, y, iw, ih, E(0.6), 1);
+        if (!shown && tm && tm->backdrop[0]) shown = d_image(g, tm->backdrop, x, y, iw, ih, E(0.6), 1);
+        if (!shown && tm && tm->poster[0]) shown = d_image(g, tm->poster, x, y, iw, ih, E(0.6), 0);
         if (!shown) {
             d_round(g, x, y, iw, ih, E(0.6), C_FILL_SOFT);
             int lw = iw * 60 / 100, lh = lw * 66 / 96;
@@ -156,9 +162,16 @@ void info_draw(gfx_t *g) {
             fmt_hm(p.start, a1);
             fmt_hm(p.stop, a2);
             snprintf(tags, sizeof tags, "%s – %s%s%s%s%s", a1, a2, p.cat[0] ? "  ·  " : "", p.cat, p.sub[0] ? "  ·  " : "", p.sub);
+            if (tm) {
+                size_t tl = strlen(tags);
+                if (tm->year[0]) snprintf(tags + tl, sizeof tags - tl, "  ·  %s", tm->year);
+                tl = strlen(tags);
+                if (tm->vote > 0) snprintf(tags + tl, sizeof tags - tl, "  ·  TMDB %.1f", tm->vote);
+            }
             d_text(g, dx, y, 1.15, F_S, C_TEXT3, tags, dw);
             int lines = (ih - E(2.2)) / d_line_h(1.25, F_R);
-            d_lines(g, dx, y + E(2.2), dw, 1.25, F_R, C_TEXT2, p.desc[0] ? p.desc : p.title, lines > 1 ? lines : 1, 0);
+            const char *desc = p.desc[0] ? p.desc : tm && tm->overview[0] ? tm->overview : tst == TMDB_LOADING ? "…" : p.title;
+            d_lines(g, dx, y + E(2.2), dw, 1.25, F_R, C_TEXT2, desc, lines > 1 ? lines : 1, 0);
         }
         int nx = x + w - nwid;
         d_text(g, nx, y, 1.15, F_S, C_TEXT3, tr(S_NEXT), 0);

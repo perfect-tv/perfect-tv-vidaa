@@ -18,6 +18,7 @@ static struct {
     int ok;                  /* код показан */
     phone_fn done;
     void *ctx;
+    int kind;
 } PH;
 static layer PHL;
 
@@ -25,7 +26,7 @@ static void start(void) {
     char e[100] = "";
     PH.ok = 0;
     PH.err[0] = 0;
-    if (phone_start(PH.url, sizeof PH.url, e, sizeof e)) {
+    if (phone_start(PH.kind, PH.url, sizeof PH.url, e, sizeof e)) {
         snprintf(PH.err, sizeof PH.err, "%s", !strcmp(e, "no_network") ? tr(S_PHONE_NO_NET) : trf(S_PHONE_FAILED, e));
         return;
     }
@@ -47,7 +48,7 @@ static void ph_tick(layer *l, double now) {
         phone_fn fn = PH.done;
         void *ctx = PH.ctx;
         layer_pop(&PHL);
-        tv_toast(tr(S_PHONE_GOT));
+        tv_toast(tr(PH.kind == PHONE_TMDB ? S_PHONE_GOT_TMDB : S_PHONE_GOT));
         if (fn) fn(&r, ctx);
         app_dirty();
     } else if (PH.ok && !phone_running()) {
@@ -88,7 +89,10 @@ static void ph_draw(layer *l, gfx_t *g) {
 
 static void ph_closed(layer *l) { (void)l; phone_stop(); }
 
-void phone_open(phone_fn done, void *ctx) {
+void phone_open(phone_fn done, void *ctx) { phone_open_kind(PHONE_PLAYLIST, done, ctx); }
+
+void phone_open_kind(int kind, phone_fn done, void *ctx) {
+    PH.kind = kind;
     PHL.name = "phone";
     PHL.key = ph_key;
     PHL.tick = ph_tick;

@@ -56,5 +56,6 @@ void search_open_query(const char *q);              /* с готовым зап�
 /* phone.c — ввод с телефона по QR */
 #include "core/phone.h"
 typedef void (*phone_fn)(const phone_result *r, void *ctx);
-void phone_open(phone_fn done, void *ctx);
+void phone_open(phone_fn done, void *ctx);          /* плейлист */
+void phone_open_kind(int kind, phone_fn done, void *ctx);
 #endif
