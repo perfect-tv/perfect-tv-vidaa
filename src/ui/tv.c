@@ -80,10 +80,14 @@ int tv_direct_count(void) {
 void tv_direct_reset(void) { store_set(DIRECT_KEY, NULL); T.direct = 0; }
 
 /* Через ретранслятор (дорожки телетекста и субтитров, которые системный плеер отбрасывает): по настройке «Поток
- * через приложение» — все HTTP/HLS-каналы, кроме тех, что так не открылись; телетекст / субтитры — всегда. */
+ * через приложение» — все каналы HTTP / HLS, UDP / RTP и RTSP, кроме тех, что так не открылись; телетекст /
+ * субтитры — всегда. RTSP в архиве — напрямую: плеер перематывает внутри ссылки, а поток от ретранслятора — без
+ * перемотки. */
 static void open_url(const char *url, const char *hdr, double start) {
     T.relayed = 0;
-    if (T.tap || (P.relay_all && !T.direct)) {
+    int rtsp_arc = T.arc && starts_with_ci(url, "rtsp://");
+    if (rtsp_arc && T.tap) { T.tap = T.subs = 0; tv_toast(tr(S_TTX_NOT_HTTP)); }
+    if (!rtsp_arc && (T.tap || (P.relay_all && !T.direct))) {
         static char r[16384];
         if (!relay_url(url, hdr, r, sizeof r)) {
             relay_reset();

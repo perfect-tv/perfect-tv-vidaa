@@ -7,6 +7,7 @@
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <sys/epoll.h>
@@ -286,8 +287,13 @@ static void make_url(sbuf *b, const char *url, const char *headers) {
     if (headers && *headers) { sb_add(b, "&h="); urlenc(b, headers); }
 }
 
+int relay_scheme_ok(const char *url) {
+    return starts_with_ci(url, "http://") || starts_with_ci(url, "https://") || starts_with_ci(url, "udp://") || starts_with_ci(url, "rtp://") ||
+           starts_with_ci(url, "rtsp://");
+}
+
 int relay_url(const char *url, const char *headers, char *out, size_t cap) {
-    if (!starts_with_ci(url, "http://") && !starts_with_ci(url, "https://")) return -1;
+    if (!relay_scheme_ok(url)) return -1;
     if (relay_start()) return -1;
     sbuf b = {0};
     make_url(&b, url, headers);
@@ -458,6 +464,7 @@ static const char *reason(int code) {
     case 304: return "Not Modified";
     case 403: return "Forbidden";
     case 404: return "Not Found";
+    case 415: return "Unsupported Media Type";
     case 416: return "Range Not Satisfiable";
     default: return code >= 500 ? "Bad Gateway" : "Error";
     }
@@ -486,7 +493,9 @@ typedef struct { int kind; void *p; } tag;
 typedef struct cl cl;
 typedef struct up up;
 
-enum { U_RESOLVE, U_CONNECT, U_TLS, U_SEND, U_HEAD, U_BODY, U_IDLE };
+enum { U_RESOLVE, U_CONNECT, U_TLS, U_SEND, U_HEAD, U_BODY, U_IDLE, U_RTSP, U_UDP };
+enum { P_HTTP, P_UDP, P_RTSP };
+typedef struct rtsp_st rtsp_st;
 typedef struct dns_job dns_job;
 struct up {
     tag t;
@@ -508,6 +517,8 @@ struct up {
     sbuf headers;
     char location[4096];
     double deadline;
+    int proto, got_data;
+    rtsp_st *rt;          /* RTSP: сеанс */
     up *next;
 };
 struct cl {
@@ -551,10 +562,19 @@ static void client_upstream_failed(cl *c, int code);
 static void up_start_request(up *u);
 static void up_readable(up *u);
 
+static void rtsp_teardown(up *u);
+static void rtsp_connected(up *u);
+static void rtsp_event(up *u, uint32_t ev);
+static void udp_event(up *u);
+static int udp_attach(cl *c);
+static void rtsp_attach(cl *c);
+static void rtsp_keepalive(up *u, double now);
+
 static void up_free(up *u) {
     if (u->dead) return;
     u->dead = 1;
     if (u->dns) u->dns->cancelled = 1;   /* поток DNS ещё работает: итог выбросит цикл */
+    if (u->rt) rtsp_teardown(u);
     if (u->fd >= 0) { epoll_ctl(ep, EPOLL_CTL_DEL, u->fd, NULL); }
     if (u->ssl) SSL_free(u->ssl);
     if (u->fd >= 0) close(u->fd);
@@ -564,6 +584,7 @@ static void up_free(up *u) {
     sb_free(&u->req);
     sb_free(&u->headers);
     free(u->in);
+    free(u->rt);
     bury(u);
 }
 
@@ -728,12 +749,18 @@ static void up_send(up *u) {
         } else {
             w = send(u->fd, u->req.s + u->req_off, n, MSG_NOSIGNAL);
             if (w < 0) {
-                if (errno == EAGAIN || errno == EINTR) { set_ev(u->fd, &u->t, &u->ev, EPOLLOUT); return; }
+                if (errno == EAGAIN || errno == EINTR) { set_ev(u->fd, &u->t, &u->ev, EPOLLOUT | (u->proto == P_RTSP ? EPOLLIN | EPOLLRDHUP : 0)); return; }
                 up_fail(u, 502);
                 return;
             }
         }
         u->req_off += (size_t)w;
+    }
+    if (u->proto == P_RTSP) {   /* RTSP: запрос ушёл — ждём ответ и данные дальше */
+        sb_clear(&u->req);
+        u->req_off = 0;
+        set_ev(u->fd, &u->t, &u->ev, EPOLLIN | EPOLLRDHUP);
+        return;
     }
     u->st = U_HEAD;
     u->in_n = 0;
@@ -742,6 +769,7 @@ static void up_send(up *u) {
 }
 
 static void up_after_connect(up *u) {
+    if (u->proto == P_RTSP) { rtsp_connected(u); return; }
     if (!strcmp(u->u.scheme, "https")) {
         int any = P.any_cert;
         SSL_CTX *ctx = http_ssl_ctx(any);
@@ -792,6 +820,8 @@ static void up_start_request(up *u) {
 
 /* Соединение к провайдеру для запроса клиента: из пула (тот же адрес и режим сертификатов) или новое. */
 static void client_attach(cl *c) {
+    if (starts_with_ci(c->url, "udp://") || starts_with_ci(c->url, "rtp://")) { if (udp_attach(c)) client_upstream_failed(c, 502); return; }
+    if (starts_with_ci(c->url, "rtsp://")) { rtsp_attach(c); return; }
     http_url hu;
     if (http_split_url(c->url, &hu)) { client_upstream_failed(c, 404); return; }
     char key[300];
@@ -1080,6 +1110,499 @@ static void up_readable(up *u) {
     if (u->st == U_BODY) up_body(u, eof);
 }
 
+/* ---------- UDP / RTP и RTSP ----------
+ * Потоки не по HTTP плееру отдаются как HTTP с MPEG-TS без длины (кусками) — тем же путём, что и HTTP, с разбором
+ * TS по дороге (телетекст, DVB, CEA-608). UDP / RTP: мультикаст — вход в группу (с источником — SSM), иначе — приём
+ * на порт; заголовок RTP снимается. Плеер читать не успевает — датаграммы сверх очереди выбрасываются (UDP не
+ * приостановить). RTSP: DESCRIBE → SETUP (RTP поверх того же TCP, interleaved) → PLAY, авторизация Basic / Digest;
+ * берётся медиа с MPEG-TS (тип 33 или rtpmap MP2T) — других (отдельные H.264 / AAC) нет: ответ 415, и tv.c открывает
+ * канал напрямую. Сеанс поддерживается GET_PARAMETER (не умеет — OPTIONS) раз в половину таймаута, при закрытии —
+ * TEARDOWN. */
+#define UDP_OUT_MAX (4u << 20)
+#define T_UDP_FIRST 10.0
+
+static const uint8_t *rtp_strip(const uint8_t *p, size_t n, size_t *out) {
+    if (n && p[0] == 0x47) { *out = n; return p; }   /* голый TS */
+    if (n < 12 || (p[0] >> 6) != 2) return NULL;
+    size_t h = 12 + 4 * (size_t)(p[0] & 15);
+    if ((p[0] & 0x10) && n >= h + 4) h += 4 + 4 * (size_t)(p[h + 2] << 8 | p[h + 3]);
+    size_t pad = (p[0] & 0x20) ? p[n - 1] : 0;
+    if (h + pad >= n) return NULL;
+    *out = n - h - pad;
+    return p + h;
+}
+
+static void stream_head(up *u) {
+    u->status = 200;
+    u->length = -1;
+    sb_clear(&u->headers);
+    sb_add(&u->headers, "Content-Type: video/mp2t\r\n");
+}
+
+/* кусок TS от UDP / RTSP — плееру (очередь переполнена — выбросить) */
+static void stream_data(up *u, const uint8_t *d, size_t n) {
+    cl *c = u->c;
+    if (!c || c->dead || !n) return;
+    if (!u->got_data) { u->got_data = 1; fprintf(stderr, "relay_stream_started proto=%d\n", u->proto); }
+    u->deadline = mono_now() + T_BODY;
+    if (out_pending(c) > UDP_OUT_MAX) return;
+    client_deliver(c, u, (const char *)d, n);
+}
+
+/* udp://[источник@]группа:порт[?…], rtp://… ; «@группа» — то же без источника */
+static int udp_parse(const char *url, struct in_addr *grp, struct in_addr *src, int *has_src, int *port_) {
+    const char *s = strstr(url, "://") + 3;
+    char a[300];
+    size_t l = strcspn(s, "?/#");
+    if (l >= sizeof a) return -1;
+    memcpy(a, s, l);
+    a[l] = 0;
+    char *at = strchr(a, '@'), *hp = a;
+    *has_src = 0;
+    if (at) {
+        *at = 0;
+        if (*a) { if (inet_pton(AF_INET, a, src) != 1) return -1; *has_src = 1; }
+        hp = at + 1;
+    }
+    char *colon = strrchr(hp, ':');
+    if (!colon) return -1;
+    *colon = 0;
+    *port_ = atoi(colon + 1);
+    if (*port_ <= 0 || *port_ > 65535) return -1;
+    if (!*hp) { grp->s_addr = htonl(INADDR_ANY); return 0; }
+    return inet_pton(AF_INET, hp, grp) == 1 ? 0 : -1;
+}
+
+static int udp_attach(cl *c) {
+    struct in_addr grp, src;
+    int has_src, prt;
+    if (udp_parse(c->url, &grp, &src, &has_src, &prt)) { fprintf(stderr, "relay_udp_bad_url\n"); return -1; }
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    int one = 1, rb = 4 << 20;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+#ifdef SO_REUSEPORT
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+#endif
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
+    int mc = IN_MULTICAST(ntohl(grp.s_addr));
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)prt)};
+    sa.sin_addr = mc ? grp : (struct in_addr){htonl(INADDR_ANY)};   /* группа в bind — чужие группы на том же порту не придут */
+    if (bind(fd, (struct sockaddr *)&sa, sizeof sa)) {
+        sa.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(fd, (struct sockaddr *)&sa, sizeof sa)) { fprintf(stderr, "relay_udp_bind %s\n", strerror(errno)); close(fd); return -1; }
+    }
+    if (mc) {
+        int r;
+        if (has_src) {
+            struct ip_mreq_source m = {.imr_multiaddr = grp, .imr_sourceaddr = src, .imr_interface = {htonl(INADDR_ANY)}};
+            r = setsockopt(fd, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP, &m, sizeof m);
+        } else {
+            struct ip_mreq m = {.imr_multiaddr = grp, .imr_interface = {htonl(INADDR_ANY)}};
+            r = setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m);
+        }
+        if (r) { fprintf(stderr, "relay_udp_join %s\n", strerror(errno)); close(fd); return -1; }
+    }
+    up *u = calloc(1, sizeof *u);
+    if (!u) { close(fd); return -1; }
+    u->t = (tag){K_UP, u};
+    u->fd = fd;
+    u->ev = -1;
+    u->st = U_UDP;
+    u->proto = P_UDP;
+    snprintf(u->key, sizeof u->key, "udp");
+    u->next = ups;
+    ups = u;
+    u->c = c;
+    c->u = u;
+    stream_head(u);
+    u->deadline = mono_now() + T_UDP_FIRST;
+    set_ev(fd, &u->t, &u->ev, EPOLLIN);
+    fprintf(stderr, "relay_udp_open multicast=%d ssm=%d\n", mc, has_src);
+    return 0;
+}
+
+static void udp_event(up *u) {
+    static uint8_t buf[65536];
+    for (int k = 0; k < 512 && !u->dead; k++) {
+        ssize_t r = recv(u->fd, buf, sizeof buf, 0);
+        if (r < 0) { if (errno != EAGAIN && errno != EINTR) up_fail(u, 502); break; }
+        size_t pn;
+        const uint8_t *pl = rtp_strip(buf, (size_t)r, &pn);
+        if (pl) stream_data(u, pl, pn);
+    }
+    if (!u->dead && u->c && !u->c->dead) client_flush(u->c);
+}
+
+/* ---- RTSP ---- */
+enum { R_DESCRIBE, R_SETUP, R_PLAY, R_PLAYING };
+struct rtsp_st {
+    int phase, cseq, auth_tries, rtp_ch, ka_period, ka_options, digest;
+    double ka_at;
+    char user[128], pass[128], realm[200], nonce[300], opaque[200], qop[32];
+    char url[4096], base[4096], media[4096], aggr[4096], session[200], ua[300];
+    char method[24], req_url[4096], extra[300];
+};
+
+static void md5hex(const char *s, char out[33]) {
+    unsigned char d[EVP_MAX_MD_SIZE];
+    unsigned l = 0;
+    EVP_Digest(s, strlen(s), d, &l, EVP_md5(), NULL);
+    for (unsigned i = 0; i < 16; i++) sprintf(out + 2 * i, "%02x", d[i]);
+    out[32] = 0;
+}
+
+static void rtsp_unpct(char *s) {
+    char *o = s;
+    for (char *p = s; *p; p++) {
+        if (*p == '%' && hexv(p[1]) >= 0 && hexv(p[2]) >= 0) { *o++ = (char)(hexv(p[1]) * 16 + hexv(p[2])); p += 2; }
+        else *o++ = *p;
+    }
+    *o = 0;
+}
+
+static void rtsp_send(up *u, const char *method, const char *url, const char *extra) {
+    rtsp_st *r = u->rt;
+    snprintf(r->method, sizeof r->method, "%s", method);
+    snprintf(r->req_url, sizeof r->req_url, "%s", url);
+    snprintf(r->extra, sizeof r->extra, "%s", extra ? extra : "");
+    sb_printf(&u->req, "%s %s RTSP/1.0\r\nCSeq: %d\r\nUser-Agent: %s\r\n", method, url, ++r->cseq, r->ua);
+    if (r->session[0]) sb_printf(&u->req, "Session: %s\r\n", r->session);
+    if (r->nonce[0] && r->digest) {
+        char a1[600], a2[4200], h1[33], h2[33], rs[33], all[1200];
+        snprintf(a1, sizeof a1, "%s:%s:%s", r->user, r->realm, r->pass);
+        snprintf(a2, sizeof a2, "%s:%s", method, url);
+        md5hex(a1, h1);
+        md5hex(a2, h2);
+        if (r->qop[0]) {
+            snprintf(all, sizeof all, "%s:%s:%08x:%s:auth:%s", h1, r->nonce, r->cseq, "0a4f113b", h2);
+            md5hex(all, rs);
+            sb_printf(&u->req, "Authorization: Digest username=\"%s\", realm=\"%s\", nonce=\"%s\", uri=\"%s\", response=\"%s\", qop=auth, nc=%08x, cnonce=\"0a4f113b\"",
+                      r->user, r->realm, r->nonce, url, rs, r->cseq);
+        } else {
+            snprintf(all, sizeof all, "%s:%s:%s", h1, r->nonce, h2);
+            md5hex(all, rs);
+            sb_printf(&u->req, "Authorization: Digest username=\"%s\", realm=\"%s\", nonce=\"%s\", uri=\"%s\", response=\"%s\"", r->user, r->realm,
+                      r->nonce, url, rs);
+        }
+        if (r->opaque[0]) sb_printf(&u->req, ", opaque=\"%s\"", r->opaque);
+        sb_add(&u->req, "\r\n");
+    } else if (r->realm[0] && !r->digest && u->u.auth[0]) sb_printf(&u->req, "Authorization: Basic %s\r\n", u->u.auth);
+    sb_add(&u->req, r->extra);
+    sb_add(&u->req, "\r\n");
+    if (u->req_off == 0) up_send(u);
+}
+
+static void rtsp_attach(cl *c) {
+    /* адрес как http://, чтобы разобрать общим разборщиком; порт по умолчанию — 554 */
+    char tmp[4200];
+    snprintf(tmp, sizeof tmp, "http://%s", c->url + 7);
+    http_url hu;
+    if (http_split_url(tmp, &hu)) { client_upstream_failed(c, 404); return; }
+    const char *auth_end = c->url + 7 + strcspn(c->url + 7, "/?#");
+    const char *hs = c->url + 7, *at = NULL;
+    for (const char *q = hs; q < auth_end; q++) if (*q == '@') at = q;
+    const char *hp = at ? at + 1 : hs;
+    int explicit_port = 0;
+    for (const char *q = hp; q < auth_end; q++) if (*q == ':') explicit_port = 1;
+    if (*hp == '[') explicit_port = memchr(hp, ']', (size_t)(auth_end - hp)) && strstr(hp, "]:") && strstr(hp, "]:") < auth_end;
+    if (!explicit_port) snprintf(hu.port, sizeof hu.port, "554");
+    up *u = calloc(1, sizeof *u);
+    rtsp_st *r = calloc(1, sizeof *r);
+    if (!u || !r) { free(u); free(r); client_upstream_failed(c, 502); return; }
+    u->rt = r;
+    if (at) {
+        char ui[300];
+        size_t l = (size_t)(at - hs);
+        if (l >= sizeof ui) l = sizeof ui - 1;
+        memcpy(ui, hs, l);
+        ui[l] = 0;
+        char *colon = strchr(ui, ':');
+        if (colon) *colon = 0;
+        snprintf(r->user, sizeof r->user, "%s", ui);
+        snprintf(r->pass, sizeof r->pass, "%s", colon ? colon + 1 : "");
+        rtsp_unpct(r->user);
+        rtsp_unpct(r->pass);
+    }
+    /* адрес в запросах — без имени и пароля */
+    snprintf(r->url, sizeof r->url, "rtsp://%.*s%s", (int)(auth_end - hp), hp, *auth_end ? auth_end : "/");
+    char *hash = strchr(r->url, '#');
+    if (hash) *hash = 0;
+    snprintf(r->base, sizeof r->base, "%s", r->url);
+    const char *ua = strcasestr(c->chan, "User-Agent:");
+    if (ua) {
+        ua += 11;
+        while (*ua == ' ') ua++;
+        snprintf(r->ua, sizeof r->ua, "%.*s", (int)strcspn(ua, "\r\n"), ua);
+    } else snprintf(r->ua, sizeof r->ua, "PerfectTV/" PTV_VERSION " (VIDAA; native)");
+    r->rtp_ch = 0;
+    u->t = (tag){K_UP, u};
+    u->fd = -1;
+    u->ev = -1;
+    u->st = -1;
+    u->proto = P_RTSP;
+    snprintf(u->key, sizeof u->key, "rtsp");
+    u->u = hu;
+    u->next = ups;
+    ups = u;
+    u->c = c;
+    c->u = u;
+    stream_head(u);
+    up_resolve(u);
+}
+
+static void rtsp_connected(up *u) {
+    u->st = U_RTSP;
+    u->deadline = mono_now() + T_CONNECT;
+    u->rt->phase = R_DESCRIBE;
+    rtsp_send(u, "DESCRIBE", u->rt->url, "Accept: application/sdp\r\n");
+}
+
+static void rtsp_teardown(up *u) {
+    rtsp_st *r = u->rt;
+    if (u->fd < 0 || !r->session[0] || u->st != U_RTSP) return;
+    char b[4600];
+    int n = snprintf(b, sizeof b, "TEARDOWN %s RTSP/1.0\r\nCSeq: %d\r\nUser-Agent: %s\r\nSession: %s\r\n\r\n", r->aggr[0] ? r->aggr : r->url, r->cseq + 1,
+                     r->ua, r->session);
+    if (n > 0 && n < (int)sizeof b && send(u->fd, b, (size_t)n, MSG_NOSIGNAL | MSG_DONTWAIT) < 0) {}   /* как получится: сокет закрывается следом */
+}
+
+/* относительный a=control: к базе (как делают серверы и клиенты RTSP — дописать через «/») */
+static void rtsp_ctl(const char *base, const char *ctl, char *out, size_t cap) {
+    if (!ctl[0] || !strcmp(ctl, "*")) { snprintf(out, cap, "%s", base); return; }
+    if (starts_with_ci(ctl, "rtsp://")) { snprintf(out, cap, "%s", ctl); return; }
+    size_t bl = strlen(base);
+    snprintf(out, cap, "%s%s%s", base, bl && base[bl - 1] == '/' ? "" : "/", ctl);
+}
+
+/* SDP: первое медиа с MPEG-TS; адреса для SETUP (медиа) и PLAY (весь сеанс) */
+int relay_sdp_pick(const char *sdp, const char *base, char *media, char *aggr, size_t cap) {
+    char sess_ctl[2048] = "", med_ctl[2048] = "", fmts[256] = "";
+    int in_media = 0, ok = 0, found = 0;
+    for (const char *p = sdp; p && *p && !found;) {
+        size_t l = strcspn(p, "\r\n");
+        char line[2048];
+        snprintf(line, sizeof line, "%.*s", (int)(l < sizeof line - 1 ? l : sizeof line - 1), p);
+        p += l;
+        while (*p == '\r' || *p == '\n') p++;
+        int last = !*p;
+        if (!strncmp(line, "m=", 2) || last) {
+            if (last && in_media) {
+                if (!strncmp(line, "a=control:", 10)) snprintf(med_ctl, sizeof med_ctl, "%s", line + 10);
+                if (!strncmp(line, "a=rtpmap:", 9) && strcasestr(line, "MP2T")) ok = 1;
+            }
+            if (in_media && ok) { found = 1; break; }
+            if (!strncmp(line, "m=", 2)) {
+                in_media = 1;
+                ok = 0;
+                med_ctl[0] = 0;
+                /* m=video 0 RTP/AVP 33 */
+                const char *f = line;
+                for (int k = 0; k < 3 && f; k++) { f = strchr(f, ' '); if (f) f++; }
+                snprintf(fmts, sizeof fmts, " %s ", f ? f : "");
+                if (strstr(fmts, " 33 ")) ok = 1;
+            }
+            continue;
+        }
+        if (!strncmp(line, "a=control:", 10)) snprintf(in_media ? med_ctl : sess_ctl, sizeof med_ctl, "%s", line + 10);
+        else if (in_media && !strncmp(line, "a=rtpmap:", 9) && strcasestr(line, "MP2T")) ok = 1;
+    }
+    if (!found && in_media && ok) found = 1;
+    if (!found) return -1;
+    rtsp_ctl(base, sess_ctl, aggr, cap);
+    rtsp_ctl(base, med_ctl[0] ? med_ctl : sess_ctl, media, cap);
+    return 0;
+}
+
+static void hdr_val(const char *head, const char *name, char *out, size_t cap) {
+    out[0] = 0;
+    size_t nl = strlen(name);
+    for (const char *p = head; p && *p;) {
+        if (!strncasecmp(p, name, nl) && p[nl] == ':') {
+            const char *v = p + nl + 1;
+            while (*v == ' ') v++;
+            snprintf(out, cap, "%.*s", (int)strcspn(v, "\r\n"), v);
+            return;
+        }
+        p = strstr(p, "\r\n");
+        if (p) p += 2;
+    }
+}
+static void auth_param(const char *h, const char *name, char *out, size_t cap) {
+    out[0] = 0;
+    const char *p = strcasestr(h, name);
+    while (p && p > h && p[-1] != ' ' && p[-1] != ',') p = strcasestr(p + 1, name);
+    if (!p || p[strlen(name)] != '=') return;
+    p += strlen(name) + 1;
+    if (*p == '"') { p++; snprintf(out, cap, "%.*s", (int)strcspn(p, "\""), p); }
+    else snprintf(out, cap, "%.*s", (int)strcspn(p, ", \r\n"), p);
+}
+
+static void rtsp_fail(up *u, int code, const char *why) {
+    fprintf(stderr, "relay_rtsp_failed %s\n", why);
+    up_fail(u, code);
+}
+
+/* ответ на запрос: head — заголовки (со строкой статуса), body — тело */
+static void rtsp_response(up *u, int status, const char *head, const char *body) {
+    rtsp_st *r = u->rt;
+    if (r->phase == R_PLAYING) {   /* ответ на поддержку сеанса: не умеет GET_PARAMETER — дальше OPTIONS */
+        if (status == 405 || status == 501 || status == 551) r->ka_options = 1;
+        return;
+    }
+    if (status == 401 && r->auth_tries < 2 && r->user[0]) {
+        char all[1024] = "";
+        /* несколько WWW-Authenticate: Digest важнее */
+        for (const char *p = head; p && *p;) {
+            if (!strncasecmp(p, "WWW-Authenticate:", 17)) {
+                const char *v = p + 17;
+                while (*v == ' ') v++;
+                size_t l = strcspn(v, "\r\n");
+                if (!all[0] || !strncasecmp(v, "Digest", 6)) snprintf(all, sizeof all, "%.*s", (int)l, v);
+            }
+            p = strstr(p, "\r\n");
+            if (p) p += 2;
+        }
+        r->auth_tries++;
+        r->digest = !strncasecmp(all, "Digest", 6);
+        auth_param(all, "realm", r->realm, sizeof r->realm);
+        if (!r->realm[0]) snprintf(r->realm, sizeof r->realm, "-");
+        auth_param(all, "nonce", r->nonce, sizeof r->nonce);
+        auth_param(all, "opaque", r->opaque, sizeof r->opaque);
+        auth_param(all, "qop", r->qop, sizeof r->qop);
+        if (r->qop[0] && !strcasestr(r->qop, "auth")) r->qop[0] = 0;
+        char m[24], url[4096], ex[300];
+        snprintf(m, sizeof m, "%s", r->method);
+        snprintf(url, sizeof url, "%s", r->req_url);
+        snprintf(ex, sizeof ex, "%s", r->extra);
+        rtsp_send(u, m, url, ex);
+        return;
+    }
+    if (status < 200 || status >= 300) {
+        char why[40];
+        snprintf(why, sizeof why, "%s_%d", r->method, status);
+        rtsp_fail(u, status == 401 || status == 403 || status == 404 ? status : 502, why);
+        return;
+    }
+    char v[600];
+    if (r->phase == R_DESCRIBE) {
+        hdr_val(head, "Content-Base", v, sizeof v);
+        if (!v[0]) hdr_val(head, "Content-Location", v, sizeof v);
+        if (v[0]) snprintf(r->base, sizeof r->base, "%s", v);
+        if (relay_sdp_pick(body ? body : "", r->base, r->media, r->aggr, sizeof r->media)) { rtsp_fail(u, 415, "no_mp2t"); return; }
+        r->phase = R_SETUP;
+        rtsp_send(u, "SETUP", r->media, "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n");
+    } else if (r->phase == R_SETUP) {
+        hdr_val(head, "Session", v, sizeof v);
+        if (!v[0]) { rtsp_fail(u, 502, "no_session"); return; }
+        char *semi = strchr(v, ';');
+        int timeout = 60;
+        if (semi) { char *t = strcasestr(semi, "timeout="); if (t) timeout = atoi(t + 8); *semi = 0; }
+        snprintf(r->session, sizeof r->session, "%s", v);
+        r->ka_period = timeout > 10 ? timeout / 2 : 5;
+        hdr_val(head, "Transport", v, sizeof v);
+        char *il = strcasestr(v, "interleaved=");
+        if (!il) { rtsp_fail(u, 502, "no_tcp"); return; }   /* сервер не дал TCP — пусть плеер сам */
+        r->rtp_ch = atoi(il + 12);
+        r->phase = R_PLAY;
+        rtsp_send(u, "PLAY", r->aggr, "Range: npt=0.000-\r\n");
+    } else if (r->phase == R_PLAY) {
+        r->phase = R_PLAYING;
+        r->ka_at = mono_now() + r->ka_period;
+        u->deadline = mono_now() + T_CONNECT;   /* до первых данных */
+        fprintf(stderr, "relay_rtsp_playing\n");
+    }
+}
+
+static void rtsp_keepalive(up *u, double now) {
+    rtsp_st *r = u->rt;
+    if (!r || r->phase != R_PLAYING || now < r->ka_at) return;
+    r->ka_at = now + r->ka_period;
+    if (r->ka_options) rtsp_send(u, "OPTIONS", r->aggr, NULL);
+    else rtsp_send(u, "GET_PARAMETER", r->aggr, NULL);
+}
+
+/* разбор входящего: $-кадры (RTP поверх TCP) и ответы RTSP вперемешку */
+static void rtsp_parse(up *u) {
+    rtsp_st *r = u->rt;
+    size_t pos = 0;
+    while (!u->dead && pos < u->in_n) {
+        uint8_t *p = (uint8_t *)u->in + pos;
+        size_t n = u->in_n - pos;
+        if (p[0] == '$') {
+            if (n < 4) break;
+            size_t l = (size_t)(p[2] << 8 | p[3]);
+            if (n < 4 + l) break;
+            if (p[1] == r->rtp_ch) {
+                size_t pn;
+                const uint8_t *pl = rtp_strip(p + 4, l, &pn);
+                if (pl) stream_data(u, pl, pn);
+            }
+            pos += 4 + l;
+            continue;
+        }
+        if (n >= 5 && !memcmp(p, "RTSP/", 5)) {
+            char *e = memmem(p, n, "\r\n\r\n", 4);
+            if (!e) { if (n > 64 * 1024) { rtsp_fail(u, 502, "head"); return; } break; }
+            size_t hl = (size_t)(e - (char *)p) + 4;
+            char *head = xstrndup((char *)p, hl);
+            char cl_[32];
+            hdr_val(head, "Content-Length", cl_, sizeof cl_);
+            size_t bl = (size_t)atol(cl_);
+            if (n < hl + bl) { free(head); break; }
+            char *body = xstrndup((char *)p + hl, bl);
+            const char *sp = strchr(head, ' ');
+            int status = sp ? atoi(sp + 1) : 0;
+            pos += hl + bl;
+            rtsp_response(u, status, head, body);
+            free(head);
+            free(body);
+            continue;
+        }
+        /* запрос сервера (ANNOUNCE, GET_PARAMETER…) — пропустить с телом; мусор — до следующего '$' или «RTSP/» */
+        if (n >= 4 && p[0] >= 'A' && p[0] <= 'Z') {
+            char *e = memmem(p, n, "\r\n\r\n", 4);
+            if (!e) break;
+            size_t hl = (size_t)(e - (char *)p) + 4;
+            char *head = xstrndup((char *)p, hl), cl_[32];
+            hdr_val(head, "Content-Length", cl_, sizeof cl_);
+            free(head);
+            size_t bl = (size_t)atol(cl_);
+            if (n < hl + bl) break;
+            pos += hl + bl;
+            continue;
+        }
+        pos++;
+    }
+    memmove(u->in, u->in + pos, u->in_n - pos);
+    u->in_n -= pos;
+}
+
+static void rtsp_event(up *u, uint32_t ev) {
+    if ((ev & EPOLLOUT) && u->req_off < u->req.n) { up_send(u); if (u->dead) return; }
+    if (!(ev & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR))) return;
+    int eof = 0;
+    for (;;) {
+        if (u->in_cap - u->in_n < 16384) {
+            size_t cap = u->in_cap ? u->in_cap * 2 : 65536;
+            if (cap > (2u << 20)) { if (u->in_n > (1u << 20)) { rtsp_fail(u, 502, "overflow"); return; } break; }
+            char *nb = realloc(u->in, cap);
+            if (!nb) break;
+            u->in = nb;
+            u->in_cap = cap;
+        }
+        ssize_t rr = recv(u->fd, u->in + u->in_n, u->in_cap - u->in_n, 0);
+        if (rr < 0) { if (errno == EAGAIN || errno == EINTR) break; eof = 1; break; }
+        if (rr == 0) { eof = 1; break; }
+        u->in_n += (size_t)rr;
+        rtsp_parse(u);
+        if (u->dead) return;
+    }
+    if (u->c && !u->c->dead) client_flush(u->c);
+    if (u->dead) return;
+    if (eof) rtsp_fail(u, 502, "closed");
+}
+
 /* ---------- плеер: запросы ---------- */
 static void client_start(cl *c, char *req) {
     char path[12000] = "";
@@ -1202,6 +1725,8 @@ static void up_event(up *u, uint32_t ev) {
         up_after_connect(u);
         return;
     }
+    if (u->proto == P_UDP) { udp_event(u); return; }
+    if (u->proto == P_RTSP) { rtsp_event(u, ev); return; }
     if (u->st == U_TLS) {
         int r = up_tls_step(u);
         if (r < 0) up_fail(u, 502);
@@ -1217,6 +1742,7 @@ static void timeouts(void) {
     double now = mono_now();
     for (up *u = ups, *n; u; u = n) {
         n = u->next;
+        if (!u->dead && u->proto == P_RTSP) rtsp_keepalive(u, now);
         if (!u->dead && !u->paused && u->deadline && now > u->deadline) {
             if (u->st == U_IDLE) up_free(u);
             else { fprintf(stderr, "relay_timeout state=%d\n", u->st); up_fail(u, 504); }

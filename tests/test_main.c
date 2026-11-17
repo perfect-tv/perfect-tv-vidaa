@@ -1041,7 +1041,6 @@ static void test_relay_http(void) {
     relay_reset();
     char src[200], url[4096];
     snprintf(src, sizeof src, "http://127.0.0.1:%d/live/pl.m3u8", UP.port);
-    CHECK(relay_url("udp://239.0.0.1:1234", NULL, url, sizeof url) != 0);   /* не HTTP — нельзя */
     CHECK(!relay_url(src, "User-Agent: Test/1\r\n", url, sizeof url));
     CHECK(starts_with(url, "http://127.0.0.1:"));
     size_t n = 0;
@@ -1108,6 +1107,220 @@ static void test_relay_http(void) {
     close(UP.fd);
     pthread_join(th, NULL);
     usleep(100000);   /* потоки соединений провайдера дочитывают и закрываются */
+}
+
+/* ---------- ретранслятор: UDP / RTP и RTSP ---------- */
+#include <openssl/evp.h>
+static struct { int port, rtp, multicast, stop; struct in_addr grp; atomic_int sent; } US;
+/* отправитель: сегмент TS по 7 пакетов в датаграмме (с RTP или без), по кругу */
+static void *udp_sender(void *a) {
+    (void)a;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in to = {.sin_family = AF_INET, .sin_port = htons((uint16_t)US.port), .sin_addr = US.grp};
+    if (US.multicast) { int one = 1; setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &one, sizeof one); }
+    uint8_t dg[12 + 7 * 188];
+    uint16_t seq = 0;
+    while (!US.stop) {
+        for (size_t off = 0; off < UP.seg.n && !US.stop; off += 7 * 188) {
+            size_t h = 0, k = UP.seg.n - off < 7 * 188 ? UP.seg.n - off : 7 * 188;
+            if (US.rtp) { memset(dg, 0, 12); dg[0] = 0x80; dg[1] = 33; dg[2] = (uint8_t)(seq >> 8); dg[3] = (uint8_t)seq; seq++; h = 12; }
+            memcpy(dg + h, UP.seg.s + off, k);
+            if (sendto(fd, dg, h + k, 0, (struct sockaddr *)&to, sizeof to) > 0) atomic_fetch_add(&US.sent, 1);
+            usleep(300);
+        }
+    }
+    close(fd);
+    return NULL;
+}
+/* ответ ретранслятора на запрос потока: заголовки и сколько байт тела пришло за время t */
+static long long relay_read(const char *rurl, double t, char *head, size_t hcap) {
+    int fd = relay_sock(rurl);
+    if (fd < 0) return -1;
+    struct timeval tv = {0, 200000};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    sbuf b = {0};
+    double end = mono_now() + t;
+    char buf[16384];
+    while (mono_now() < end) {
+        ssize_t r = recv(fd, buf, sizeof buf, 0);
+        if (r == 0) break;
+        if (r > 0 && b.n < (1u << 20)) sb_addn(&b, buf, (size_t)r);
+    }
+    close(fd);
+    const char *e = b.n ? memmem(b.s, b.n, "\r\n\r\n", 4) : NULL;
+    snprintf(head, hcap, "%.*s", e ? (int)(e - b.s) : (int)(b.n < hcap ? b.n : hcap - 1), b.s ? b.s : "");
+    long long body = e ? (long long)(b.n - (size_t)(e + 4 - b.s)) : 0;
+    sb_free(&b);
+    return body;
+}
+static void udp_case(const char *url, int rtp, int multicast, const char *grp, int port) {
+    relay_reset();
+    US.port = port;
+    US.rtp = rtp;
+    US.multicast = multicast;
+    US.stop = 0;
+    atomic_store(&US.sent, 0);
+    inet_pton(AF_INET, grp, &US.grp);
+    char rurl[4096], head[2000];
+    CHECK(!relay_url(url, NULL, rurl, sizeof rurl));
+    pthread_t th;
+    pthread_create(&th, NULL, udp_sender, NULL);
+    long long body = relay_read(rurl, 1.5, head, sizeof head);
+    US.stop = 1;
+    pthread_join(th, NULL);
+    printf("relay %s rtp=%d: датаграмм %d, тела %lld\n", url, rtp, atomic_load(&US.sent), body);
+    CHECK(starts_with(head, "HTTP/1.1 200") && strstr(head, "video/mp2t") && strstr(head, "chunked"));
+    CHECK(body > (long long)UP.seg.n);
+    CHECK(relay_has_teletext());   /* TS разобран по дороге */
+}
+
+static void md5h(const char *s, char out[33]) {
+    unsigned char d[EVP_MAX_MD_SIZE];
+    unsigned l = 0;
+    EVP_Digest(s, strlen(s), d, &l, EVP_md5(), NULL);
+    for (int i = 0; i < 16; i++) sprintf(out + 2 * i, "%02x", d[i]);
+}
+static struct { int fd, port, mp2t; atomic_int teardown, play, auth_ok, keepalive; } RS;
+static int rtsp_read_req(int c, char *req, size_t cap) {
+    size_t n = 0;
+    req[0] = 0;
+    while (n < cap - 1 && !strstr(req, "\r\n\r\n")) { ssize_t r = recv(c, req + n, cap - 1 - n, 0); if (r <= 0) return -1; n += (size_t)r; req[n] = 0; }
+    return 0;
+}
+static void *rtsp_server(void *a) {
+    (void)a;
+    for (;;) {
+        int c = accept(RS.fd, NULL, NULL);
+        if (c < 0) break;
+        char req[8192], resp[4096];
+        int playing = 0;
+        uint16_t seq = 0;
+        struct timeval tv = {0, 2000};
+        for (;;) {
+            if (playing) {   /* данные: RTP в $-кадрах канала 0, между ними — мусорный канал 1 */
+                for (size_t off = 0; off < UP.seg.n; off += 7 * 188) {
+                    size_t k = UP.seg.n - off < 7 * 188 ? UP.seg.n - off : 7 * 188;
+                    uint8_t f[4 + 12 + 7 * 188];
+                    f[0] = '$'; f[1] = 0; f[2] = (uint8_t)((12 + k) >> 8); f[3] = (uint8_t)((12 + k) & 255);
+                    memset(f + 4, 0, 12); f[4] = 0x80; f[5] = 33; f[6] = (uint8_t)(seq >> 8); f[7] = (uint8_t)seq; seq++;
+                    memcpy(f + 16, UP.seg.s + off, k);
+                    if (send(c, f, 16 + k, MSG_NOSIGNAL) < 0) goto done;
+                    uint8_t junk[] = {'$', 1, 0, 4, 1, 2, 3, 4};
+                    if (send(c, junk, sizeof junk, MSG_NOSIGNAL) < 0) goto done;
+                }
+                setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+                char tmp[4096];
+                ssize_t r = recv(c, tmp, sizeof tmp - 1, MSG_DONTWAIT);
+                if (r == 0) break;
+                if (r > 0) { tmp[r] = 0; if (strstr(tmp, "TEARDOWN")) atomic_store(&RS.teardown, 1); if (strstr(tmp, "GET_PARAMETER")) atomic_fetch_add(&RS.keepalive, 1); }
+                usleep(2000);
+                continue;
+            }
+            if (rtsp_read_req(c, req, sizeof req)) break;
+            int cseq = atoi(strstr(req, "CSeq:") ? strstr(req, "CSeq:") + 5 : "0");
+            if (!strncmp(req, "DESCRIBE ", 9)) {
+                const char *au = strstr(req, "Authorization: Digest ");
+                char want[33] = "", h1[33], h2[33], all[300];
+                md5h("user:Камера:p@ss", h1);
+                snprintf(all, sizeof all, "DESCRIBE:rtsp://127.0.0.1:%d/live", RS.port);
+                md5h(all, h2);
+                snprintf(all, sizeof all, "%s:n0nce:%s", h1, h2);
+                md5h(all, want);
+                if (!au || !strstr(au, want) || !strstr(au, "username=\"user\"")) {
+                    snprintf(resp, sizeof resp, "RTSP/1.0 401 Unauthorized\r\nCSeq: %d\r\nWWW-Authenticate: Basic realm=\"Камера\"\r\nWWW-Authenticate: Digest realm=\"Камера\", nonce=\"n0nce\"\r\n\r\n", cseq);
+                } else {
+                    atomic_store(&RS.auth_ok, 1);
+                    const char *sdp = RS.mp2t ? "v=0\r\ns=x\r\na=control:*\r\nm=video 0 RTP/AVP 33\r\na=control:track1\r\n"
+                                              : "v=0\r\ns=x\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:track1\r\n";
+                    snprintf(resp, sizeof resp, "RTSP/1.0 200 OK\r\nCSeq: %d\r\nContent-Base: rtsp://127.0.0.1:%d/live/\r\nContent-Type: application/sdp\r\nContent-Length: %zu\r\n\r\n%s",
+                             cseq, RS.port, strlen(sdp), sdp);
+                }
+            } else if (!strncmp(req, "SETUP ", 6)) {
+                char want[200];
+                snprintf(want, sizeof want, "SETUP rtsp://127.0.0.1:%d/live/track1 RTSP/1.0", RS.port);
+                if (strncmp(req, want, strlen(want)) || !strstr(req, "interleaved=0-1")) snprintf(resp, sizeof resp, "RTSP/1.0 400 Bad\r\nCSeq: %d\r\n\r\n", cseq);
+                else snprintf(resp, sizeof resp, "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: 4242;timeout=10\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n", cseq);
+            } else if (!strncmp(req, "PLAY ", 5) && strstr(req, "Session: 4242")) {
+                snprintf(resp, sizeof resp, "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: 4242\r\n\r\n", cseq);
+                playing = 1;
+                atomic_store(&RS.play, 1);
+            } else snprintf(resp, sizeof resp, "RTSP/1.0 405 Method Not Allowed\r\nCSeq: %d\r\n\r\n", cseq);
+            if (send(c, resp, strlen(resp), MSG_NOSIGNAL) < 0) break;
+        }
+    done:
+        /* ретранслятор закрыл: дочитать, что он прислал напоследок (TEARDOWN) */
+        for (int k = 0; k < 20; k++) {
+            char tmp[4096];
+            ssize_t r = recv(c, tmp, sizeof tmp - 1, MSG_DONTWAIT);
+            if (r > 0) { tmp[r] = 0; if (strstr(tmp, "TEARDOWN")) atomic_store(&RS.teardown, 1); continue; }
+            if (r == 0) break;
+            usleep(5000);
+        }
+        close(c);
+    }
+    return NULL;
+}
+
+static void test_relay_streams(void) {
+    char url[200];
+    /* UDP на порт (не мультикаст), RTP; затем голый TS */
+    snprintf(url, sizeof url, "udp://@127.0.0.1:%d", 47411);
+    udp_case(url, 1, 0, "127.0.0.1", 47411);
+    snprintf(url, sizeof url, "rtp://127.0.0.1:%d?pkt_size=1316", 47412);
+    udp_case(url, 0, 0, "127.0.0.1", 47412);
+    /* мультикаст: вход в группу; без сети с мультикастом (песочница) — пропуск */
+    {
+        int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        struct ip_mreq m = {.imr_interface = {htonl(INADDR_ANY)}};
+        inet_pton(AF_INET, "239.255.71.17", &m.imr_multiaddr);
+        int ok = !setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m);
+        close(fd);
+        if (ok) udp_case("udp://@239.255.71.17:47413", 1, 1, "239.255.71.17", 47413);
+        else printf("relay: мультикаст недоступен, пропуск\n");
+    }
+    CHECK(relay_url("rtmp://x/live", NULL, url, sizeof url) != 0);
+    /* SDP: медиа с MPEG-TS, адреса относительно Content-Base */
+    char media[300], aggr[300];
+    CHECK(!relay_sdp_pick("v=0\r\na=control:*\r\nm=audio 0 RTP/AVP 0\r\na=control:a\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 MP2T/90000\r\na=control:v\r\n",
+                          "rtsp://h/x/", media, aggr, sizeof media));
+    EQS(media, "rtsp://h/x/v");
+    EQS(aggr, "rtsp://h/x/");
+    CHECK(!relay_sdp_pick("m=video 0 RTP/AVP 33\r\na=control:rtsp://o/t1", "rtsp://h/x", media, aggr, sizeof media));
+    EQS(media, "rtsp://o/t1");
+    CHECK(relay_sdp_pick("m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n", "rtsp://h/", media, aggr, sizeof media) != 0);
+    /* RTSP: Digest (имя и пароль из адреса), SETUP через TCP, данные, поддержка сеанса, TEARDOWN */
+    RS.fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET};
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    if (bind(RS.fd, (struct sockaddr *)&sa, sizeof sa) || listen(RS.fd, 4) || getsockname(RS.fd, (struct sockaddr *)&sa, &sl)) { printf("rtsp: нет сокета, пропуск\n"); return; }
+    RS.port = ntohs(sa.sin_port);
+    RS.mp2t = 1;
+    pthread_t th;
+    pthread_create(&th, NULL, rtsp_server, NULL);
+    relay_reset();
+    char src[300], rurl[4096], head[2000];
+    snprintf(src, sizeof src, "rtsp://user:p%%40ss@127.0.0.1:%d/live", RS.port);
+    CHECK(!relay_url(src, "User-Agent: Test/1\r\n", rurl, sizeof rurl));
+    long long body = relay_read(rurl, 7.0, head, sizeof head);
+    printf("relay rtsp: тела %lld\n", body);
+    CHECK(atomic_load(&RS.auth_ok) && atomic_load(&RS.play));
+    CHECK(starts_with(head, "HTTP/1.1 200") && strstr(head, "video/mp2t"));
+    CHECK(body > (long long)UP.seg.n);
+    CHECK(relay_has_teletext());
+    CHECK(atomic_load(&RS.keepalive) >= 1);   /* таймаут 10 с — раз в 5 с */
+    for (int i = 0; i < 50 && !atomic_load(&RS.teardown); i++) usleep(20000);
+    CHECK(atomic_load(&RS.teardown));
+    /* без MPEG-TS — отказ (tv.c откроет канал напрямую) */
+    RS.mp2t = 0;
+    atomic_store(&RS.play, 0);
+    relay_reset();
+    CHECK(!relay_url(src, NULL, rurl, sizeof rurl));
+    relay_read(rurl, 1.0, head, sizeof head);
+    CHECK(starts_with(head, "HTTP/1.1 415") && !atomic_load(&RS.play));
+    shutdown(RS.fd, SHUT_RDWR);
+    close(RS.fd);
+    pthread_join(th, NULL);
 }
 
 static void test_teletext(void) {
@@ -1213,6 +1426,7 @@ static void test_teletext(void) {
     sb_free(&UP.seg);
     sb_addn(&UP.seg, ts.s, ts.n);
     test_relay_http();
+    test_relay_streams();
     sb_free(&UP.seg);
     sb_free(&ts); sb_free(&v); sb_free(&t); sb_free(&tp);
 }
