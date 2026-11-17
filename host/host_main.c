@@ -31,7 +31,24 @@ extern int host_video_on;
 
 static uint32_t *last;
 static int lw, lh, lstride;
-static const char *out_dir = "build/host/shots";
+static const char *out_dir;
+
+/* папка рядом с программой (build/host/…), откуда бы ни запускали */
+static void beside_exe(const char *name, char *out, size_t cap) {
+    char exe[512];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) { snprintf(out, cap, "build/host/%s", name); return; }
+    exe[n] = 0;
+    char *sl = strrchr(exe, '/');
+    if (sl) *sl = 0;
+    snprintf(out, cap, "%s/%s", exe, name);
+}
+static void mkdirs(const char *path) {
+    char p[600];
+    snprintf(p, sizeof p, "%s", path);
+    for (char *s = p + 1; *s; s++) if (*s == '/') { *s = 0; mkdir(p, 0755); *s = '/'; }
+    mkdir(p, 0755);
+}
 
 #ifndef PTV_NO_X11
 int host_window_open(void);
@@ -107,7 +124,10 @@ static void root_tick(screen *s, double now) { (void)s; tv_tick(now); }
 static screen root = {.name = "tv", .draw = root_draw, .tick = root_tick};
 
 int main(int argc, char **argv) {
-    static char data[600] = "build/host/data";
+    static char data[600], shots[600];
+    beside_exe("data", data, sizeof data);
+    beside_exe("shots", shots, sizeof shots);
+    out_dir = shots;
     int i = 1;
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "--data") && i + 1 < argc) snprintf(data, sizeof data, "%s", argv[++i]);
@@ -120,8 +140,9 @@ int main(int argc, char **argv) {
 #else
     if (windowed) { if (host_window_open()) return 1; host_keys_help(); }
 #endif
-    mkdir(data, 0700);
-    mkdir(out_dir, 0700);
+    mkdirs(data);
+    mkdirs(out_dir);
+    fprintf(stderr, "data_dir=%s\n", data);
     app_platform p = {.present = present, .data_dir = data};
     p.font_mem[TX_REGULAR] = ptv_font_regular; p.font_len[TX_REGULAR] = (size_t)(ptv_font_regular_end - ptv_font_regular);
     p.font_mem[TX_BOLD] = ptv_font_bold; p.font_len[TX_BOLD] = (size_t)(ptv_font_bold_end - ptv_font_bold);

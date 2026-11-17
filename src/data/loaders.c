@@ -11,6 +11,7 @@
 #include "core/lang.h"
 #include "core/prefs.h"
 #include "core/unpack.h"
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,7 +97,8 @@ static void pl_work(void *p) {
     snprintf(j->new_lm, sizeof j->new_lm, "%s", hs_last_modified(h));
     up *u = up_new(hs_rd, h);
     j->out = fopen(j->tmp, "wb");
-    if (!u || !j->out) { snprintf(j->err, sizeof j->err, "write"); goto out; }
+    if (!u) { snprintf(j->err, sizeof j->err, "format"); goto out; }
+    if (!j->out) { snprintf(j->err, sizeof j->err, "write: %s", strerror(errno)); goto out; }
     m3u *m = m3u_new(on_m3u, j);
     char buf[32768];
     long r;
@@ -113,11 +115,11 @@ static void pl_work(void *p) {
     }
     j->header_epg = strdup(m3u_epg_urls(m));
     m3u_free(m);
-    if (fflush(j->out) || ferror(j->out)) snprintf(j->err, sizeof j->err, "write");
+    if (fflush(j->out) || ferror(j->out)) snprintf(j->err, sizeof j->err, "write: %s", strerror(errno));
     fclose(j->out);
     j->out = NULL;
     /* оборванный, но непустой плейлист лучше старого? Нет: старый список остаётся до успешной загрузки */
-    if (!j->err[0] && rename(j->tmp, j->dst)) snprintf(j->err, sizeof j->err, "write");
+    if (!j->err[0] && rename(j->tmp, j->dst)) snprintf(j->err, sizeof j->err, "write: %s", strerror(errno));
     if (!j->err[0]) j->ok = 1;
 out:
     if (j->out) fclose(j->out);
@@ -221,7 +223,7 @@ static void epg_work(void *p) {
     snprintf(j->new_lm, sizeof j->new_lm, "%s", hs_last_modified(h));
     up *u = up_new(hs_rd, h);
     epg_build *b = epg_build_new(j->hash, j->old_gen, j->new_gen, j->w, j->nw, j->now, j->lang);
-    if (!u || !b) { snprintf(j->err, sizeof j->err, "write"); goto out; }
+    if (!u || !b) { snprintf(j->err, sizeof j->err, "write: %s", strerror(errno)); goto out; }
     char *buf = malloc(1 << 16);
     long r = -1;
     while (buf && (r = up_read(u, buf, 1 << 16)) > 0) {
