@@ -849,6 +849,26 @@ int repo_select(int index) {
     return rc;
 }
 
+/* После восстановления копии: всё заново из файлов (плейлисты, напоминания, пользовательские данные). */
+void repo_reload(void) {
+    for (int i = 0; i < R.nepg; i++) epg_close(&R.epg[i]);
+    R.nepg = 0;
+    free_channels();
+    for (int i = 0; i < R.npl; i++) { free(R.pl[i].user_epg); free(R.pl[i].header_epg); }
+    free(R.pl);
+    R.pl = NULL;
+    R.npl = 0;
+    sl_clear(&R.fav);
+    sl_clear(&R.history);
+    sl_clear(&R.locked_ch);
+    sl_clear(&R.locked_gr);
+    smap_free(&R.hidden_ch);
+    smap_free(&R.hidden_gr);
+    smap_free(&R.scores);
+    R.rev++;
+    repo_init();
+}
+
 void repo_init(void) {
     load_playlists();
     load_reminders();

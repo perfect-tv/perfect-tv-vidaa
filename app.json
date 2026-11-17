@@ -27,6 +27,7 @@
     "src/data/repo.c",
     "src/data/loaders.c",
     "src/data/search.c",
+    "src/data/backup.c",
     "src/player/player.c",
     "src/ui/u.c",
     "src/ui/keys.c",

@@ -10,6 +10,7 @@
 #include "core/usb.h"
 #include "core/util.h"
 #include "data/catchup.h"
+#include "data/backup.h"
 #include "data/epg.h"
 #include "data/m3u.h"
 #include "data/names.h"
@@ -656,6 +657,47 @@ static void test_usb(const char *tmp) {
     unsetenv("PTV_USB_ROOT");
 }
 
+/* ---------- резервная копия ---------- */
+static void test_backup(void) {
+    store_set("fav.1", "первый\nвторой");
+    store_set("pin", "1234");
+    const char *pl = "[{\"id\":1,\"name\":\"Мой\",\"url\":\"http://x/p.m3u\",\"epg_mode\":1,\"loaded_at\":1700000000,\"etag\":\"e1\",\"user_epg\":\"http://e/1.xml\"}]\n";
+    file_write_atomic(data_path("playlists.json"), pl, strlen(pl));
+    const char *rem = "[{\"key\":\"k\",\"start\":5}]";
+    file_write_atomic(data_path("reminders.json"), rem, strlen(rem));
+    char where[600] = "", err[100] = "";
+    CHECK(!backup_save(where, sizeof where, err, sizeof err));
+    CHECK(strstr(where, "/backups/backup-") && ends_with_ci(where, ".perfecttv"));
+    int64_t created = 0;
+    CHECK(!backup_check(where, &created) && created > 0);
+    backup_item it[4];
+    EQI(backup_list(it, 4), 1);
+    /* поменяли всё, затем восстановили */
+    store_set("fav.1", "другое");
+    store_set("lockc.1", "канал");
+    file_write_atomic(data_path("playlists.json"), "[]", 2);
+    file_write_atomic(data_path("channels_1.tsv"), "x", 1);
+    CHECK(!backup_restore(where, err, sizeof err));
+    EQS(store_get("fav.1"), "первый\nвторой");
+    EQS(store_get("pin"), "1234");
+    CHECK(store_get("lockc.1") == NULL);
+    CHECK(!file_exists(data_path("channels_1.tsv")));
+    size_t n;
+    char *t = file_read(data_path("playlists.json"), &n);
+    CHECK(t && strstr(t, "\"name\":\"Мой\"") && strstr(t, "\"epg_mode\":1") && strstr(t, "http://e/1.xml") && !strstr(t, "loaded_at") && !strstr(t, "etag"));
+    free(t);
+    t = file_read(data_path("reminders.json"), &n);
+    CHECK(t && strstr(t, "\"start\":5"));
+    free(t);
+    /* не копия */
+    file_write_atomic(data_path("bad.perfecttv"), "{\"x\":1}", strlen("{\"x\":1}"));
+    CHECK(backup_check(data_path("bad.perfecttv"), NULL) != 0);
+    CHECK(backup_restore(data_path("bad.perfecttv"), err, sizeof err) != 0);
+    EQS(err, "format");
+    store_set("fav.1", NULL);
+    store_set("pin", NULL);
+}
+
 static void test_lang(void) {
     lang_set(LANG_RU);
     EQS(trp(S_CHANNELS_N, 1), "1 канал");
@@ -730,6 +772,7 @@ int main(void) {
     }
     test_phone();
     test_usb(dir);
+    test_backup();
     test_lang();
     test_clock();
     char cmd[300];

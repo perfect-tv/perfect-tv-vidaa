@@ -12,6 +12,7 @@
 #include "core/prefs.h"
 #include "data/epg.h"
 #include "data/loaders.h"
+#include "data/backup.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -30,7 +31,7 @@ enum {
     I_LANG, I_TZ, I_SCALE, I_NUMBER, I_GUIDE_VIEW, I_GUIDE_HEADER, I_HINTS_P, I_LOGO_PRIO,
     I_ADAPTIVE_P, I_RESET_SCORES, I_HIDDEN_P,
     I_PIN_SET, I_PIN_CLEAR, I_PIN_ASK, I_PIN_INPUT,
-    I_CLEAR_LOGOS, I_CLEAR_EPG, I_DATA_DIR,
+    I_BACKUP_SAVE, I_BACKUP_RESTORE, I_CLEAR_LOGOS, I_CLEAR_EPG, I_DATA_DIR,
     I_VERSION, I_SOURCE, I_LICENSE,
 };
 typedef struct { int id; char label[200], sub[300], value[200]; int choice; } item;
@@ -128,6 +129,8 @@ static void build(void) {
         add(I_PIN_INPUT, tr(S_PIN_INPUT), NULL, tr(P.pin_input == PIN_IN_RING ? S_PIN_RING : P.pin_input == PIN_IN_KEYS ? S_PIN_KEYS : S_PIN_ROWS), 1);
         break;
     case SEC_DATA:
+        add(I_BACKUP_SAVE, tr(S_BACKUP_SAVE), tr(S_BACKUP_SAVE_SUB), NULL, 0);
+        add(I_BACKUP_RESTORE, tr(S_BACKUP_RESTORE), NULL, NULL, 0);
         add(I_CLEAR_LOGOS, tr(S_CLEAR_LOGOS), NULL, NULL, 0);
         add(I_CLEAR_EPG, tr(S_CLEAR_EPG), NULL, NULL, 0);
         add(I_DATA_DIR, tr(S_DATA_DIR), app_platform_get()->data_dir, NULL, 0);
@@ -151,6 +154,54 @@ static void clear_epg_yes(void *c) {
     repo_open_epg();
     load_epg(1);
     tv_toast(tr(S_EPG_CLEARED));
+}
+
+/* ---- резервная копия ---- */
+static backup_item BK[16];
+static int nbk, bk_pick;
+static void restore_go(void *c) {
+    (void)c;
+    char err[100] = "";
+    if (backup_restore(BK[bk_pick].path, err, sizeof err)) { tv_toast(!strcmp(err, "format") ? tr(S_BACKUP_BAD) : trf(S_BACKUP_FAILED, err)); return; }
+    tv_restart();
+    tv_toast(tr(S_BACKUP_RESTORED));
+}
+static void restore_yes(void *c) {
+    /* копия заменит и PIN: с заданным PIN — сначала спросить его */
+    if (P.pin[0]) pin_ask(restore_go, NULL, c);
+    else restore_go(c);
+}
+static void bk_when(int64_t t, char *out, size_t cap) {
+    char hm[8];
+    fmt_hm(t, hm);
+    ltm m = local_tm(t);
+    snprintf(out, cap, "%02d.%02d.%04d %s", m.d, m.mo, m.y, hm);
+}
+static void restore_chosen(int i, void *c) {
+    (void)c;
+    if (i < 0 || i >= nbk) return;
+    bk_pick = i;
+    char w[80];
+    bk_when(BK[i].created, w, sizeof w);
+    confirm_open(trf(S_BACKUP_CONFIRM, w), tr(S_BACKUP_DO), restore_yes, NULL);
+}
+static void restore_open(void) {
+    nbk = backup_list(BK, 16);
+    if (!nbk) { tv_toast(tr(S_BACKUP_NONE)); return; }
+    static char labels[16][160];
+    static const char *items[16];
+    for (int i = 0; i < nbk; i++) {
+        char w[80];
+        bk_when(BK[i].created, w, sizeof w);
+        snprintf(labels[i], sizeof labels[i], "%s  ·  %s", w, tr(BK[i].usb ? S_BACKUP_ON_USB : S_BACKUP_ON_TV));
+        items[i] = labels[i];
+    }
+    choose_open(tr(S_BACKUP_CHOOSE), items, nbk, 0, restore_chosen, NULL);
+}
+static void save_backup(void) {
+    char where[600] = "", err[100] = "";
+    if (backup_save(where, sizeof where, err, sizeof err)) tv_toast(trf(S_BACKUP_FAILED, err));
+    else tv_toast(trf(S_BACKUP_SAVED, where));
 }
 
 static void change(item *it, int dir) {
@@ -199,6 +250,8 @@ static void action(item *it) {
     case I_HIDDEN_P: hidden_open(); break;
     case I_PIN_SET: if (P.pin[0]) pin_ask(after_pin_ok, NULL, NULL); else pin_create(NULL, NULL); break;
     case I_PIN_CLEAR: pin_ask(after_pin_clear, NULL, NULL); break;
+    case I_BACKUP_SAVE: save_backup(); break;
+    case I_BACKUP_RESTORE: restore_open(); break;
     case I_CLEAR_LOGOS: img_cache_clear(); tv_toast(tr(S_LOGOS_CLEARED)); break;
     case I_CLEAR_EPG: confirm_open(tr(S_CLEAR_EPG), tr(S_DELETE), clear_epg_yes, NULL); break;
     default: break;

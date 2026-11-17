@@ -74,6 +74,7 @@ typedef struct {
 extern repo R;
 
 void repo_init(void);
+void repo_reload(void);                  /* всё заново из файлов (после восстановления копии) */
 int repo_select(int pl_index);           /* загрузить каналы плейлиста из файла; 0 — ок */
 void repo_save_playlists(void);
 playlist *repo_cur(void);

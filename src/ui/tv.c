@@ -432,10 +432,32 @@ static void on_epg(int ok, const char *err) {
     app_dirty();
 }
 
+static void begin(void);
 void tv_start(void) {
     u_init();
     loaders_on_playlist = on_playlist;
     loaders_on_epg = on_epg;
+    begin();
+}
+
+/* Восстановили копию: настройки, плейлисты и данные — заново, как при запуске. */
+void tv_restart(void) {
+    loaders_cancel();
+    layer_pop_all();
+    pl_close();
+    T.cur = NULL;
+    T.group[0] = 0;
+    T.arc = T.paused = T.seeking = 0;
+    T.pin_passed = 0;
+    prefs_load();
+    lang_set(P.lang);
+    u_init();
+    repo_reload();
+    app_dirty();
+    begin();
+}
+
+static void begin(void) {
     if (!R.npl) { welcome_open(); return; }
     if (!R.nch) { if (R.cur < 0) repo_select(0); load_playlist(R.cur, 1); return; }
     channel *c = P.last_channel[0] ? repo_by_key(P.last_channel) : NULL;

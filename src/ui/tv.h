@@ -65,6 +65,7 @@ void tv_set_sleep(int minutes);      /* 0 — выкл. */
 int tv_sleep_minutes(void);
 /* После загрузки плейлиста / смены плейлиста. */
 void tv_playlist_changed(int keep_channel);
+void tv_restart(void);               /* после восстановления копии */
 /* Шаг по категории: +1 / -1, с пропуском закрытых при отмене PIN. */
 channel *tv_neighbour(int dir);
 /* окна */
