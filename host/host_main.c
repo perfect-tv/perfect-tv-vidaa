@@ -1,5 +1,6 @@
 /* Запуск интерфейса на ПК без ТВ: тот же код экранов, заглушка плеера, клавиши — по сценарию, кадры — в PPM.
  *   build/host/perfecttv-host --data DIR --out DIR key:down wait:1 shot:info long:ok shot:menu ...
+ *   build/host/perfecttv-host --window [шаги сценария] — окно X11, управление с клавиатуры (host/x11_window.c).
  * Сценарий: key:NAME (нажатие), long:NAME (удержание 1 с), hold:NAME:SEC, wait:SEC, shot:NAME, lang:ru|en.
  * Имена клавиш: left right up down ok back menu info guide chup chdown red green yellow blue play stop rew ff 0..9.
  * Видео под «дырой» холста (alpha 0) — тестовая картинка; так видно, что просвечивает через затемнения. */
@@ -14,6 +15,7 @@
 #include "ui/tv.h"
 #include "ui/u.h"
 #include "ui/screens.h"
+#include "data/epg.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,7 +33,18 @@ static uint32_t *last;
 static int lw, lh, lstride;
 static const char *out_dir = "build/host/shots";
 
+#ifndef PTV_NO_X11
+int host_window_open(void);
+void host_window_present(const uint32_t *px, int w, int h, int stride);
+int host_window_poll(void);
+void host_keys_help(void);
+#endif
+static int windowed;
+
 static void present(const uint32_t *px, int w, int h, int stride) {
+#ifndef PTV_NO_X11
+    if (windowed) host_window_present(px, w, h, stride);
+#endif
     if (!last) last = malloc((size_t)w * h * 4);
     lw = w;
     lh = h;
@@ -89,7 +102,7 @@ static void run(double secs) {
     } while (app_now() < end && !app_quitting());
 }
 
-static void root_draw(screen *s, gfx_t *g) { (void)s; tv_draw(g); }
+static void root_draw(screen *s, gfx_t *g) { (void)s; epg_frame(); tv_draw(g); }
 static void root_tick(screen *s, double now) { (void)s; tv_tick(now); }
 static screen root = {.name = "tv", .draw = root_draw, .tick = root_tick};
 
@@ -99,8 +112,14 @@ int main(int argc, char **argv) {
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "--data") && i + 1 < argc) snprintf(data, sizeof data, "%s", argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out_dir = argv[++i];
+        else if (!strcmp(argv[i], "--window")) windowed = 1;
         else break;
     }
+#ifdef PTV_NO_X11
+    if (windowed) { fprintf(stderr, "собрано без X11: окна нет (нужен пакет libx11-dev)\n"); return 1; }
+#else
+    if (windowed) { if (host_window_open()) return 1; host_keys_help(); }
+#endif
     mkdir(data, 0700);
     mkdir(out_dir, 0700);
     app_platform p = {.present = present, .data_dir = data};
@@ -158,6 +177,14 @@ int main(int argc, char **argv) {
             run(0.15);
         } else fprintf(stderr, "unknown step %s\n", a);
     }
+#ifndef PTV_NO_X11
+    /* окно: работать, пока его не закрыли (или Home — выход приложения) */
+    while (windowed && !app_quitting() && host_window_poll()) {
+        app_frame();
+        struct timespec w = {0, 10000000};
+        nanosleep(&w, NULL);
+    }
+#endif
     prefs_save();
     store_save();
     fflush(stdout);

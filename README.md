@@ -78,6 +78,19 @@ python3 tools/make_demo.py build/host/demo     # демо-плейлист и п
 [{"id":1,"name":"Демо","url":"/полный/путь/build/host/demo/demo.m3u","epg_mode":0}]
 ```
 
+**С окном и клавиатурой** (нужен X11: `libx11-dev`; без него собирается без окна):
+
+```bash
+build/host/perfecttv-host --window
+```
+
+Окно 1280×720 (меняет размер, F11 — во весь экран). Клавиши: стрелки, Enter — OK, Esc / Backspace — «Назад»,
+M — «Меню», I — INFO, G — гид, PgUp / PgDn — CH±, F1–F4 — цветные, 0–9, пробел — пауза, [ / ] — перемотка,
+L — недавние, T — телетекст, S — субтитры, F — поиск, Home — выход. Долгое нажатие — держать клавишу. Перед окном
+можно выполнить шаги сценария (`--window open:settings`).
+
+**Сценарием и снимками** (без окна):
+
 ```bash
 build/host/perfecttv-host wait:3 shot:live key:down shot:info key:ok shot:guide key:right shot:grid open:settings shot:settings
 ```

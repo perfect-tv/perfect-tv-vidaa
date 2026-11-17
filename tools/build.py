@@ -221,6 +221,11 @@ def build_host(cfg, sdk, verbose, tests):
     if tests:   # тестам нужны только ядро и данные
         own = [s for s in own if ('/src/core/' in s or '/src/data/' in s) and os.path.isfile(s)]
     host = sorted(glob.glob(os.path.join(ROOT, 'host', '*.c')))
+    # окно X11 (--window) — если есть libX11; без него — только сценарии и снимки
+    x11 = subprocess.run(['pkg-config', '--exists', 'x11'], capture_output=True).returncode == 0
+    if not x11:
+        host = [h for h in host if not h.endswith('x11_window.c')]
+        common = common + ['-DPTV_NO_X11=1']
     test_src = sorted(glob.glob(os.path.join(ROOT, 'tests', '*.c')))
     jobs, objs_fw, objs_own, objs_host, objs_test = [], [], [], [], []
     def add(srcs, lst, warn):
@@ -246,7 +251,8 @@ def build_host(cfg, sdk, verbose, tests):
         r = subprocess.run([exe], env=env)
         sys.exit(r.returncode)
     exe = os.path.join(out, 'perfecttv-host')
-    r = subprocess.run([cc] + objs_own + objs_host + objs_fw + [emb] + ['-o', exe] + ldl)
+    xl = subprocess.run(['pkg-config', '--libs', 'x11'], capture_output=True, text=True).stdout.split() if x11 else []
+    r = subprocess.run([cc] + objs_own + objs_host + objs_fw + [emb] + ['-o', exe] + ldl + xl)
     if r.returncode:
         sys.exit('ошибка компоновки')
     print(os.path.relpath(exe, ROOT))
