@@ -17,7 +17,10 @@ static const char *const RU[S_COUNT] = {
 
 static int ru = 1;
 
+static int rev;
+int lang_rev(void) { return rev * 2 + ru; }   /* меняется при смене языка */
 void lang_set(int mode) {
+    rev++;
     if (mode == LANG_EN) { ru = 0; return; }
     if (mode == LANG_RU) { ru = 1; return; }
     const char *l = getenv("LC_ALL");

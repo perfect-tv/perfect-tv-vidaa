@@ -248,6 +248,8 @@ static int key(layer *l, int k, int ev) {
 
 static void draw(layer *l, gfx_t *g) {
     (void)l;
+    static int built_lang;
+    if (built_lang != lang_rev()) { built_lang = lang_rev(); build(); }   /* язык сменили, пока окно открыто */
     int w = E(35.6), x = SW - w;
     d_hgrad(g, 0, 0, x, SH, 0, BA(0.7));
     d_fill(g, x, 0, w, SH, C_POPUP);

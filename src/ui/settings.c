@@ -327,6 +327,8 @@ static void tick(layer *l, double now) {
 
 static void draw(layer *l, gfx_t *g) {
     (void)l;
+    static int built_lang;
+    if (built_lang != lang_rev()) { built_lang = lang_rev(); build(); }   /* язык сменили, пока окно открыто */
     d_clear(g, C_SETTINGS_BG);
     int lw = E(25);
     d_fill(g, 0, 0, lw, SH, C_FILL);

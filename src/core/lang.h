@@ -14,6 +14,8 @@ enum {
 enum { LANG_AUTO = 0, LANG_EN = 1, LANG_RU = 2 };
 void lang_set(int mode);        /* LANG_AUTO — по переменным окружения LANG/LC_ALL, иначе русский */
 int lang_is_ru(void);
+/* Растёт при каждой смене языка: окна, собравшие строки заранее (настройки, меню), по нему пересобирают их. */
+int lang_rev(void);
 const char *tr(int id);
 /* Счётная форма: формы через «|» (en: one|other; ru: one|few|many), %d — число. Буфер на поток. */
 const char *trp(int id, long n);
