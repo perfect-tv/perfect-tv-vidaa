@@ -10,6 +10,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include "core/http.h"
 
 /* адрес ретранслятора: читать его, как читал бы плеер (телетекст разбирается по пути) */
@@ -27,43 +29,167 @@ static void *drain(void *arg) {
 
 static double mono(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 
-struct hmc_player { double opened, base, paused_at; int paused, vod; double dur; char url[512]; };
+/* ---------- настоящее видео в окне ПК: ffmpeg -> кадры BGRA по трубе, звук — сам в PulseAudio ---------- */
+#define VW 960
+#define VH 540
+int host_real_video;                 /* host_main --window: потоки по-настоящему (кроме demo.invalid) */
+static pthread_mutex_t vmu = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t *vframe;
+static int vseq;
+
+/* кадр видео для окна; 0 — нет */
+int host_video_frame(const uint32_t **px, int *w, int *h) {
+    *px = vframe;
+    *w = VW;
+    *h = VH;
+    return vframe ? vseq : 0;
+}
+void host_video_lock(int on) { if (on) pthread_mutex_lock(&vmu); else pthread_mutex_unlock(&vmu); }
+
+struct hmc_player {
+    double opened, base, paused_at; int paused, vod; double dur; char url[16384]; char headers[2048];
+    /* ffmpeg */
+    int ff, fd, got, exited, stop, mute;
+    pid_t pid;
+    pthread_t th;
+    double first_at;
+};
 int host_video_on;   /* host_main: рисовать тестовую картинку под интерфейсом */
 
+static void *reader(void *arg) {
+    struct hmc_player *h = arg;
+    size_t sz = (size_t)VW * VH * 4, got = 0;
+    uint8_t *buf = malloc(sz);
+    while (buf && !h->stop) {
+        ssize_t r = read(h->fd, buf + got, sz - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+        if (got < sz) continue;
+        got = 0;
+        pthread_mutex_lock(&vmu);
+        if (!vframe) vframe = malloc(sz);
+        if (vframe) memcpy(vframe, buf, sz);
+        vseq++;
+        pthread_mutex_unlock(&vmu);
+        if (!h->got) { h->got = 1; h->first_at = mono(); }
+    }
+    free(buf);
+    h->exited = 1;
+    return NULL;
+}
+
+static void ff_stop(struct hmc_player *h) {
+    if (!h->pid) return;
+    h->stop = 1;
+    kill(h->pid, SIGCONT);
+    kill(h->pid, SIGKILL);
+    waitpid(h->pid, NULL, 0);
+    close(h->fd);
+    pthread_join(h->th, NULL);
+    h->pid = 0;
+}
+
+static int ff_start(struct hmc_player *h, double start) {
+    int p[2];
+    if (pipe(p)) return -1;
+    char ss[32];
+    snprintf(ss, sizeof ss, "%.2f", start);
+    const char *argv[48];
+    int n = 0;
+    argv[n++] = "ffmpeg"; argv[n++] = "-hide_banner"; argv[n++] = "-loglevel"; argv[n++] = "error"; argv[n++] = "-nostdin";
+    if (h->headers[0]) { argv[n++] = "-headers"; argv[n++] = h->headers; }
+    argv[n++] = "-re";
+    if (start > 0.5) { argv[n++] = "-ss"; argv[n++] = ss; }
+    argv[n++] = "-i"; argv[n++] = h->url;
+    argv[n++] = "-map"; argv[n++] = "0:v:0";
+    argv[n++] = "-vf"; argv[n++] = "scale=960:540:force_original_aspect_ratio=decrease,pad=960:540:(ow-iw)/2:(oh-ih)/2,fps=25";
+    argv[n++] = "-pix_fmt"; argv[n++] = "bgra"; argv[n++] = "-f"; argv[n++] = "rawvideo"; argv[n++] = "pipe:1";
+    if (!getenv("PTV_NO_AUDIO") && !h->mute) { argv[n++] = "-map"; argv[n++] = "0:a:0?"; argv[n++] = "-f"; argv[n++] = "pulse"; argv[n++] = "Perfect TV"; }
+    argv[n] = NULL;
+    pid_t pid = fork();
+    if (pid < 0) { close(p[0]); close(p[1]); return -1; }
+    if (!pid) {
+        /* как на ТВ: без прокси из окружения (ffmpeg иначе идёт через него и к 127.0.0.1) */
+        unsetenv("http_proxy"); unsetenv("HTTP_PROXY"); unsetenv("https_proxy"); unsetenv("HTTPS_PROXY"); unsetenv("all_proxy"); unsetenv("ALL_PROXY");
+        dup2(p[1], 1);
+        close(p[0]);
+        close(p[1]);
+        execvp("ffmpeg", (char *const *)argv);
+        _exit(127);
+    }
+    close(p[1]);
+    h->fd = p[0];
+    h->pid = pid;
+    h->stop = h->got = h->exited = 0;
+    h->opened = mono();
+    h->base = start;
+    if (pthread_create(&h->th, NULL, reader, h)) { ff_stop(h); return -1; }
+    return 0;
+}
+
 struct hmc_player *hmc_player_open(const char *url, const char *headers, double start_s, int dw, int dh, char *why, size_t why_cap) {
-    (void)headers; (void)dw; (void)dh;
-    usleep(300000);
-    if (strstr(url, "fail")) { snprintf(why, why_cap, "open_input=-5"); return NULL; }
-    if (strstr(url, "sw")) { snprintf(why, why_cap, "video_codec=mpeg2video"); return NULL; }
+    (void)dw; (void)dh;
     struct hmc_player *h = calloc(1, sizeof *h);
+    snprintf(h->url, sizeof h->url, "%s", url);
+    snprintf(h->headers, sizeof h->headers, "%s", headers ? headers : "");
+    h->ff = host_real_video && !strstr(url, ".invalid");
+    h->vod = strstr(url, "archive-") != NULL && !strstr(url, "-now");
+    if (h->vod) {   /* archive-START-DURATION */
+        const char *q = strchr(strstr(url, "archive-") + 8, '-');
+        h->dur = q ? atof(q + 1) : 3600;
+    }
+    if (h->ff) {
+        if (ff_start(h, start_s)) { snprintf(why, why_cap, "open_input=ffmpeg"); free(h); return NULL; }
+        fprintf(stderr, "host_player ffmpeg start=%.0f\n", start_s);
+        host_video_on = 1;
+        return h;
+    }
+    usleep(300000);
+    if (strstr(url, "fail")) { snprintf(why, why_cap, "open_input=-5"); free(h); return NULL; }
+    if (strstr(url, "sw")) { snprintf(why, why_cap, "video_codec=mpeg2video"); free(h); return NULL; }
     h->opened = mono();
     h->base = start_s;
-    snprintf(h->url, sizeof h->url, "%s", url);
     if (!strncmp(url, "http://127.0.0.1:", 17)) {
         pthread_t t;
         if (!pthread_create(&t, NULL, drain, strdup(url))) pthread_detach(t);
-    }
-    h->vod = strstr(url, "archive-") != NULL && !strstr(url, "-now");
-    if (h->vod) {   /* archive-START-DURATION */
-        const char *p = strstr(url, "archive-") + 8;
-        long long s = atoll(p);
-        const char *q = strchr(p, '-');
-        h->dur = q ? atof(q + 1) : 3600;
-        (void)s;
     }
     fprintf(stderr, "stub_player open start=%.0f vod=%d\n", start_s, h->vod);
     host_video_on = 1;
     return h;
 }
-void hmc_player_destroy(struct hmc_player *h) { free(h); host_video_on = 0; }
-static double pos(struct hmc_player *h) { return h->base + ((h->paused ? h->paused_at : mono()) - h->opened); }
+void hmc_player_destroy(struct hmc_player *h) {
+    ff_stop(h);
+    pthread_mutex_lock(&vmu);
+    free(vframe);
+    vframe = NULL;
+    pthread_mutex_unlock(&vmu);
+    free(h);
+    host_video_on = 0;
+}
+static double pos(struct hmc_player *h) {
+    double t0 = h->ff ? (h->got ? h->first_at : mono()) : h->opened;
+    return h->base + ((h->paused ? h->paused_at : mono()) - t0);
+}
 enum hmc_state hmc_player_state(struct hmc_player *h) {
+    if (h->ff) {
+        /* нет PulseAudio — ffmpeg падает целиком: ещё раз без звука */
+        if (!h->got && h->exited && !h->mute && mono() - h->opened < 5) {
+            fprintf(stderr, "host_player: без звука\n");
+            double b = h->base;
+            ff_stop(h);
+            h->mute = 1;
+            if (!ff_start(h, b)) return HMC_STARTING;
+        }
+        if (!h->got) return h->exited || mono() - h->opened > 25 ? HMC_FAILED : HMC_STARTING;
+        if (h->exited && !h->paused) return h->vod ? HMC_ENDED : HMC_FAILED;
+        return HMC_PLAYING;
+    }
     if (mono() - h->opened < 0.2) return HMC_STARTING;
     if (h->vod && h->dur > 0 && pos(h) >= h->dur) return HMC_ENDED;
     return HMC_PLAYING;
 }
 int hmc_player_error(const struct hmc_player *h) { (void)h; return 0; }
-const char *hmc_player_error_stage(const struct hmc_player *h) { (void)h; return "none"; }
+const char *hmc_player_error_stage(const struct hmc_player *h) { return h->ff && !h->got ? "open_input" : "none"; }
 int hmc_player_control_error(struct hmc_player *h) { (void)h; return 0; }
 void hmc_player_snapshot(struct hmc_player *h, struct pl_info *v, const char *fallback, int details) {
     (void)fallback; (void)details;
@@ -73,8 +199,9 @@ void hmc_player_snapshot(struct hmc_player *h, struct pl_info *v, const char *fa
     v->paused = h->paused;
     v->width = 1920;
     v->height = 1080;
-    snprintf(v->video_codec, sizeof v->video_codec, "h264");
+    snprintf(v->video_codec, sizeof v->video_codec, h->ff ? "ffmpeg" : "h264");
     snprintf(v->audio_codec, sizeof v->audio_codec, "AAC");
+    if (h->ff) { v->audio_count = 1; return; }
     v->audio_count = 2;
     snprintf(v->audio_tracks[0].label, sizeof v->audio_tracks[0].label, "Русский");
     snprintf(v->audio_tracks[0].meta, sizeof v->audio_tracks[0].meta, "AAC 2.0");
@@ -85,11 +212,24 @@ void hmc_player_snapshot(struct hmc_player *h, struct pl_info *v, const char *fa
 }
 int hmc_player_action(struct hmc_player *h, struct pl_action a) {
     if (a.type == PL_PAUSE) {
-        if (a.value && !h->paused) { h->paused = 1; h->paused_at = mono(); }
-        else if (!a.value && h->paused) { h->opened += mono() - h->paused_at; h->paused = 0; }
+        if (a.value && !h->paused) {
+            h->paused = 1;
+            h->paused_at = mono();
+            if (h->ff && h->pid) kill(h->pid, SIGSTOP);
+        } else if (!a.value && h->paused) {
+            double p = pos(h);
+            h->paused = 0;
+            /* ffmpeg с -re после остановки догонял бы часы: проще начать с места паузы */
+            if (h->ff) { ff_stop(h); ff_start(h, h->vod || p > 0.5 ? p : 0); }
+            else h->opened += mono() - h->paused_at;
+        }
         return 0;
     }
-    if (a.type == PL_SEEK_ABS) { h->base = a.value; h->opened = mono(); if (h->paused) h->paused_at = h->opened; return 0; }
+    if (a.type == PL_SEEK_ABS) {
+        if (h->ff) { ff_stop(h); h->paused = 0; return ff_start(h, a.value); }
+        h->base = a.value; h->opened = mono(); if (h->paused) h->paused_at = h->opened;
+        return 0;
+    }
     return 0;
 }
 

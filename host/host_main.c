@@ -55,7 +55,9 @@ int host_window_open(void);
 void host_window_present(const uint32_t *px, int w, int h, int stride);
 int host_window_poll(void);
 void host_keys_help(void);
+void host_window_video_tick(void);
 #endif
+extern int host_real_video;
 static int windowed;
 
 static void present(const uint32_t *px, int w, int h, int stride) {
@@ -133,11 +135,13 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--data") && i + 1 < argc) snprintf(data, sizeof data, "%s", argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out_dir = argv[++i];
         else if (!strcmp(argv[i], "--window")) windowed = 1;
+        else if (!strcmp(argv[i], "--no-video")) host_real_video = -1;
         else break;
     }
 #ifdef PTV_NO_X11
     if (windowed) { fprintf(stderr, "собрано без X11: окна нет (нужен пакет libx11-dev)\n"); return 1; }
 #else
+    host_real_video = windowed && host_real_video >= 0;
     if (windowed) { if (host_window_open()) return 1; host_keys_help(); }
 #endif
     mkdirs(data);
@@ -202,6 +206,7 @@ int main(int argc, char **argv) {
     /* окно: работать, пока его не закрыли (или Home — выход приложения) */
     while (windowed && !app_quitting() && host_window_poll()) {
         app_frame();
+        host_window_video_tick();
         struct timespec w = {0, 10000000};
         nanosleep(&w, NULL);
     }

@@ -13,6 +13,8 @@
 
 void keys_raw(int code, int value);
 extern int host_video_on;
+int host_video_frame(const uint32_t **px, int *w, int *h);
+void host_video_lock(int on);
 
 static Display *dpy;
 static Window win;
@@ -65,6 +67,10 @@ static void blit(void) {
     if (!dpy || !src || !img) return;
     uint32_t *dst = (uint32_t *)img->data;
     int stride = img->bytes_per_line / 4;
+    const uint32_t *vf;
+    int vw, vh;
+    host_video_lock(1);
+    int real = host_video_on == 1 && host_video_frame(&vf, &vw, &vh);
     for (int y = 0; y < wh; y++) {
         int sy = (int)((long)y * sh / wh), sy2 = sy + 1 < sh ? sy + 1 : sy;
         for (int x = 0; x < ww; x++) {
@@ -75,7 +81,11 @@ static void blit(void) {
             for (int k = 0; k < n; k++) {
                 uint32_t c = p[k];
                 unsigned a = c >> 24, vr = 0, vg = 0, vb = 0;
-                if (host_video_on == 1) {
+                if (real && a < 255) {   /* настоящий кадр (ffmpeg) под «дырой» */
+                    int vx = k & 1 ? sx2 : sx, vy = k & 2 ? sy2 : sy;
+                    uint32_t v = vf[(vy * vh / sh) * vw + vx * vw / sw];
+                    vr = (v >> 16) & 255; vg = (v >> 8) & 255; vb = v & 255;
+                } else if (host_video_on == 1) {
                     int vx = k & 1 ? sx2 : sx, vy = k & 2 ? sy2 : sy;
                     vr = (unsigned)(60 + vx * 120 / sw);
                     vg = (unsigned)(90 + vy * 90 / sh);
@@ -88,8 +98,20 @@ static void blit(void) {
             dst[y * stride + x] = (r / (unsigned)n) << 16 | (g / (unsigned)n) << 8 | (b / (unsigned)n);
         }
     }
+    host_video_lock(0);
     XPutImage(dpy, win, gc, img, 0, 0, 0, 0, (unsigned)ww, (unsigned)wh);
     XFlush(dpy);
+}
+
+/* новый кадр видео — перерисовать окно с последним холстом */
+void host_window_video_tick(void) {
+    static int seen;
+    const uint32_t *vf;
+    int vw, vh;
+    host_video_lock(1);
+    int seq = host_video_on == 1 ? host_video_frame(&vf, &vw, &vh) : 0;
+    host_video_lock(0);
+    if (seq && seq != seen) { seen = seq; blit(); }
 }
 
 int host_window_open(void) {
