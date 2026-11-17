@@ -260,6 +260,7 @@ int d_text_c(gfx_t *g, int x, int w, int y, double em, int f, uint32_t c, const 
     return d_text(g, x + (w - tw) / 2, y, em, f, c, s, 0);
 }
 int d_line_h(double em, int f) { return text_line_height_w(px(em), f); }
+int d_text_base(gfx_t *g, int x, int base, double em, int f, uint32_t c, const char *s, int maxw) { return d_text(g, x, base - text_ascent_w(px(em), f), em, f, c, s, maxw); }
 int d_text_mid(gfx_t *g, int x, int cy, double em, int f, uint32_t c, const char *s, int maxw) {
     int p = px(em);
     int base = cy + (int)(p * 0.36);   /* половина высоты прописной */
