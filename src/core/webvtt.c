@@ -2,6 +2,7 @@
 #include "webvtt.h"
 #include "http.h"
 #include "util.h"
+#include "substyle.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,23 +50,64 @@ static double vtime(const char *s, const char **end) {
     return h * 3600 + m * 60 + sec + ms / 1000.0;
 }
 
-/* теги <…> прочь, сущности — знаками */
-static void clean(char *s) {
-    char *o = s;
-    for (char *p = s; *p;) {
-        if (*p == '<') { char *e = strchr(p, '>'); if (e) { p = e + 1; continue; } }
+/* знак c при оформлении w — в out (с метками перед ним, core/substyle.h) */
+static void ss_put(sbuf *out, ss_out *w, char c) {
+    char m[9];
+    int k = ss_out_marks(w, c, m);
+    if (k) sb_addn(out, m, (size_t)k);
+    sb_addc(out, c);
+}
+
+/* цвет класса WebVTT «c.yellow» (классы фона «bg_…» и чужие — нет) */
+static uint32_t vtt_class_color(const char *t, const char *e) {
+    static const struct { const char *n; uint32_t c; } C[] = {{"white", 0xffffffffu}, {"lime", 0xff00ff00u}, {"cyan", 0xff00ffffu}, {"red", 0xffff0000u},
+                                                              {"yellow", 0xffffff00u}, {"magenta", 0xffff00ffu}, {"blue", 0xff0000ffu}, {"black", 0xff000000u}};
+    uint32_t r = SS_NOCOLOR;
+    for (const char *p = t; p < e; p++) {
+        if (*p != '.') continue;
+        size_t l = strcspn(p + 1, ". \t>");
+        if (p + 1 + l > e) l = (size_t)(e - p - 1);
+        for (int i = 0; i < COUNT(C); i++) if (strlen(C[i].n) == l && !strncmp(p + 1, C[i].n, l)) r = C[i].c;
+    }
+    return r;
+}
+
+/* Текст реплики: <i> <b> <u> и цвет <c.класс> — метками оформления, прочие теги (<v>, <lang>, <ruby>, метки времени)
+ * прочь, сущности — знаками. */
+static void vtt_styled(sbuf *out, const char *s) {
+    ss_out w;
+    ss_out_init(&w);
+    struct { int f; uint32_t c; } st[16];
+    int d = 0;
+    for (const char *p = s; *p;) {
+        if (*p == '<') {
+            const char *e = strchr(p, '>');
+            if (e) {
+                const char *t = p + 1;
+                p = e + 1;
+                if (*t == '/') { if (d > 0) { d--; w.flags = st[d].f; w.color = st[d].c; } continue; }
+                if (*t >= '0' && *t <= '9') continue;   /* метка времени */
+                if (d < 16) { st[d].f = w.flags; st[d].c = w.color; d++; }
+                size_t nl = strcspn(t, ". \t>");
+                if (nl == 1 && *t == 'i') w.flags |= SS_I;
+                else if (nl == 1 && *t == 'b') w.flags |= SS_B;
+                else if (nl == 1 && *t == 'u') w.flags |= SS_U;
+                else if (nl == 1 && *t == 'c') { uint32_t c = vtt_class_color(t, e); if (c != SS_NOCOLOR) w.color = c; }
+                continue;
+            }
+        }
         if (*p == '&') {
             static const struct { const char *e, *v; } ent[] = {{"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"}, {"&nbsp;", " "}, {"&quot;", "\""}, {"&apos;", "'"}, {"&lrm;", ""}, {"&rlm;", ""}};
             int done = 0;
             for (size_t i = 0; i < sizeof ent / sizeof ent[0] && !done; i++) {
                 size_t l = strlen(ent[i].e);
-                if (!strncmp(p, ent[i].e, l)) { size_t vl = strlen(ent[i].v); memmove(o, ent[i].v, vl); o += vl; p += l; done = 1; }
+                if (!strncmp(p, ent[i].e, l)) { for (const char *v = ent[i].v; *v; v++) ss_put(out, &w, *v); p += l; done = 1; }
             }
             if (done) continue;
         }
-        *o++ = *p++;
+        if (ss_is_mark((unsigned char)*p)) { p++; continue; }
+        ss_put(out, &w, *p++);
     }
-    *o = 0;
 }
 
 /* Блоки разделены пустыми строками. Первый — заголовок (WEBVTT, X-TIMESTAMP-MAP). В блоке реплики строка с «-->»
@@ -100,12 +142,14 @@ int webvtt_parse(const char *text, size_t n, webvtt_cue_fn cb, void *ctx) {
         if (blank || e == end) {   /* конец блока: реплика готова */
             if (!blank && in_text) { if (body.n) sb_addc(&body, '\n'); sb_add(&body, line); }
             if (in_text && a >= 0 && b > a && body.s) {
-                clean(body.s);
-                trim(body.s);
-                if (*body.s) {
-                    cb(ctx, mpegts + (int64_t)((a - local) * 90000.0), mpegts + (int64_t)((b - local) * 90000.0), body.s);
+                sbuf st = {0};
+                vtt_styled(&st, body.s);
+                if (st.s) trim(st.s);
+                if (st.s && ss_visible(st.s)) {
+                    cb(ctx, mpegts + (int64_t)((a - local) * 90000.0), mpegts + (int64_t)((b - local) * 90000.0), st.s);
                     count++;
                 }
+                sb_free(&st);
             }
             sb_clear(&body);
             in_text = 0;
@@ -131,7 +175,8 @@ int webvtt_parse(const char *text, size_t n, webvtt_cue_fn cb, void *ctx) {
  * Свой маленький разбор XML: элементы body / div / p / span с begin / end / dur (время ребёнка — от начала родителя,
  * timeContainer «par»), текст абзаца — его текст и span, <br/> — перевод строки, пробелы сжимаются. Время — часы
  * «чч:мм:сс(.доли)» и «чч:мм:сс:кадры», смещения «12.5s», «300ms», «40f», «1200t» (ttp:tickRate, ttp:frameRate,
- * ttp:frameRateMultiplier). Оформление и области не берутся — текст внизу, как у остальных субтитров. Картинки
+ * ttp:frameRateMultiplier). Оформление (курсив, жирный, подчёркивание, цвет — tts: на элементе и через
+ * <style>) — метками core/substyle.h; области не берутся — текст внизу, как у остальных субтитров. Картинки
  * (профиль image) — нет. */
 typedef struct { double tick, fps; } ttp;
 
@@ -183,8 +228,49 @@ static int xml_attr(const char *tag, size_t tl, const char *name, char *out, siz
     return 0;
 }
 
+/* знак текста TTML: с метками оформления (w), \n сбрасывает их */
+static void tput(sbuf *b, ss_out *w, const char *s, size_t n) {
+    char m[9];
+    int k = ss_out_marks(w, s[0], m);
+    if (k) sb_addn(b, m, (size_t)k);
+    sb_addn(b, s, n);
+}
+
+/* цвет tts:color: «#rrggbb[aa]», «rgb(…)» / «rgba(…)», имена TTML; SS_NOCOLOR — не понят или прозрачный */
+static uint32_t tts_color(const char *v) {
+    static const struct { const char *n; uint32_t c; } N[] = {
+        {"white", 0xffffff}, {"black", 0x000000}, {"red", 0xff0000}, {"lime", 0x00ff00}, {"green", 0x008000}, {"blue", 0x0000ff},
+        {"yellow", 0xffff00}, {"cyan", 0x00ffff}, {"aqua", 0x00ffff}, {"magenta", 0xff00ff}, {"fuchsia", 0xff00ff}, {"gray", 0x808080},
+        {"silver", 0xc0c0c0}, {"maroon", 0x800000}, {"olive", 0x808000}, {"navy", 0x000080}, {"purple", 0x800080}, {"teal", 0x008080}};
+    while (*v == ' ') v++;
+    unsigned r, g, b, a = 255;
+    if (*v == '#') {
+        size_t l = strspn(v + 1, "0123456789abcdefABCDEF");
+        if (l != 6 && l != 8) return SS_NOCOLOR;
+        unsigned long x = strtoul(v + 1, NULL, 16);
+        if (l == 8) { a = (unsigned)(x & 0xff); x >>= 8; }
+        return a ? 0xff000000u | (uint32_t)x : SS_NOCOLOR;
+    }
+    if (sscanf(v, "rgba(%u,%u,%u,%u)", &r, &g, &b, &a) == 4 || sscanf(v, "rgb(%u,%u,%u)", &r, &g, &b) == 3)
+        return a && r < 256 && g < 256 && b < 256 ? 0xff000000u | r << 16 | g << 8 | b : SS_NOCOLOR;
+    for (int i = 0; i < COUNT(N); i++) if (!strcasecmp(v, N[i].n)) return 0xff000000u | N[i].c;
+    return SS_NOCOLOR;
+}
+
+/* оформление из атрибутов tts: (элемент или <style>): mask — какие флаги заданы, val — их значения */
+static void tts_attrs(const char *tag, size_t tl, int *mask, int *val, uint32_t *color) {
+    char v[64];
+    if (xml_attr(tag, tl, "fontStyle", v, sizeof v)) { *mask |= SS_I; if (!strcmp(v, "italic") || !strcmp(v, "oblique")) *val |= SS_I; else *val &= ~SS_I; }
+    if (xml_attr(tag, tl, "fontWeight", v, sizeof v)) { *mask |= SS_B; if (!strcmp(v, "bold")) *val |= SS_B; else *val &= ~SS_B; }
+    if (xml_attr(tag, tl, "textDecoration", v, sizeof v)) {
+        if (strstr(v, "noUnderline")) { *mask |= SS_U; *val &= ~SS_U; }
+        else if (strstr(v, "underline")) { *mask |= SS_U; *val |= SS_U; }
+    }
+    if (xml_attr(tag, tl, "color", v, sizeof v)) { uint32_t c = tts_color(v); if (c != SS_NOCOLOR) *color = c; }
+}
+
 /* текст XML: сущности — знаками, пробелы — одним */
-static void xml_text(sbuf *b, const char *s, size_t n) {
+static void xml_text(sbuf *b, ss_out *w, const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         char c = s[i];
         if (c == '&') {
@@ -204,17 +290,18 @@ static void xml_text(sbuf *b, const char *s, size_t n) {
                           : cp < 0x800 ? (u[0] = (char)(0xC0 | cp >> 6), u[1] = (char)(0x80 | (cp & 63)), 2)
                           : cp < 0x10000 ? (u[0] = (char)(0xE0 | cp >> 12), u[1] = (char)(0x80 | ((cp >> 6) & 63)), u[2] = (char)(0x80 | (cp & 63)), 3)
                           : (u[0] = (char)(0xF0 | cp >> 18), u[1] = (char)(0x80 | ((cp >> 12) & 63)), u[2] = (char)(0x80 | ((cp >> 6) & 63)), u[3] = (char)(0x80 | (cp & 63)), 4);
-                    sb_addn(b, u, (size_t)k);
+                    if (!ss_is_mark((unsigned char)u[0])) tput(b, w, u, (size_t)k);
                     i += l - 1;
                     continue;
                 }
             }
         }
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-            if (b->n && b->s[b->n - 1] != ' ' && b->s[b->n - 1] != '\n') sb_addc(b, ' ');
+            if (b->n && b->s[b->n - 1] != ' ' && b->s[b->n - 1] != '\n') tput(b, w, " ", 1);
             continue;
         }
-        sb_addc(b, c);
+        if (ss_is_mark((unsigned char)c)) continue;
+        tput(b, w, &c, 1);
     }
 }
 
@@ -231,17 +318,23 @@ static void tidy(char *s) {
 
 int ttml_parse(const char *xml, size_t n, double base_sec, webvtt_cue_fn cb, void *ctx) {
     ttp tp = {1, 30};
-    struct { double b, e; } st[48];
+    struct { double b, e; int f; uint32_t c; } st[48];
+    struct { char id[32]; int mask, val; uint32_t c; } sty[32];   /* <style xml:id> из <styling> */
+    int nsty = 0;
     int depth = 0, count = 0, p_depth = -1;
     double pb = 0, pe = 0;
     sbuf text = {0};
+    ss_out w;
+    ss_out_init(&w);
     st[0].b = base_sec;
     st[0].e = 1e12;
+    st[0].f = 0;
+    st[0].c = SS_NOCOLOR;
     const char *p = xml, *end = xml + n;
     while (p < end) {
         const char *lt = memchr(p, '<', (size_t)(end - p));
         if (!lt) lt = end;
-        if (p_depth >= 0 && lt > p) xml_text(&text, p, (size_t)(lt - p));
+        if (p_depth >= 0 && lt > p) { w.flags = st[depth].f; w.color = st[depth].c; xml_text(&text, &w, p, (size_t)(lt - p)); }
         if (lt >= end) break;
         if (lt + 4 <= end && !strncmp(lt, "<!--", 4)) { const char *e = memmem(lt, (size_t)(end - lt), "-->", 3); p = e ? e + 3 : end; continue; }
         const char *gt = memchr(lt, '>', (size_t)(end - lt));
@@ -264,7 +357,7 @@ int ttml_parse(const char *xml, size_t n, double base_sec, webvtt_cue_fn cb, voi
             if (IS("p") && p_depth >= 0 && depth <= p_depth) {
                 if (text.s) {
                     tidy(text.s);
-                    if (*text.s && pe > pb) {
+                    if (ss_visible(text.s) && pe > pb) {
                         int64_t s0 = (int64_t)(pb * 90000.0 + 0.5), e0 = (int64_t)(pe * 90000.0 + 0.5);
                         cb(ctx, s0, e0, text.s);
                         count++;
@@ -275,7 +368,23 @@ int ttml_parse(const char *xml, size_t n, double base_sec, webvtt_cue_fn cb, voi
             }
             continue;
         }
-        if (IS("br")) { if (p_depth >= 0) sb_addc(&text, '\n'); if (!selfc && depth < 47) { depth++; st[depth] = st[depth - 1]; } continue; }
+        if (IS("br")) { if (p_depth >= 0) tput(&text, &w, "\n", 1); if (!selfc && depth < 47) { depth++; st[depth] = st[depth - 1]; } continue; }
+        if (IS("style") && nsty < COUNT(sty)) {   /* именованный стиль: свои tts: и стили, на которые ссылается */
+            char id[32], refs[256];
+            if (xml_attr(tag, tl, "id", id, sizeof id)) {
+                int mask = 0, val = 0;
+                uint32_t c = SS_NOCOLOR;
+                if (xml_attr(tag, tl, "style", refs, sizeof refs))
+                    for (char *sv, *r = strtok_r(refs, " ", &sv); r; r = strtok_r(NULL, " ", &sv))
+                        for (int k = 0; k < nsty; k++) if (!strcmp(sty[k].id, r)) { mask |= sty[k].mask; val = (val & ~sty[k].mask) | sty[k].val; if (sty[k].c != SS_NOCOLOR) c = sty[k].c; }
+                tts_attrs(tag, tl, &mask, &val, &c);
+                snprintf(sty[nsty].id, sizeof sty[nsty].id, "%s", id);
+                sty[nsty].mask = mask;
+                sty[nsty].val = val;
+                sty[nsty].c = c;
+                nsty++;
+            }
+        }
         if (IS("tt")) {
             char v[64];
             if (xml_attr(tag, tl, "frameRate", v, sizeof v)) tp.fps = atof(v) > 0 ? atof(v) : 30;
@@ -290,8 +399,16 @@ int ttml_parse(const char *xml, size_t n, double base_sec, webvtt_cue_fn cb, voi
         if (xml_attr(tag, tl, "end", v, sizeof v)) { double t = ttml_time(v, &tp); if (t >= 0) e = pbeg + t; }
         else if (xml_attr(tag, tl, "dur", v, sizeof v)) { double t = ttml_time(v, &tp); if (t >= 0) e = b + t; }
         if (e > pend) e = pend;
-        if (IS("p") && p_depth < 0) { p_depth = depth; pb = b; pe = e; sb_clear(&text); }
-        if (!selfc && depth < 47) { depth++; st[depth].b = b; st[depth].e = e; }
+        /* оформление: от родителя, затем style="…", затем свои tts: */
+        int mask = 0, val = st[depth].f;
+        uint32_t col = st[depth].c;
+        char refs[256];
+        if (xml_attr(tag, tl, "style", refs, sizeof refs))
+            for (char *sv, *r = strtok_r(refs, " ", &sv); r; r = strtok_r(NULL, " ", &sv))
+                for (int k = 0; k < nsty; k++) if (!strcmp(sty[k].id, r)) { val = (val & ~sty[k].mask) | sty[k].val; if (sty[k].c != SS_NOCOLOR) col = sty[k].c; }
+        tts_attrs(tag, tl, &mask, &val, &col);
+        if (IS("p") && p_depth < 0) { p_depth = depth; pb = b; pe = e; sb_clear(&text); ss_out_init(&w); }
+        if (!selfc && depth < 47) { depth++; st[depth].b = b; st[depth].e = e; st[depth].f = val; st[depth].c = col; }
 #undef IS
     }
     sb_free(&text);
@@ -374,9 +491,11 @@ static int sample(const uint8_t *d, size_t n, int kind, double t0, double dur, w
             if (strcmp(it, "payl")) continue;
             char *s = xstrndup((const char *)pb, (size_t)(pe - pb));
             if (!s) continue;
-            clean(s);
-            trim(s);
-            if (*s) { cb(ctx, (int64_t)(t0 * 90000.0 + 0.5), (int64_t)((t0 + dur) * 90000.0 + 0.5), s); count++; }
+            sbuf st = {0};
+            vtt_styled(&st, s);
+            if (st.s) trim(st.s);
+            if (st.s && ss_visible(st.s)) { cb(ctx, (int64_t)(t0 * 90000.0 + 0.5), (int64_t)((t0 + dur) * 90000.0 + 0.5), st.s); count++; }
+            sb_free(&st);
             free(s);
         }
     }

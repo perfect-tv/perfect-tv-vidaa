@@ -14,8 +14,9 @@ enum { CC_608 = 1, CC_708 = 2 };
 enum { CC_VIDEO_MPEG2 = 1, CC_VIDEO_H264, CC_VIDEO_HEVC };
 
 /* строка показа: положение — доли безопасной области (x — левый край или середина / правый при align 1 / 2,
- * y — верх строки), высота строки — доля 1/15 */
-typedef struct { float x, y; int align; uint32_t color; int italic, underline; char text[256]; } cc_row;
+ * y — верх строки), высота строки — доля 1/15; курсив, подчёркивание и цвет знаков — метками в тексте
+ * (core/substyle.h; цвет по умолчанию — белый) */
+typedef struct { float x, y; int align; char text[384]; } cc_row;
 typedef struct { int64_t pts; int n; cc_row row[16]; } cc_show;
 
 typedef struct ccdec ccdec;

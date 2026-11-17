@@ -1,5 +1,6 @@
 /* Закрытые субтитры CEA-608 / CEA-708 (core/cc.h). */
 #include "cc.h"
+#include "substyle.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +18,10 @@ typedef struct {
 typedef struct {
     int defined, visible, rows, cols, av, ah, rel, ap, prow, pcol, priority;
     uint32_t t[15][42];
+    uint16_t a[15][42];   /* перо знака: 6 бит цвета (по 2 на R, G, B), A_I, A_U */
+    uint16_t pen;
 } win708;
+enum { A_I = 0x40, A_U = 0x80, PEN_DEF = 0x2A };   /* перо по умолчанию — белый (2, 2, 2) */
 typedef struct { win708 w[8]; int cur, changed; } c708;
 
 struct ccdec {
@@ -193,11 +197,17 @@ static void snap608(ccdec *d, int64_t pts) {
         cc_row *o = &s.row[s.n++];
         o->x = c0 / 32.0f;
         o->y = r / 15.0f;
-        o->color = COLORS[m[r][c0].color & 7];
-        o->italic = m[r][c0].italic;
-        o->underline = m[r][c0].underline;
+        ss_out w;
+        ss_out_init(&w);
         size_t k = 0;
-        for (int c = c0; c <= c1 && k + 4 < sizeof o->text; c++) k += (size_t)utf8(m[r][c].ch ? m[r][c].ch : ' ', o->text + k);
+        for (int c = c0; c <= c1 && k + 4 + 9 < sizeof o->text; c++) {
+            cell *e = &m[r][c];
+            w.flags = (e->italic ? SS_I : 0) | (e->underline ? SS_U : 0);
+            w.color = (e->color & 7) ? COLORS[e->color & 7] : SS_NOCOLOR;
+            uint32_t cp = e->ch ? e->ch : ' ';
+            k += (size_t)ss_out_marks(&w, (char)(cp == ' ' ? ' ' : 'x'), o->text + k);
+            k += (size_t)utf8(cp, o->text + k);
+        }
         o->text[k] = 0;
     }
     push_show(d, &s);
@@ -229,12 +239,20 @@ static uint32_t g2(int c) {
     }
 }
 
-static void w_clear(win708 *w) { memset(w->t, 0, sizeof w->t); w->prow = w->pcol = 0; }
+static void w_clear(win708 *w) { memset(w->t, 0, sizeof w->t); memset(w->a, 0, sizeof w->a); w->prow = w->pcol = 0; }
+
+/* цвет 708 (по 2 бита на канал) — ARGB; белый и ярко-белый — цвет по умолчанию */
+static uint32_t rgb708(int c) {
+    static const uint8_t L[4] = {0x00, 0x7F, 0xEB, 0xFF};
+    c &= 0x3F;
+    if (c == 0x2A || c == 0x3F) return SS_NOCOLOR;
+    return 0xff000000u | (uint32_t)L[c >> 4] << 16 | (uint32_t)L[(c >> 2) & 3] << 8 | L[c & 3];
+}
 
 static void w_put(c708 *b, uint32_t cp) {
     win708 *w = &b->w[b->cur];
     if (!w->defined) return;
-    if (w->prow < w->rows && w->pcol < w->cols) w->t[w->prow][w->pcol] = cp;
+    if (w->prow < w->rows && w->pcol < w->cols) { w->t[w->prow][w->pcol] = cp; w->a[w->prow][w->pcol] = w->pen; }
     if (w->pcol < w->cols) w->pcol++;
     if (w->visible) b->changed = 1;
 }
@@ -246,6 +264,7 @@ static void w_cr(c708 *b) {
     if (w->prow + 1 < w->rows) w->prow++;
     else {   /* последняя строка — окно сдвигается вверх */
         memmove(w->t[0], w->t[1], sizeof w->t[0] * (size_t)(w->rows - 1));
+        memmove(w->a[0], w->a[1], sizeof w->a[0] * (size_t)(w->rows - 1));
         memset(w->t[w->rows - 1], 0, sizeof w->t[0]);
     }
     if (w->visible) b->changed = 1;
@@ -301,8 +320,18 @@ static void block708(c708 *b, const uint8_t *p, int n) {
         if (c == 0x8D) { i += 1; continue; }
         if (c == 0x8E) continue;
         if (c == 0x8F) { memset(b->w, 0, sizeof b->w); b->changed = 1; continue; }
-        if (c == 0x90) { i += 2; continue; }
-        if (c == 0x91) { i += 3; continue; }
+        if (c == 0x90) {   /* SPA: курсив, подчёркивание */
+            if (i + 2 >= n) break;
+            if (w->defined) w->pen = (uint16_t)((w->pen & 0x3F) | (p[i + 2] & 0x80 ? A_I : 0) | (p[i + 2] & 0x40 ? A_U : 0));
+            i += 2;
+            continue;
+        }
+        if (c == 0x91) {   /* SPC: цвет знаков */
+            if (i + 3 >= n) break;
+            if (w->defined) w->pen = (uint16_t)((w->pen & ~0x3F) | (p[i + 1] & 0x3F));
+            i += 3;
+            continue;
+        }
         if (c == 0x92) {   /* SPL */
             if (i + 2 >= n) break;
             if (w->defined) { w->prow = p[i + 1] & 0x0F; w->pcol = p[i + 2] & 0x3F; if (w->prow >= w->rows) w->prow = w->rows - 1; }
@@ -326,7 +355,7 @@ static void block708(c708 *b, const uint8_t *p, int n) {
             x->cols = (q[4] & 0x3F) + 1;
             if (x->rows > 15) x->rows = 15;
             if (x->cols > 42) x->cols = 42;
-            if (fresh) w_clear(x);
+            if (fresh) { w_clear(x); x->pen = PEN_DEF; }
             if (x->prow >= x->rows) x->prow = x->rows - 1;
             b->cur = c - 0x98;
             b->changed = 1;
@@ -359,9 +388,17 @@ static void snap708(ccdec *d, int64_t pts) {
             o->y = top + r / 15.0f;
             if (o->y < 0) o->y = 0;
             if (o->y > 14 / 15.0f) o->y = 14 / 15.0f;
-            o->color = COLORS[0];
+            ss_out sw;
+            ss_out_init(&sw);
             size_t q = 0;
-            for (int c = c0; c <= c1 && q + 4 < sizeof o->text; c++) q += (size_t)utf8(w->t[r][c] ? w->t[r][c] : ' ', o->text + q);
+            for (int c = c0; c <= c1 && q + 4 + 9 < sizeof o->text; c++) {
+                uint32_t cp = w->t[r][c] ? w->t[r][c] : ' ';
+                uint16_t at = w->t[r][c] ? w->a[r][c] : PEN_DEF;
+                sw.flags = (at & A_I ? SS_I : 0) | (at & A_U ? SS_U : 0);
+                sw.color = rgb708(at);
+                q += (size_t)ss_out_marks(&sw, (char)(cp == ' ' ? ' ' : 'x'), o->text + q);
+                q += (size_t)utf8(cp, o->text + q);
+            }
             o->text[q] = 0;
         }
     }

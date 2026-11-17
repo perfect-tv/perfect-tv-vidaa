@@ -12,6 +12,7 @@
 #include "core/ttx.h"
 #include "core/dvbsub.h"
 #include "core/cc.h"
+#include "core/substyle.h"
 #include "core/webvtt.h"
 #include "core/util.h"
 #include "data/catchup.h"
@@ -1186,6 +1187,22 @@ static void test_relay_http(void) {
 
 /* ---------- ретранслятор: UDP / RTP и RTSP ---------- */
 #include <openssl/evp.h>
+
+/* метки оформления (core/substyle.h) — видимыми: {i} {b} {u} {iu} … {} — обычный, {#rrggbb} / {#} — цвет */
+static void ss_show(char *dst, size_t cap, const char *src) {
+    size_t o = 0;
+    for (const char *p = src; *p && o + 12 < cap;) {
+        unsigned char c = (unsigned char)*p;
+        if (c >= SS_SET && c <= SS_SET + 7) {
+            int f = c - SS_SET;
+            o += (size_t)snprintf(dst + o, cap - o, "{%s%s%s}", f & SS_I ? "i" : "", f & SS_B ? "b" : "", f & SS_U ? "u" : "");
+            p++;
+        } else if (c == SS_COLOR_DEF) { o += (size_t)snprintf(dst + o, cap - o, "{#}"); p++; }
+        else if (c == SS_COLOR) { o += (size_t)snprintf(dst + o, cap - o, "{#%.6s}", p + 1); p += ss_mark_len(p); }
+        else dst[o++] = *p++;
+    }
+    dst[o] = 0;
+}
 static struct { int port, rtp, multicast, stop; struct in_addr grp; atomic_int sent; } US;
 /* отправитель: сегмент TS по 7 пакетов в датаграмме (с RTP или без), по кругу */
 static void *udp_sender(void *a) {
@@ -1578,7 +1595,7 @@ static void cc_sample(void) {
         if (!r) sh.n = 0;
         if (sh.n == prev.n && (!sh.n || sh.pts == prev.pts)) continue;
         printf("cc %7.3f с:", (t - base) / 90000.0);
-        for (int i = 0; i < sh.n; i++) printf(" [стр %2d кол %2d %08x%s] «%s»", (int)(sh.row[i].y * 15 + 0.5) + 1, (int)(sh.row[i].x * 32 + 0.5), sh.row[i].color, sh.row[i].italic ? " курсив" : "", sh.row[i].text);
+        for (int i = 0; i < sh.n; i++) { char v[600]; ss_show(v, sizeof v, sh.row[i].text); printf(" [стр %2d кол %2d] «%s»", (int)(sh.row[i].y * 15 + 0.5) + 1, (int)(sh.row[i].x * 32 + 0.5), v); }
         printf("\n");
         prev = sh;
         if (!sh.n) prev.pts = -1;
@@ -1640,7 +1657,7 @@ static char vt_t[8][200];
 static int vt_n;
 static void vt_cb(void *ctx, int64_t s, int64_t e, const char *t) {
     (void)ctx;
-    if (vt_n < 8) { vt_s[vt_n] = s; vt_e[vt_n] = e; snprintf(vt_t[vt_n], 200, "%s", t); vt_n++; }
+    if (vt_n < 8) { vt_s[vt_n] = s; vt_e[vt_n] = e; ss_show(vt_t[vt_n], 200, t); vt_n++; }
 }
 static void test_webvtt(void) {
     const char *v = "WEBVTT\r\nX-TIMESTAMP-MAP=LOCAL:00:00:10.000,MPEGTS:1800000\r\n\r\n"
@@ -1652,13 +1669,19 @@ static void test_webvtt(void) {
     EQI(vt_n, 2);
     EQI(vt_s[0], 1800000 + 135000);   /* MPEGTS + (11,5 − 10) × 90000 */
     EQI(vt_e[0], 1800000 + 270000);
-    EQS(vt_t[0], "Первая строка\nвторая & конец");
+    EQS(vt_t[0], "{i}Первая {}строка\nвторая & конец");
     EQI(vt_s[1], 1800000 + 180000);   /* «мм:сс.ттт» без часов */
     EQI(vt_e[1], 1800000 + 382500);
     EQS(vt_t[1], "Реплика");
     vt_n = 0;
     EQI(webvtt_parse("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nбез карты\n", 46, vt_cb, NULL), 1);
     EQI(vt_s[0], 90000);
+    /* оформление: вложенность, переносы строк внутри тега (на новой строке — заново), цвет класса, мусорные байты */
+    const char *st = "WEBVTT\n\n00:01.000 --> 00:02.000\n<i>курсив <b>жирный</b>\nещё</i> <c.yellow.bg_black>жёлтый</c> <u>под черта</u>\x02\n\n"
+                     "00:03.000 --> 00:04.000\n<c.unknown><i></i></c>\n";
+    vt_n = 0;
+    EQI(webvtt_parse(st, strlen(st), vt_cb, NULL), 1);   /* вторая — без видимого текста */
+    EQS(vt_t[0], "{i}курсив {ib}жирный\n{i}ещё {}{#ffff00}жёлтый {u}{#}под черта");
 }
 
 /* ---------- закрытые субтитры CEA-608 / 708 ---------- */
@@ -1693,6 +1716,20 @@ static void test_cc(void) {
     EQS(sh.row[0].text, "HELLO♪");
     CHECK(sh.row[0].y > 0.9f && sh.row[0].x == 0);
     CHECK(cc_present608(d) == 1u);
+    /* оформление 608: PAC курсив, смена цвета посреди строки (пробел), курсив с подчёркиванием (цвет прежний) */
+    ctl2(d, 0x14, 0x20);           /* RCL */
+    ctl2(d, 0x14, 0x2E);           /* ENM */
+    ctl2(d, 0x14, 0x6E);           /* PAC: строка 15, курсив */
+    txt608(d, "ab");
+    ctl2(d, 0x11, 0x22);           /* зелёный */
+    txt608(d, "cd");
+    ctl2(d, 0x11, 0x2F);           /* курсив, подчёркнутый */
+    txt608(d, "e");
+    ctl2(d, 0x14, 0x2F);           /* EOC */
+    cc_flush(d);
+    CHECK(cc_at(d, ccpts, &sh));
+    if (sh.n == 1) { char v[400]; ss_show(v, sizeof v, sh.row[0].text); EQS(v, "{i}ab {}{#4cd964}cd{iu} e"); }
+    ctl2(d, 0x14, 0x60);           /* PAC: белый, без курсива — дальше как было */
     /* roll-up на 2 строки, PAC с отступом 4, расширенный знак вместо предыдущего (e → É) */
     ctl2(d, 0x14, 0x25);           /* RU2 (стирает показанное) */
     ctl2(d, 0x14, 0x2D);           /* CR */
@@ -1734,7 +1771,8 @@ static void test_cc(void) {
     /* 708: окно 0 (видно, отн. позиция 90 % / 50 %, привязка — низ по центру, 2 × 32), текст, CR, ещё строка */
     cc_select(d, CC_708, 1);
     ccpts = 3000000;
-    uint8_t blk[] = {0x98, 0x20, 0x80 | 90, 50, (7 << 4) | 1, 31, 0, 'H', 'i', ' ', '7', '0', '8', 0x0D, 'L', 0xE9, 0x7F};
+    uint8_t blk[] = {0x98, 0x20, 0x80 | 90, 50, (7 << 4) | 1, 31, 0, 0x90, 0x00, 0x80, 'H', 'i', ' ', 0x90, 0x00, 0x00, '7', '0', '8', 0x0D,
+                     0x91, 0x30, 0x00, 0x00, 'L', 0xE9, 0x7F};   /* SPA курсив / прямо, SPC красный */
     uint8_t pk[64] = {0};
     int bl = (int)sizeof blk, tot = 2 + bl;
     int code = (tot + 1) / 2;
@@ -1750,8 +1788,11 @@ static void test_cc(void) {
     CHECK(cc_at(d, ccpts, &sh));
     EQI(sh.n, 2);
     if (sh.n == 2) {
-        EQS(sh.row[0].text, "Hi 708");
-        EQS(sh.row[1].text, "Lé♪");
+        char v[400];
+        ss_show(v, sizeof v, sh.row[0].text);
+        EQS(v, "{i}Hi {}708");
+        ss_show(v, sizeof v, sh.row[1].text);
+        EQS(v, "{#ff0000}Lé♪");
         EQI(sh.row[0].align, 1);
         CHECK(sh.row[0].y > 0.7f && sh.row[1].y > sh.row[0].y);
     }
@@ -1808,7 +1849,18 @@ static void test_ttml(void) {
     EQI(ttml_parse(x, strlen(x), 100, vt_cb, NULL), 2);
     EQI(vt_s[0], (int64_t)(111.5 * 90000));   /* 100 + 10 + 1,5 */
     EQI(vt_e[0], (int64_t)(113.0 * 90000));
-    EQS(vt_t[0], "Первая строка\nвторая & Ж");
+    EQS(vt_t[0], "Первая {#ff0000}строка\nвторая & Ж");
+    {
+        const char *y = "<tt xmlns=\"http://www.w3.org/ns/ttml\" xmlns:tts=\"http://www.w3.org/ns/ttml#styling\"><head><styling>"
+                        "<style xml:id=\"it\" tts:fontStyle=\"italic\"/><style xml:id=\"yb\" style=\"it\" tts:color=\"#FFFF00FF\" tts:fontWeight=\"bold\"/>"
+                        "</styling></head><body><div style=\"it\"><p begin=\"1s\" end=\"2s\">весь <span tts:fontStyle=\"normal\">прямо</span> "
+                        "<span style=\"yb\" tts:textDecoration=\"underline\">ярко</span><br/>низ</p></div></body></tt>";
+        int keep = vt_n;
+        vt_n = 0;
+        EQI(ttml_parse(y, strlen(y), 0, vt_cb, NULL), 1);
+        EQS(vt_t[0], "{i}весь {}прямо {ibu}{#ffff00}ярко\n{i}низ");
+        vt_n = keep;
+    }
     EQI(vt_s[1], (int64_t)(114.2 * 90000 + 0.5));   /* 4 с + 5 кадров по 25 */
     EQI(vt_e[1], (int64_t)(115.2 * 90000 + 0.5));
     EQS(vt_t[1], "Кадры");
@@ -1841,7 +1893,7 @@ static void test_ttml(void) {
     EQI(webvtt_segment(segb.s, segb.n, &in, vt_cb, NULL), 1);
     EQI(vt_s[0], 7 * 90000);
     EQI(vt_e[0], 10 * 90000);
-    EQS(vt_t[0], "Реплика MP4");
+    EQS(vt_t[0], "Реплика {b}MP4");
     /* голый TTML-сегмент и WebVTT — тем же входом */
     vt_n = 0;
     EQI(webvtt_segment("\n<tt><body><p begin=\"1s\" end=\"2s\">XML</p></body></tt>", 52, NULL, vt_cb, NULL), 1);

@@ -64,7 +64,9 @@
     { "symbol": "bold", "file": "NotoSans-Bold.ttf" },
     { "symbol": "ui", "file": "Onest-Regular.ttf" },
     { "symbol": "ui_semi", "file": "Onest-SemiBold.ttf" },
-    { "symbol": "ui_bold", "file": "Onest-Bold.ttf" }
+    { "symbol": "ui_bold", "file": "Onest-Bold.ttf" },
+    { "symbol": "italic", "file": "NotoSans-Italic.ttf" },
+    { "symbol": "bold_italic", "file": "NotoSans-BoldItalic.ttf" }
   ],
   "embedCa": true,
   "shipCa": true,

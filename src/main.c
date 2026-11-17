@@ -22,6 +22,7 @@
 
 extern const unsigned char ptv_font_regular[], ptv_font_regular_end[], ptv_font_bold[], ptv_font_bold_end[];
 extern const unsigned char ptv_font_ui[], ptv_font_ui_end[], ptv_font_ui_semi[], ptv_font_ui_semi_end[], ptv_font_ui_bold[], ptv_font_ui_bold_end[];
+extern const unsigned char ptv_font_italic[], ptv_font_italic_end[], ptv_font_bold_italic[], ptv_font_bold_italic_end[];
 extern const unsigned char ptv_ca_pem[], ptv_ca_pem_end[];
 
 static void root_draw(screen *s, gfx_t *g) { (void)s; epg_frame(); tv_draw(g); }
@@ -65,6 +66,9 @@ int main(int argc, char **argv) {
     c.font_mem[TX_UI] = ptv_font_ui;           c.font_len[TX_UI] = (size_t)(ptv_font_ui_end - ptv_font_ui);
     c.font_mem[TX_UI_SEMI] = ptv_font_ui_semi; c.font_len[TX_UI_SEMI] = (size_t)(ptv_font_ui_semi_end - ptv_font_ui_semi);
     c.font_mem[TX_UI_BOLD] = ptv_font_ui_bold; c.font_len[TX_UI_BOLD] = (size_t)(ptv_font_ui_bold_end - ptv_font_ui_bold);
+    /* курсивы субтитров — в свободных слотах каркаса (F_I / F_BI в ui/u.h) */
+    c.font_mem[TX_DISPLAY] = ptv_font_italic; c.font_len[TX_DISPLAY] = (size_t)(ptv_font_italic_end - ptv_font_italic);
+    c.font_mem[TX_BRAND] = ptv_font_bold_italic; c.font_len[TX_BRAND] = (size_t)(ptv_font_bold_italic_end - ptv_font_bold_italic);
     c.ui_start = ui_start;
     c.raw_key = raw_key;
     c.on_shutdown = on_shutdown;

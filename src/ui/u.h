@@ -45,8 +45,10 @@ void u_init(void);
 #define C_TEXT3 WA(0.55)
 #define C_HINT WA(0.50)
 
-/* шрифты: UI — Onest, F_B — жирный */
+/* шрифты: UI — Onest, F_B — жирный; субтитры — Noto Sans (обычный, жирный, курсив и жирный курсив — в свободных
+ * слотах каркаса TX_DISPLAY / TX_BRAND, main.c) */
 enum { F_R = TX_UI, F_S = TX_UI_SEMI, F_B = TX_UI_BOLD };
+enum { F_SUB = TX_REGULAR, F_SUB_B = TX_BOLD, F_SUB_I = TX_DISPLAY, F_SUB_BI = TX_BRAND };
 
 /* --- заливки с честной прозрачностью --- */
 void d_fill(gfx_t *g, int x, int y, int w, int h, uint32_t c);
