@@ -13,6 +13,7 @@ typedef struct {
     const char *etag, *last_modified;   /* условный запрос: 304 — данные не менялись */
     int timeout_ms;             /* чтение; по умолчанию 30000 */
     volatile int *cancel;       /* != 0 — прервать */
+    int raw;                    /* без сжатия (Accept-Encoding: identity) — ретранслятор */
 } hs_req;
 
 void http_init(const char *ca_pem, size_t ca_len);   /* один раз в главном потоке */
@@ -20,6 +21,7 @@ void http_init(const char *ca_pem, size_t ca_len);   /* один раз в гл�
 hs *hs_open(const hs_req *rq, char *err, size_t errn);
 int hs_status(const hs *h);
 const char *hs_url(const hs *h);          /* адрес после редиректов */
+const char *hs_headers(const hs *h);      /* заголовки ответа «Имя: значение\r\n…» */
 /* Относительный адрес ref от base (как браузер). */
 void http_resolve(const char *base, const char *ref, char *out, size_t cap);
 long long hs_length(const hs *h);         /* Content-Length или -1 */

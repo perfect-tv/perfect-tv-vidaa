@@ -843,7 +843,7 @@ static void pes(sbuf *out, int sid, int64_t pts, const uint8_t *data, size_t n) 
 static struct { int fd, port; sbuf seg; } UP;
 static void *upstream(void *a) {
     (void)a;
-    for (int k = 0; k < 8; k++) {
+    for (int k = 0; k < 9; k++) {
         int c = accept(UP.fd, NULL, NULL);
         if (c < 0) break;
         char req[4096] = "";
@@ -852,11 +852,20 @@ static void *upstream(void *a) {
         char head[256];
         if (strstr(req, "GET /live/pl.m3u8")) {
             const char *pl = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:6,\nseg1.ts?x=1\n";
-            snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(pl));
+            snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nSet-Cookie: sid=abc; Domain=.provider.tv; Path=/; Secure; HttpOnly\r\nConnection: close\r\n\r\n", strlen(pl));
             if (send(c, head, strlen(head), 0) < 0 || send(c, pl, strlen(pl), 0) < 0) {}
-        } else if (strstr(req, "GET /live/seg1.ts?x=1") && strstr(req, "User-Agent: Test/1")) {
-            snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", UP.seg.n);
-            if (send(c, head, strlen(head), 0) < 0 || send(c, UP.seg.s, UP.seg.n, 0) < 0) {}
+        } else if (strstr(req, "GET /live/seg1.ts?x=1") && strstr(req, "User-Agent: Test/1") && !strstr(req, "PerfectTV/") &&
+                   !strstr(req, "Accept-Encoding: gzip")) {
+            const char *rg = strstr(req, "Range: bytes=");
+            if (rg && strstr(req, "Cookie: sid=abc")) {   /* часть — 206, как у настоящего сервера */
+                size_t a0 = (size_t)atol(rg + 13), b0 = (size_t)atol(strchr(rg, '-') + 1);
+                snprintf(head, sizeof head, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes %zu-%zu/%zu\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                         a0, b0, UP.seg.n, b0 - a0 + 1);
+                if (send(c, head, strlen(head), 0) < 0 || send(c, UP.seg.s + a0, b0 - a0 + 1, 0) < 0) {}
+            } else {
+                snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", UP.seg.n);
+                if (send(c, head, strlen(head), 0) < 0 || send(c, UP.seg.s, UP.seg.n, 0) < 0) {}
+            }
         } else {
             const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             if (send(c, nf, strlen(nf), 0) < 0) {}
@@ -865,19 +874,22 @@ static void *upstream(void *a) {
     }
     return NULL;
 }
-static char *fetch(const char *url, size_t *len) {
+static char resp_hdr[8192];
+static char *fetch_h(const char *url, const char *headers, size_t *len) {
     char err[120] = "";
-    hs_req rq = {.url = url, .timeout_ms = 5000};
+    hs_req rq = {.url = url, .headers = headers, .timeout_ms = 5000};
     hs *h = hs_open(&rq, err, sizeof err);
     if (!h) { fprintf(stderr, "fetch: %s\n", err); return NULL; }
     sbuf b = {0};
     char buf[8192];
     long r;
+    snprintf(resp_hdr, sizeof resp_hdr, "%d\n%s", hs_status(h), hs_headers(h));
     while ((r = hs_read(h, buf, sizeof buf)) > 0) sb_addn(&b, buf, (size_t)r);
     hs_close(h);
     *len = b.n;
     return sb_take(&b);
 }
+static char *fetch(const char *url, size_t *len) { return fetch_h(url, NULL, len); }
 static void test_relay_http(void) {
     UP.fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in sa = {.sin_family = AF_INET};
@@ -896,6 +908,9 @@ static void test_relay_http(void) {
     size_t n = 0;
     char *pl = fetch(url, &n);
     CHECK(pl && starts_with(pl, "#EXTM3U"));
+    /* cookie — плееру, без Domain и Secure (он ходит на 127.0.0.1) */
+    CHECK(strstr(resp_hdr, "Set-Cookie: sid=abc; Path=/; HttpOnly") != NULL);
+    CHECK(!strstr(resp_hdr, "Domain") && !strstr(resp_hdr, "Secure"));
     /* сегмент и ключ — тоже через ретранслятор, адреса абсолютные, заголовки канала переданы */
     char *seg = pl ? strstr(pl, "#EXTINF:6,\n") : NULL;
     CHECK(pl && strstr(pl, "URI=\"http://127.0.0.1:") && strstr(pl, "key.bin"));
@@ -905,6 +920,11 @@ static void test_relay_http(void) {
     free(pl);
     char *body = segurl[0] ? fetch(segurl, &n) : NULL;
     CHECK(body && n == UP.seg.n && !memcmp(body, UP.seg.s, n));   /* байты — как есть */
+    free(body);
+    /* Range и Cookie плеера — провайдеру, 206 и Content-Range — обратно */
+    body = segurl[0] ? fetch_h(segurl, "Range: bytes=188-375\r\nCookie: sid=abc\r\n", &n) : NULL;
+    CHECK(body && n == 188 && !memcmp(body, UP.seg.s + 188, 188));
+    CHECK(starts_with(resp_hdr, "206\n") && strstr(resp_hdr, "Content-Range: bytes 188-375/"));
     free(body);
     CHECK(relay_has_teletext());   /* и попутно разобраны */
     CHECK(relay_ts_bytes() >= (long long)UP.seg.n);

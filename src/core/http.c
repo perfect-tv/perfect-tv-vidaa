@@ -62,6 +62,7 @@ struct hs {
     long long length, received, chunk_left;
     char etag[160], last_modified[64], location[2048], error[120];
     char final_url[4096];         /* после редиректов (база для относительных адресов HLS) */
+    char resp[8192]; size_t resp_n;   /* заголовки последнего ответа «Имя: значение\r\n» */
     volatile int *cancel;
     /* буфер чтения сырых байтов */
     char buf[16384]; size_t bpos, blen;
@@ -322,7 +323,9 @@ static int request(hs *h, const char *url, const hs_req *rq) {
     sb_add(&b, "\r\n");
     int has_ua = rq->headers && strcasestr(rq->headers, "user-agent:");
     if (!has_ua) sb_add(&b, "User-Agent: PerfectTV/" PTV_VERSION " (VIDAA; native)\r\n");
-    sb_add(&b, "Accept: */*\r\nAccept-Encoding: gzip\r\nConnection: close\r\n");
+    if (!(rq->headers && strcasestr(rq->headers, "\naccept:")) && !(rq->headers && !strncasecmp(rq->headers, "accept:", 7))) sb_add(&b, "Accept: */*\r\n");
+    /* raw (ретранслятор): тело как есть, без сжатия — байты уходят плееру, плейлист переписывается */
+    sb_add(&b, rq->raw ? "Accept-Encoding: identity\r\nConnection: close\r\n" : "Accept-Encoding: gzip\r\nConnection: close\r\n");
     if (u.auth[0]) sb_printf(&b, "Authorization: Basic %s\r\n", u.auth);
     if (rq->etag && *rq->etag) sb_printf(&b, "If-None-Match: %s\r\n", rq->etag);
     if (rq->last_modified && *rq->last_modified) sb_printf(&b, "If-Modified-Since: %s\r\n", rq->last_modified);
@@ -335,6 +338,8 @@ static int request(hs *h, const char *url, const hs_req *rq) {
     if (getline_(h, line, sizeof line) < 0) { if (!h->error[0]) snprintf(h->error, sizeof h->error, "no response"); return -1; }
     if (strncmp(line, "HTTP/", 5) || !strchr(line, ' ')) { snprintf(h->error, sizeof h->error, "bad response"); return -1; }
     h->status = atoi(strchr(line, ' ') + 1);
+    h->resp_n = 0;
+    h->resp[0] = 0;
     h->length = -1;
     h->chunked = 0;
     h->location[0] = 0;
@@ -342,6 +347,8 @@ static int request(hs *h, const char *url, const hs_req *rq) {
         int n = getline_(h, line, sizeof line);
         if (n < 0) { snprintf(h->error, sizeof h->error, "headers cut"); return -1; }
         if (n == 0) break;
+        size_t ll = strlen(line);
+        if (h->resp_n + ll + 3 < sizeof h->resp) { memcpy(h->resp + h->resp_n, line, ll); memcpy(h->resp + h->resp_n + ll, "\r\n", 3); h->resp_n += ll + 2; }
         const char *v;
         if (header_is(line, "Content-Length", &v)) h->length = atoll(v);
         else if (header_is(line, "Transfer-Encoding", &v)) h->chunked = strcasestr(v, "chunked") != NULL;
@@ -397,6 +404,7 @@ hs *hs_open(const hs_req *rq, char *err, size_t errn) {
 
 int hs_status(const hs *h) { return h->status; }
 const char *hs_url(const hs *h) { return h->final_url; }
+const char *hs_headers(const hs *h) { return h->resp; }
 void http_resolve(const char *base, const char *ref, char *out, size_t cap) { resolve(base, ref, out, cap); }
 long long hs_length(const hs *h) { return h->length; }
 long long hs_received(const hs *h) { return h->received; }

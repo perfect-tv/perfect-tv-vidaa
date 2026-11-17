@@ -41,6 +41,8 @@ typedef struct {
     int sleep_warned;
     /* телетекст и субтитры: поток через ретранслятор (core/relay.c) */
     int tap, subs;
+    int relayed;                     /* текущий поток идёт через ретранслятор */
+    int direct;                      /* у канала — прямое подключение (через ретранслятор не открылся) */
     /* PIN */
     int pin_passed;
     char last_unlocked[160];
@@ -70,6 +72,8 @@ void tv_playlist_changed(int keep_channel);
 void tv_restart(void);               /* после восстановления копии */
 void tv_teletext(void);              /* открыть телетекст (поток — через ретранслятор) */
 void tv_set_subtitles(int on);       /* субтитры телетекста поверх видео (запоминается за каналом) */
+int tv_direct_count(void);           /* каналов с прямым подключением */
+void tv_direct_reset(void);
 /* Шаг по категории: +1 / -1, с пропуском закрытых при отмене PIN. */
 channel *tv_neighbour(int dir);
 /* окна */

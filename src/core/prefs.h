@@ -26,6 +26,7 @@ typedef struct {
     int epg_hours;      /* обновлять программу каждые N часов */
     int playlist_hours; /* плейлист устаревает через N часов */
     int any_cert;       /* принимать любые сертификаты */
+    int relay_all;      /* HTTP/HLS-потоки — через ретранслятор (дорожки телетекста и субтитров известны сразу) */
     int logo_priority;  /* 0 плейлист, 1 программа */
     int aspect;
     int remind_before;  /* минут */

@@ -52,20 +52,60 @@ int64_t tv_position(void) {
 int64_t tv_behind(void) { return clock_now() - tv_position(); }
 
 /* ---------- открытие потока ---------- */
-/* с телетекстом / субтитрами — через ретранслятор: системный плеер эти дорожки отбрасывает */
+/* Каналы, которые через ретранслятор не открылись: ключи через \n в хранилище. */
+#define DIRECT_KEY "relay.direct"
+static int is_direct(const channel *c) {
+    strlist l = {0};
+    sl_from_lines(&l, store_get(DIRECT_KEY));
+    int r = sl_find(&l, c->key) >= 0;
+    sl_clear(&l);
+    return r;
+}
+static void set_direct(const channel *c) {
+    strlist l = {0};
+    sl_from_lines(&l, store_get(DIRECT_KEY));
+    if (sl_find(&l, c->key) < 0) sl_add(&l, c->key);
+    char *s = sl_join(&l, "\n");
+    store_set(DIRECT_KEY, s);
+    free(s);
+    sl_clear(&l);
+}
+int tv_direct_count(void) {
+    strlist l = {0};
+    sl_from_lines(&l, store_get(DIRECT_KEY));
+    int n = l.n;
+    sl_clear(&l);
+    return n;
+}
+void tv_direct_reset(void) { store_set(DIRECT_KEY, NULL); T.direct = 0; }
+
+/* Через ретранслятор (дорожки телетекста и субтитров, которые системный плеер отбрасывает): по настройке «Поток
+ * через приложение» — все HTTP/HLS-каналы, кроме тех, что так не открылись; телетекст / субтитры — всегда. */
 static void open_url(const char *url, const char *hdr, double start) {
-    if (T.tap) {
+    T.relayed = 0;
+    if (T.tap || (P.relay_all && !T.direct)) {
         static char r[16384];
         if (!relay_url(url, hdr, r, sizeof r)) {
             relay_reset();
+            T.relayed = 1;
             fprintf(stderr, "stream via relay\n");
             pl_open(r, NULL, start);
             return;
         }
-        T.tap = T.subs = 0;
-        tv_toast(tr(S_TTX_NOT_HTTP));
+        if (T.tap) { T.tap = T.subs = 0; tv_toast(tr(S_TTX_NOT_HTTP)); }
     }
     pl_open(url, hdr, start);
+}
+
+static void start_stream(void);
+/* через ретранслятор не открылось — сразу напрямую (попыткой не считается) */
+static void relay_fallback(void) {
+    fprintf(stderr, "relay_fallback explicit=%d\n", T.tap);
+    if (T.tap) { T.tap = T.subs = 0; tv_toast(tr(S_TTX_RELAY_FAILED)); }
+    else if (T.cur) set_direct(T.cur);
+    T.direct = 1;
+    if (T.arc) T.arc_target = tv_position();
+    start_stream();
 }
 
 static void start_stream(void) {
@@ -127,6 +167,7 @@ static void really_play(channel *c, const char *gkey, int arc, int64_t t, double
         char k[200];
         snprintf(k, sizeof k, "subs.%s", c->key);
         T.subs = T.tap = store_get(k) != NULL;
+        T.direct = is_direct(c);
     }
     T.cur = c;
     group *g = repo_group_of(c, gkey ? gkey : T.group[0] ? T.group : NULL);
@@ -413,6 +454,7 @@ int tv_sleep_minutes(void) {
 static void reopen_with_tap(void) {
     if (T.tap || !T.cur) return;
     T.tap = 1;
+    if (T.relayed) return;   /* поток уже идёт через ретранслятор — телетекст есть сразу */
     if (T.arc) T.arc_target = tv_position();
     request_open(0.05);
 }
@@ -573,6 +615,8 @@ void tv_tick(double now) {
             int64_t t = T.arc_range ? T.arc_url_end : tv_position();
             if (t >= clock_now() - 30) tv_go_live();
             else { T.arc_target = t; request_open(0.05); }
+        } else if (st == PL_FAILED && !T.failed && T.relayed && !T.playing_since) {
+            relay_fallback();
         } else if ((st == PL_FAILED || st == PL_ENDED) && !T.failed) {
             static const double delays[] = {2, 5, 10};
             if (!T.retry_at) {

@@ -290,6 +290,83 @@ static int is_playlist(const char *s, size_t n) {
     return n - i >= 7 && !strncmp(s + i, "#EXTM3U", 7);
 }
 
+/* ---- заголовки: ретранслятор прозрачен — Range, Cookie, повторы и т. п. делает плеер ---- */
+static int hname(const char *line, const char *name) {
+    size_t n = strlen(name);
+    return !strncasecmp(line, name, n) && line[n] == ':';
+}
+/* от плеера к провайдеру: всё, кроме заголовков соединения; заголовки канала (h=) важнее */
+static int pass_request(const char *line) {
+    static const char *const drop[] = {"Host", "Connection", "Keep-Alive", "Accept-Encoding", "TE", "Upgrade", "Proxy-Connection",
+                                       "Proxy-Authorization", "Transfer-Encoding", "Content-Length"};
+    for (size_t i = 0; i < sizeof drop / sizeof drop[0]; i++) if (hname(line, drop[i])) return 0;
+    return strchr(line, ':') != NULL;
+}
+/* от провайдера к плееру: тело и длину ретранслятор отдаёт сам */
+static int pass_response(const char *line) {
+    static const char *const drop[] = {"Connection", "Keep-Alive", "Transfer-Encoding", "Content-Length", "Proxy-Connection",
+                                       "Upgrade", "Alt-Svc", "Strict-Transport-Security"};
+    for (size_t i = 0; i < sizeof drop / sizeof drop[0]; i++) if (hname(line, drop[i])) return 0;
+    return 1;
+}
+/* Set-Cookie: плеер обращается к 127.0.0.1 — Domain и Secure мешали бы ему вернуть cookie */
+static void cookie_line(sbuf *o, const char *line) {
+    const char *p = line;
+    while (*p) {
+        const char *e = strchr(p, ';');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        const char *t = p;
+        while (*t == ' ') t++;
+        int skip = p != line && (!strncasecmp(t, "Domain=", 7) || !strncasecmp(t, "Secure", 6) || !strncasecmp(t, "SameSite", 8));
+        if (!skip) { if (p != line) sb_addc(o, ';'); sb_addn(o, p, l); }
+        if (!e) break;
+        p = e + 1;
+    }
+}
+static void each_line(const char *block, void (*fn)(sbuf *, const char *, void *), sbuf *o, void *ctx) {
+    for (const char *p = block; p && *p;) {
+        const char *e = strstr(p, "\r\n");
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        char *line = xstrndup(p, l);
+        if (line && *line) fn(o, line, ctx);
+        free(line);
+        p = e ? e + 2 : NULL;
+    }
+}
+/* у канала (h=) уже есть заголовок с таким именем */
+static int chan_has(const char *chan, const char *line) {
+    size_t n = (size_t)(strchr(line, ':') - line);
+    for (const char *p = chan; p && *p;) {
+        if (!strncasecmp(p, line, n) && p[n] == ':') return 1;
+        p = strchr(p, '\n');
+        if (p) p++;
+    }
+    return 0;
+}
+static void req_fn(sbuf *o, const char *line, void *ctx) {
+    if (!pass_request(line) || chan_has(ctx, line)) return;
+    sb_add(o, line);
+    sb_add(o, "\r\n");
+}
+static void resp_fn(sbuf *o, const char *line, void *ctx) {
+    (void)ctx;
+    if (!pass_response(line)) return;
+    if (hname(line, "Set-Cookie")) cookie_line(o, line);
+    else sb_add(o, line);
+    sb_add(o, "\r\n");
+}
+static const char *reason(int code) {
+    switch (code) {
+    case 200: return "OK";
+    case 206: return "Partial Content";
+    case 304: return "Not Modified";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 416: return "Range Not Satisfiable";
+    default: return code >= 500 ? "Bad Gateway" : "Error";
+    }
+}
+
 static void *client(void *arg) {
     int fd = (int)(intptr_t)arg;
     struct timeval tv = {15, 0};
@@ -310,37 +387,52 @@ static void *client(void *arg) {
     char *url = malloc(4096), *hdr = malloc(4096);
     query_get(path + 3, "u", url, 4096);
     query_get(path + 3, "h", hdr, 4096);
+    /* заголовки запроса плеера (после строки запроса) — провайдеру, кроме заголовков соединения */
+    sbuf fwd = {0};
+    sb_add(&fwd, hdr);
+    char *hs0 = strstr(req, "\r\n"), *he = strstr(req, "\r\n\r\n");
+    if (hs0 && he && he > hs0) {
+        *he = 0;
+        each_line(hs0 + 2, req_fn, &fwd, hdr);
+    }
     pthread_mutex_lock(&D.mu);
     int gen = D.gen;
     pthread_mutex_unlock(&D.mu);
     volatile int cancel = 0;
-    hs_req rq = {.url = url, .headers = hdr[0] ? hdr : NULL, .timeout_ms = 20000, .cancel = &cancel};
+    hs_req rq = {.url = url, .headers = fwd.n ? fwd.s : NULL, .timeout_ms = 20000, .cancel = &cancel, .raw = 1};
     char err[120] = "";
     hs *h = hs_open(&rq, err, sizeof err);
     if (!h) {
-        reply_status(fd, !strncmp(err, "http_", 5) ? atoi(err + 5) : 502);
+        int code = !strncmp(err, "http_", 5) ? atoi(err + 5) : 502;
+        reply_status(fd, code >= 300 && code < 600 ? code : 502);
         fprintf(stderr, "relay_open_failed %s\n", strncmp(err, "http_", 5) ? "network" : err);
-        free(url); free(hdr); close(fd);
+        sb_free(&fwd); free(url); free(hdr); close(fd);
         return NULL;
     }
+    int status = hs_status(h);
+    sbuf head = {0};
+    sb_printf(&head, "HTTP/1.1 %d %s\r\n", status, reason(status));
+    each_line(hs_headers(h), resp_fn, &head, NULL);
     char *buf = malloc(65536);
-    long n = buf ? hs_read(h, buf, 65536) : -1;
-    if (n > 0 && is_playlist(buf, (size_t)n)) {
+    long n = buf && status != 304 ? hs_read(h, buf, 65536) : 0;
+    const char *enc = strcasestr(hs_headers(h), "\nContent-Encoding:");
+    if (!enc && !strncasecmp(hs_headers(h), "Content-Encoding:", 17)) enc = hs_headers(h);
+    if (n > 0 && !enc && is_playlist(buf, (size_t)n)) {
+        /* HLS: адреса — через ретранслятор; длина — новая */
         sbuf body = {0}, out = {0};
         sb_addn(&body, buf, (size_t)n);
         while ((n = hs_read(h, buf, 65536)) > 0 && body.n < PLAYLIST_MAX) sb_addn(&body, buf, (size_t)n);
         rewrite_playlist(&out, body.s, body.n, hs_url(h), hdr);
-        char head[200];
-        snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", out.n);
-        if (!send_all(fd, head, strlen(head))) send_all(fd, out.s ? out.s : "", out.n);
+        sb_printf(&head, "Content-Length: %zu\r\nConnection: close\r\n\r\n", out.n);
+        if (!send_all(fd, head.s, head.n)) send_all(fd, out.s ? out.s : "", out.n);
         sb_free(&body);
         sb_free(&out);
     } else if (n >= 0) {
-        char head[200];
         long long len = hs_length(h);
-        if (len > 0) snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %lld\r\nConnection: close\r\n\r\n", len);
-        else snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n");
-        int ok = !send_all(fd, head, strlen(head));
+        if (status == 304) sb_add(&head, "Content-Length: 0\r\n");
+        else if (len >= 0) sb_printf(&head, "Content-Length: %lld\r\n", len);
+        sb_add(&head, "Connection: close\r\n\r\n");
+        int ok = !send_all(fd, head.s, head.n);
         while (ok && n > 0) {
             pthread_mutex_lock(&D.mu);
             if (D.gen == gen) tap_locked((const uint8_t *)buf, (size_t)n);   /* прежняя ссылка — не разбирать */
@@ -349,6 +441,8 @@ static void *client(void *arg) {
             n = hs_read(h, buf, 65536);
         }
     }
+    sb_free(&head);
+    sb_free(&fwd);
     free(buf);
     hs_close(h);
     free(url);

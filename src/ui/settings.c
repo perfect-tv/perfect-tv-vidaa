@@ -22,8 +22,8 @@
 #define PTV_VERSION "dev"
 #endif
 
-enum { SEC_PLAYLISTS, SEC_VIEW, SEC_LOOK, SEC_LIST, SEC_LOCK, SEC_TMDB, SEC_DATA, SEC_ABOUT, NSEC };
-static const int SEC_NAMES[NSEC] = {S_SEC_PLAYLISTS, S_SEC_VIEW, S_SEC_LOOK, S_SEC_LIST, S_SEC_LOCK, S_SEC_TMDB, S_SEC_DATA, S_SEC_ABOUT};
+enum { SEC_PLAYLISTS, SEC_VIEW, SEC_NET, SEC_LOOK, SEC_LIST, SEC_LOCK, SEC_TMDB, SEC_DATA, SEC_ABOUT, NSEC };
+static const int SEC_NAMES[NSEC] = {S_SEC_PLAYLISTS, S_SEC_VIEW, S_SEC_NET, S_SEC_LOOK, S_SEC_LIST, S_SEC_LOCK, S_SEC_TMDB, S_SEC_DATA, S_SEC_ABOUT};
 
 enum {
     I_PL = 1000,   /* I_PL + индекс плейлиста */
@@ -32,6 +32,7 @@ enum {
     I_LANG, I_TZ, I_SCALE, I_NUMBER, I_GUIDE_VIEW, I_GUIDE_HEADER, I_HINTS_P, I_LOGO_PRIO,
     I_ADAPTIVE_P, I_RESET_SCORES, I_HIDDEN_P,
     I_PIN_SET, I_PIN_CLEAR, I_PIN_ASK, I_PIN_INPUT,
+    I_RELAY_ALL, I_RELAY_DIRECT,
     I_TMDB_KEY, I_TMDB_PHONE, I_TMDB_API, I_TMDB_IMG, I_TMDB_TEST, I_TMDB_REMOVE,
     I_BACKUP_SAVE, I_BACKUP_RESTORE, I_CLEAR_LOGOS, I_CLEAR_EPG, I_DATA_DIR,
     I_VERSION, I_SOURCE, I_LICENSE,
@@ -103,7 +104,6 @@ static void build(void) {
         add(I_START_LAST, tr(S_START_LAST), NULL, tr(P.start_last ? S_ON : S_OFF), 1);
         if (P.remind_before) snprintf(v, sizeof v, tr(S_REMIND_MIN), P.remind_before); else snprintf(v, sizeof v, "%s", tr(S_REMIND_AT_START));
         add(I_REMIND, tr(S_REMIND_BEFORE), NULL, v, 1);
-        add(I_ANYCERT, tr(S_ANY_CERT), tr(S_ANY_CERT_SUB), tr(P.any_cert ? S_ON : S_OFF), 1);
         { int a[] = {S_ASPECT_FIT, S_ASPECT_STRETCH, S_ASPECT_16_9, S_ASPECT_4_3}; add(I_ASPECT_P, tr(S_ASPECT), NULL, tr(a[P.aspect & 3]), 1); }
         add(I_EPG_HOURS, tr(S_EPG_EVERY), NULL, trf(S_HOURS_EVERY, P.epg_hours), 1);
         add(I_PL_HOURS, tr(S_PLAYLIST_EVERY), NULL, trf(S_HOURS_EVERY, P.playlist_hours), 1);
@@ -129,6 +129,11 @@ static void build(void) {
         if (P.pin[0]) add(I_PIN_CLEAR, tr(S_PIN_CLEAR), NULL, NULL, 0);
         add(I_PIN_ASK, tr(S_PIN_ASK), NULL, tr(P.pin_ask == PIN_ONCE ? S_PIN_ONCE : S_PIN_EACH), 1);
         add(I_PIN_INPUT, tr(S_PIN_INPUT), NULL, tr(P.pin_input == PIN_IN_RING ? S_PIN_RING : P.pin_input == PIN_IN_KEYS ? S_PIN_KEYS : S_PIN_ROWS), 1);
+        break;
+    case SEC_NET:
+        add(I_RELAY_ALL, tr(S_RELAY_ALL), tr(S_RELAY_ALL_SUB), tr(P.relay_all ? S_ON : S_OFF), 1);
+        if (tv_direct_count()) { snprintf(v, sizeof v, "%d", tv_direct_count()); add(I_RELAY_DIRECT, tr(S_RELAY_DIRECT), tr(S_RELAY_DIRECT_SUB), v, 0); }
+        add(I_ANYCERT, tr(S_ANY_CERT), tr(S_ANY_CERT_SUB), tr(P.any_cert ? S_ON : S_OFF), 1);
         break;
     case SEC_TMDB:
         add(I_TMDB_KEY, tr(S_TMDB_KEY), tr(S_TMDB_KEY_SUB), tr(tmdb_enabled() ? S_TMDB_SET : S_TMDB_NOT_SET), 0);
@@ -250,6 +255,7 @@ static void change(item *it, int dir) {
     case I_START_LAST: P.start_last = !P.start_last; break;
     case I_REMIND: CYCLE(REM, remind_before); break;
     case I_ANYCERT: P.any_cert = !P.any_cert; break;
+    case I_RELAY_ALL: P.relay_all = !P.relay_all; break;   /* действует со следующего открытия потока */
     case I_ASPECT_P: P.aspect = ((P.aspect + d) % 4 + 4) % 4; break;
     case I_EPG_HOURS: CYCLE(EPGH, epg_hours); break;
     case I_PL_HOURS: CYCLE(PLH, playlist_hours); break;
@@ -286,6 +292,7 @@ static void action(item *it) {
     case I_HIDDEN_P: hidden_open(); break;
     case I_PIN_SET: if (P.pin[0]) pin_ask(after_pin_ok, NULL, NULL); else pin_create(NULL, NULL); break;
     case I_PIN_CLEAR: pin_ask(after_pin_clear, NULL, NULL); break;
+    case I_RELAY_DIRECT: tv_direct_reset(); tv_toast(tr(S_RELAY_DIRECT_RESET)); build(); break;
     case I_TMDB_KEY: form_text(tr(S_TMDB_KEY), P.tmdb_key, 0, set_tmdb_key, NULL); break;
     case I_TMDB_PHONE: phone_open_kind(PHONE_TMDB, tmdb_from_phone, NULL); break;
     case I_TMDB_API: form_text(tr(S_TMDB_API), P.tmdb_api[0] ? P.tmdb_api : TMDB_API_DEFAULT, 0, set_tmdb_api, NULL); break;
