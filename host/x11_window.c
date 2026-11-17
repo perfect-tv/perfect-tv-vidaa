@@ -97,7 +97,11 @@ int host_window_open(void) {
     if (!dpy) { fprintf(stderr, "нет дисплея X11 (DISPLAY не задан?)\n"); return -1; }
     int s = DefaultScreen(dpy);
     win = XCreateSimpleWindow(dpy, RootWindow(dpy, s), 0, 0, (unsigned)ww, (unsigned)wh, 0, BlackPixel(dpy, s), BlackPixel(dpy, s));
-    XStoreName(dpy, win, "Perfect TV — ПК");
+    /* WM_NAME — Latin-1 (UTF-8 там превращается в «Ã…»): ASCII; заголовок в UTF-8 — _NET_WM_NAME */
+    XStoreName(dpy, win, "Perfect TV (PC)");
+    const char *title = "Perfect TV — ПК";
+    XChangeProperty(dpy, win, XInternAtom(dpy, "_NET_WM_NAME", False), XInternAtom(dpy, "UTF8_STRING", False), 8, PropModeReplace,
+                    (const unsigned char *)title, (int)strlen(title));
     XSelectInput(dpy, win, ExposureMask | KeyPressMask | KeyReleaseMask | StructureNotifyMask | FocusChangeMask);
     wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, win, &wm_delete, 1);
