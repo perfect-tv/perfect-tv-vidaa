@@ -1,6 +1,6 @@
 /* Субтитры: дорожки, выбор, показ (docs/controls.md, «Субтитры»). Три вида, которые умеем показывать сами (системный
- * плеер субтитры не показывает): телетекст (core/ttx.c), DVB-картинки (core/dvbsub.c), WebVTT из HLS
- * (core/webvtt.c) — все берутся из потока через ретранслятор. Остальные форматы видны в списке как «не
+ * плеер субтитры не показывает): телетекст (core/ttx.c), DVB-картинки (core/dvbsub.c), WebVTT и TTML / IMSC из
+ * HLS (core/webvtt.c) — все берутся из потока через ретранслятор. Остальные форматы видны в списке как «не
  * поддерживается». Дорожки: поток через ретранслятор — из его разбора (+ прочие из системного плеера); напрямую —
  * из системного плеера (выбор переоткрывает поток через ретранслятор). Выбор — ключ «вид:язык[:слабослышащие]»,
  * хранится за каналом (subs.<ключ канала>) и каждый кадр сопоставляется с дорожкой ретранслятора. */
@@ -84,14 +84,15 @@ int subs_tracks(subtrack *out, int max) {
             snprintf(t->key, sizeof t->key, "vtt:%s", lc);
             /* название рендиции — если оно не служебное («subtitle_0» у FFmpeg); иначе — язык */
             int generic = !v[i].name[0] || !strncasecmp(v[i].name, "subtitle", 8) || !strncasecmp(v[i].name, "subs", 4);
-            if (generic || lang_find(v[i].name) >= 0) snprintf(t->label, sizeof t->label, "%s · WebVTT", lang_label(v[i].lang));
-            else snprintf(t->label, sizeof t->label, "%s · %s · WebVTT", lang_label(v[i].lang), v[i].name);
+            const char *fmt = !strcmp(v[i].codec, "stpp") ? "TTML" : "WebVTT";
+            if (generic || lang_find(v[i].name) >= 0) snprintf(t->label, sizeof t->label, "%s · %s", lang_label(v[i].lang), fmt);
+            else snprintf(t->label, sizeof t->label, "%s · %s · %s", lang_label(v[i].lang), v[i].name, fmt);
         }
     }
     /* системный плеер: напрямую — всё; через ретранслятор — только то, чего ретранслятор не умеет */
     for (int i = 0; i < pl_sub_count() && n < max; i++) {
         const char *codec = pl_sub_codec(i);
-        int ttx = !strcmp(codec, "dvb_teletext"), dvb = !strcmp(codec, "dvb_subtitle"), vtt = !strcmp(codec, "webvtt");
+        int ttx = !strcmp(codec, "dvb_teletext"), dvb = !strcmp(codec, "dvb_subtitle"), vtt = !strcmp(codec, "webvtt") || !strcmp(codec, "ttml");
         if (parsed && (ttx || dvb || vtt)) continue;
         if (ttx) {   /* телетекст: одна строка, даже если дорожек несколько */
             int dup = 0;
@@ -105,7 +106,7 @@ int subs_tracks(subtrack *out, int max) {
         if (ttx) { snprintf(t->key, sizeof t->key, "ttx"); snprintf(t->label, sizeof t->label, "%s", tr(S_SUB_TELETEXT)); }
         else {
             snprintf(t->key, sizeof t->key, "%s:%s%s", dvb ? "dvb" : vtt ? "vtt" : "other", lc, dvb ? ":0" : "");
-            snprintf(t->label, sizeof t->label, "%s · %s", lang_label(pl_sub_label(i)), dvb ? "DVB" : vtt ? "WebVTT" : codec);
+            snprintf(t->label, sizeof t->label, "%s · %s", lang_label(pl_sub_label(i)), dvb ? "DVB" : !strcmp(codec, "ttml") ? "TTML" : vtt ? "WebVTT" : codec);
         }
     }
     return n;

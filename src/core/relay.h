@@ -38,9 +38,9 @@ int relay_dvb_list(relay_dvb *out, int max);
 void relay_dvb_select(int index);        /* номер в relay_dvb_list; -1 — выключить */
 int relay_dvb_selected(void);
 dvbsub *relay_dvbsub(void);
-/* Субтитры WebVTT, объявленные в главном плейлисте HLS (#EXT-X-MEDIA:TYPE=SUBTITLES): адрес провайдера и заголовки
- * канала — для core/webvtt.c. */
-typedef struct { char name[64], lang[16], url[4096], hdr[2048]; } relay_vtt;
+/* Текстовые субтитры, объявленные в главном плейлисте HLS (#EXT-X-MEDIA:TYPE=SUBTITLES): адрес провайдера и заголовки
+ * канала — для core/webvtt.c; вид (WebVTT / TTML) — по CODECS вариантов с этой группой субтитров. */
+typedef struct { char name[64], lang[16], url[4096], hdr[2048], group[64], codec[16]; } relay_vtt;   /* codec: wvtt, stpp или «» */
 int relay_vtt_list(relay_vtt *out, int max);
 /* разбор TS (для тестов): кусок байтов как из сети */
 void relay_tap(const uint8_t *d, size_t n);

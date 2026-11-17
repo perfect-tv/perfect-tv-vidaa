@@ -846,10 +846,65 @@ static void pes(sbuf *out, int sid, int64_t pts, const uint8_t *data, size_t n) 
 /* поддельный «провайдер» для ретранслятора: плейлист HLS и сегмент; keep-alive, после 3 запросов на соединении
  * молча закрывает его (как сервер по пределу или простою) */
 static struct { int fd, port; sbuf seg; atomic_int conns, reqs; atomic_llong big_sent; } UP;
+/* субтитры IMSC в fMP4: инициализация и сегмент (собирает mp4_build) */
+static struct { sbuf init, seg; } IM;
+static void box(sbuf *b, const char *type, const void *d, size_t n) {
+    uint8_t h[8] = {(uint8_t)((n + 8) >> 24), (uint8_t)((n + 8) >> 16), (uint8_t)((n + 8) >> 8), (uint8_t)(n + 8)};
+    memcpy(h + 4, type, 4);
+    sb_addn(b, (const char *)h, 8);
+    if (n) sb_addn(b, (const char *)d, n);
+}
+static void put32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
+/* init: moov/trak/mdia (mdhd: шкала ts; minf/stbl/stsd: запись kind); сегмент: moof (tfhd, tfdt base, trun) + mdat */
+static void mp4_build(sbuf *init, sbuf *segb, const char *kind, uint32_t ts, uint32_t base, const sbuf *samples, const uint32_t *durs, int ns) {
+    uint8_t mdhd[24] = {0};
+    put32(mdhd + 12, ts);
+    sbuf entry = {0}, stsd = {0}, stbl = {0}, minf = {0}, mdia = {0}, trak = {0};
+    uint8_t se[8] = {0};
+    box(&entry, kind, se, sizeof se);
+    uint8_t sh[8] = {0, 0, 0, 0, 0, 0, 0, 1};
+    sb_addn(&stsd, (const char *)sh, 8);
+    sb_addn(&stsd, entry.s, entry.n);
+    box(&stbl, "stsd", stsd.s, stsd.n);
+    box(&minf, "stbl", stbl.s, stbl.n);
+    box(&mdia, "mdhd", mdhd, sizeof mdhd);
+    box(&mdia, "minf", minf.s, minf.n);
+    box(&trak, "mdia", mdia.s, mdia.n);
+    sbuf moov = {0};
+    box(&moov, "trak", trak.s, trak.n);
+    sb_clear(init);
+    box(init, "ftyp", "iso6\0\0\0\0", 8);
+    box(init, "moov", moov.s, moov.n);
+    sb_free(&entry); sb_free(&stsd); sb_free(&stbl); sb_free(&minf); sb_free(&mdia); sb_free(&trak); sb_free(&moov);
+    /* moof: tfhd (default-base-is-moof), tfdt, trun (длительность и размер на образец, data_offset) */
+    uint8_t tfhd[8] = {0, 2, 0, 0, 0, 0, 0, 1}, tfdt[8] = {0};
+    put32(tfdt + 4, base);
+    size_t trl = 12 + 8 * (size_t)ns;
+    uint8_t *trun = calloc(1, trl);
+    trun[1] = 0; trun[2] = 3; trun[3] = 1;   /* флаги 0x301 */
+    put32(trun + 4, (uint32_t)ns);
+    for (int i = 0; i < ns; i++) { put32(trun + 12 + 8 * i, durs[i]); put32(trun + 16 + 8 * i, (uint32_t)samples[i].n); }
+    sbuf traf = {0}, moof = {0};
+    box(&traf, "tfhd", tfhd, sizeof tfhd);
+    box(&traf, "tfdt", tfdt, sizeof tfdt);
+    size_t moof_len = 8 + 8 + traf.n + 8 + trl;
+    put32(trun + 8, (uint32_t)(moof_len + 8));   /* данные — сразу за заголовком mdat */
+    box(&traf, "trun", trun, trl);
+    box(&moof, "traf", traf.s, traf.n);
+    sb_clear(segb);
+    box(segb, "moof", moof.s, moof.n);
+    sbuf mdat = {0};
+    for (int i = 0; i < ns; i++) sb_addn(&mdat, samples[i].s, samples[i].n);
+    box(segb, "mdat", mdat.s, mdat.n);
+    free(trun);
+    sb_free(&traf); sb_free(&moof); sb_free(&mdat);
+}
+
 static void up_answer(int c, const char *req) {
     char head[400];
     if (strstr(req, "GET /live/pl.m3u8")) {
         const char *pl = "#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"s\",NAME=\"Русские\",LANGUAGE=\"ru\",URI=\"subs/ru.m3u8\"\n"
+                         "#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS=\"avc1.64001f,mp4a.40.2,stpp.ttml.im1t\",SUBTITLES=\"s\"\nvar.m3u8\n"
                          "#EXT-X-TARGETDURATION:6\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:6,\nseg1.ts?x=1\n";
         snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nSet-Cookie: sid=abc; Domain=.provider.tv; Path=/; Secure; HttpOnly\r\n\r\n", strlen(pl));
         if (send(c, head, strlen(head), 0) < 0 || send(c, pl, strlen(pl), 0) < 0) {}
@@ -884,6 +939,14 @@ static void up_answer(int c, const char *req) {
         const char *v = "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:03.000\nПривет из WebVTT\n";
         snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", strlen(v));
         if (send(c, head, strlen(head), 0) < 0 || send(c, v, strlen(v), 0) < 0) {}
+    } else if (strstr(req, "GET /live/subs/im.m3u8")) {
+        const char *pl = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MAP:URI=\"im_init.mp4\"\n#EXTINF:6,\nim0.m4s\n#EXT-X-ENDLIST\n";
+        snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", strlen(pl));
+        if (send(c, head, strlen(head), 0) < 0 || send(c, pl, strlen(pl), 0) < 0) {}
+    } else if (strstr(req, "GET /live/subs/im_init.mp4") || strstr(req, "GET /live/subs/im0.m4s")) {
+        sbuf *b = strstr(req, "im_init") ? &IM.init : &IM.seg;
+        snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", b->n);
+        if (send(c, head, strlen(head), 0) < 0 || send(c, b->s, b->n, 0) < 0) {}
     } else if (strstr(req, "GET /live/chunked.ts")) {   /* длина неизвестна: куски */
         const char *h0 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
         if (send(c, h0, strlen(h0), 0) < 0) {}
@@ -1085,6 +1148,7 @@ static void test_relay_http(void) {
         char want[200];
         snprintf(want, sizeof want, "http://127.0.0.1:%d/live/subs/ru.m3u8", UP.port);
         EQS(vt[0].url, want);
+        EQS(vt[0].codec, "stpp");   /* CODECS варианта с этой группой */
         webvtt_clock(900000, 0);
         webvtt_start(vt[0].url, vt[0].hdr);
         for (int i = 0; i < 100 && !webvtt_cues(); i++) usleep(20000);
@@ -1095,6 +1159,16 @@ static void test_relay_http(void) {
         EQS(txt, "Привет из WebVTT");
         webvtt_stop();
         EQI(webvtt_cues(), 0);
+        /* IMSC в fMP4: инициализация из #EXT-X-MAP, время — по шкале потока */
+        char imu[200];
+        snprintf(imu, sizeof imu, "http://127.0.0.1:%d/live/subs/im.m3u8", UP.port);
+        webvtt_clock(11 * 90000, 11);
+        webvtt_start(imu, "User-Agent: Test/1\r\n");
+        for (int i = 0; i < 100 && !webvtt_cues(); i++) usleep(20000);
+        EQI(webvtt_cues(), 1);
+        webvtt_text_at(12 * 90000, txt, sizeof txt);
+        EQS(txt, "Привет из IMSC");
+        webvtt_stop();
     }
     relay_many(segurl);
     char bigsrc[300], bigurl[4096];
@@ -1549,6 +1623,65 @@ static void test_webvtt(void) {
     EQI(vt_s[0], 90000);
 }
 
+static void test_ttml(void) {
+    /* тики, кадры, вложенные div (время — от родителя), br, span, сущности, пробелы */
+    const char *x = "<?xml version=\"1.0\"?><!-- c --><tt xmlns=\"http://www.w3.org/ns/ttml\" xmlns:ttp=\"http://www.w3.org/ns/ttml#parameter\" "
+                    "ttp:tickRate=\"10000000\" ttp:frameRate=\"25\"><head><metadata>meta текст</metadata></head><body><div begin=\"10s\">"
+                    "<p begin=\"15000000t\" end=\"00:00:03.000\">Первая  <span tts:color=\"red\">строка</span><br/>\n  вторая &amp; &#x416;</p>"
+                    "<p begin=\"00:00:04:05\" dur=\"1s\">Кадры</p><p begin=\"5s\" end=\"5s\">пусто</p></div></body></tt>";
+    vt_n = 0;
+    EQI(ttml_parse(x, strlen(x), 100, vt_cb, NULL), 2);
+    EQI(vt_s[0], (int64_t)(111.5 * 90000));   /* 100 + 10 + 1,5 */
+    EQI(vt_e[0], (int64_t)(113.0 * 90000));
+    EQS(vt_t[0], "Первая строка\nвторая & Ж");
+    EQI(vt_s[1], (int64_t)(114.2 * 90000 + 0.5));   /* 4 с + 5 кадров по 25 */
+    EQI(vt_e[1], (int64_t)(115.2 * 90000 + 0.5));
+    EQS(vt_t[1], "Кадры");
+    /* fMP4 stpp: шкала 1000, tfdt 20 с; первый документ — время по шкале дорожки, второй — от начала образца */
+    sbuf sm[2] = {{0}, {0}}, init = {0}, segb = {0};
+    sb_add(&sm[0], "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><div><p begin=\"00:00:20.500\" end=\"00:00:21.500\">Абсолютное</p></div></body></tt>");
+    sb_add(&sm[1], "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><div><p begin=\"0.5s\" end=\"1.5s\">От образца</p></div></body></tt>");
+    uint32_t durs[2] = {2000, 2000};
+    mp4_build(&init, &segb, "stpp", 1000, 20000, sm, durs, 2);
+    mp4sub_init in;
+    CHECK(!mp4sub_init_parse((const uint8_t *)init.s, init.n, &in));
+    EQI(in.kind, MP4SUB_STPP);
+    EQI(in.timescale, 1000);
+    vt_n = 0;
+    EQI(webvtt_segment(segb.s, segb.n, &in, vt_cb, NULL), 2);
+    EQI(vt_s[0], (int64_t)(20.5 * 90000));
+    EQS(vt_t[0], "Абсолютное");
+    EQI(vt_s[1], (int64_t)(22.5 * 90000));   /* образец с 22 с + 0,5 */
+    EQI(vt_e[1], (int64_t)(23.5 * 90000));
+    /* fMP4 wvtt: vttc/payl на всю длину образца, vtte — пусто */
+    sbuf w[2] = {{0}, {0}}, pay = {0};
+    box(&pay, "payl", "Реплика <b>MP4</b>", strlen("Реплика <b>MP4</b>"));
+    box(&w[0], "vttc", pay.s, pay.n);
+    box(&w[1], "vtte", NULL, 0);
+    uint32_t wd[2] = {3000, 1000};
+    mp4_build(&init, &segb, "wvtt", 1000, 7000, w, wd, 2);
+    CHECK(!mp4sub_init_parse((const uint8_t *)init.s, init.n, &in));
+    EQI(in.kind, MP4SUB_WVTT);
+    vt_n = 0;
+    EQI(webvtt_segment(segb.s, segb.n, &in, vt_cb, NULL), 1);
+    EQI(vt_s[0], 7 * 90000);
+    EQI(vt_e[0], 10 * 90000);
+    EQS(vt_t[0], "Реплика MP4");
+    /* голый TTML-сегмент и WebVTT — тем же входом */
+    vt_n = 0;
+    EQI(webvtt_segment("\n<tt><body><p begin=\"1s\" end=\"2s\">XML</p></body></tt>", 52, NULL, vt_cb, NULL), 1);
+    EQI(vt_s[0], 90000);
+    for (int i = 0; i < 2; i++) { sb_free(&sm[i]); sb_free(&w[i]); }
+    sb_free(&pay);
+    /* для сквозной проверки загрузчика (test_relay_http): IMSC в fMP4 */
+    sb_add(&sm[0], "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><p begin=\"00:00:11.000\" end=\"00:00:13.000\">Привет из IMSC</p></body></tt>");
+    uint32_t d1[1] = {6000};
+    mp4_build(&IM.init, &IM.seg, "stpp", 1000, 10000, sm, d1, 1);
+    sb_free(&sm[0]);
+    sb_free(&init);
+    sb_free(&segb);
+}
+
 static void test_lang(void) {
     lang_set(LANG_RU);
     EQS(trp(S_CHANNELS_N, 1), "1 канал");
@@ -1625,6 +1758,7 @@ int main(void) {
     test_usb(dir);
     test_backup();
     test_tmdb();
+    test_ttml();
     test_teletext();
     test_dvbsub();
     test_webvtt();

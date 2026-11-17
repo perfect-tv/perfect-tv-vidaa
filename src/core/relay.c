@@ -329,6 +329,18 @@ static void hls_attr(const char *line, const char *name, char *out, size_t cap) 
 }
 /* #EXT-X-MEDIA:TYPE=SUBTITLES — запомнить (адрес провайдера, не ретранслятора) */
 static void note_subtitles(const char *line, const char *base, const char *headers) {
+    /* вариант: CODECS (stpp — TTML, wvtt — WebVTT) относится к его группе субтитров */
+    if (!strncmp(line, "#EXT-X-STREAM-INF:", 18)) {
+        char g[64], codecs[300];
+        hls_attr(line, "SUBTITLES", g, sizeof g);
+        hls_attr(line, "CODECS", codecs, sizeof codecs);
+        const char *c = strstr(codecs, "stpp") ? "stpp" : strstr(codecs, "wvtt") ? "wvtt" : NULL;
+        if (!g[0] || !c) return;
+        pthread_mutex_lock(&D.mu);
+        for (int i = 0; i < D.nvtt; i++) if (!strcmp(D.vtt[i].group, g)) snprintf(D.vtt[i].codec, sizeof D.vtt[i].codec, "%s", c);
+        pthread_mutex_unlock(&D.mu);
+        return;
+    }
     if (strncmp(line, "#EXT-X-MEDIA:", 13) || !strstr(line, "TYPE=SUBTITLES")) return;
     char uri[4096];
     hls_attr(line, "URI", uri, sizeof uri);
@@ -338,6 +350,7 @@ static void note_subtitles(const char *line, const char *base, const char *heade
     http_resolve(base, uri, v.url, sizeof v.url);
     hls_attr(line, "NAME", v.name, sizeof v.name);
     hls_attr(line, "LANGUAGE", v.lang, sizeof v.lang);
+    hls_attr(line, "GROUP-ID", v.group, sizeof v.group);
     snprintf(v.hdr, sizeof v.hdr, "%s", headers ? headers : "");
     pthread_mutex_lock(&D.mu);
     int known = 0;
