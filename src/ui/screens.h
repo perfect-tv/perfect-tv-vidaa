@@ -49,6 +49,9 @@ void form_playlist_phone(void);                     /* новый плейлис
 typedef void (*file_fn)(const char *path, int epg, void *ctx);
 void files_open(file_fn done, void *ctx);
 
+/* teletext.c — телетекст */
+void teletext_open(void);
+
 /* search.c — поиск */
 void search_open(void);
 void search_open_query(const char *q);              /* с готовым запросом */

@@ -130,6 +130,8 @@ int main(int argc, char **argv) {
             else if (!strcmp(a + 5, "menu")) tv_open_menu(T.cur, T.group, 0);
             else if (!strcmp(a + 5, "phone")) form_playlist_phone();
             else if (!strcmp(a + 5, "search")) search_open();
+            else if (!strcmp(a + 5, "teletext")) tv_teletext();
+            else if (!strcmp(a + 5, "subs")) tv_set_subtitles(1);
             else if (!strcmp(a + 5, "form")) form_playlist(-1);
             else if (!strcmp(a + 5, "files")) { form_playlist(-1); files_open(NULL, NULL); }
             run(0.1);

@@ -19,6 +19,9 @@ void http_init(const char *ca_pem, size_t ca_len);   /* один раз в гл�
 /* NULL — ошибка, причина в err («dns: …», «connect failed», «tls: …», «http_404», «timeout»). */
 hs *hs_open(const hs_req *rq, char *err, size_t errn);
 int hs_status(const hs *h);
+const char *hs_url(const hs *h);          /* адрес после редиректов */
+/* Относительный адрес ref от base (как браузер). */
+void http_resolve(const char *base, const char *ref, char *out, size_t cap);
 long long hs_length(const hs *h);         /* Content-Length или -1 */
 long long hs_received(const hs *h);       /* байтов тела прочитано */
 const char *hs_etag(const hs *h);

@@ -9,6 +9,21 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
+#include "core/http.h"
+
+/* адрес ретранслятора: читать его, как читал бы плеер (телетекст разбирается по пути) */
+static void *drain(void *arg) {
+    char *url = arg;
+    char err[120];
+    hs_req rq = {.url = url, .timeout_ms = 10000};
+    hs *h = hs_open(&rq, err, sizeof err);
+    char buf[16384];
+    while (h && hs_read(h, buf, sizeof buf) > 0) {}
+    if (h) hs_close(h);
+    free(url);
+    return NULL;
+}
 
 static double mono(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 
@@ -24,6 +39,10 @@ struct hmc_player *hmc_player_open(const char *url, const char *headers, double 
     h->opened = mono();
     h->base = start_s;
     snprintf(h->url, sizeof h->url, "%s", url);
+    if (!strncmp(url, "http://127.0.0.1:", 17)) {
+        pthread_t t;
+        if (!pthread_create(&t, NULL, drain, strdup(url))) pthread_detach(t);
+    }
     h->vod = strstr(url, "archive-") != NULL && !strstr(url, "-now");
     if (h->vod) {   /* archive-START-DURATION */
         const char *p = strstr(url, "archive-") + 8;

@@ -61,6 +61,7 @@ struct hs {
     int timeout, status, chunked, eof;
     long long length, received, chunk_left;
     char etag[160], last_modified[64], location[2048], error[120];
+    char final_url[4096];         /* после редиректов (база для относительных адресов HLS) */
     volatile int *cancel;
     /* буфер чтения сырых байтов */
     char buf[16384]; size_t bpos, blen;
@@ -367,6 +368,7 @@ hs *hs_open(const hs_req *rq, char *err, size_t errn) {
         if (!h->file) { snprintf(err, errn, "file: %s", strerror(errno)); free(h); return NULL; }
         h->status = 200;
         h->length = file_size(path);
+        snprintf(h->final_url, sizeof h->final_url, "%s", u);
         return h;
     }
     http_init(NULL, 0);
@@ -381,7 +383,7 @@ hs *hs_open(const hs_req *rq, char *err, size_t errn) {
             snprintf(cur, sizeof cur, "%s", h->location);
             continue;
         }
-        if (h->status == 200 || h->status == 304 || h->status == 206) return h;
+        if (h->status == 200 || h->status == 304 || h->status == 206) { snprintf(h->final_url, sizeof h->final_url, "%s", cur); return h; }
         snprintf(err, errn, "http_%d", h->status);
         conn_close(h);
         free(h);
@@ -394,6 +396,8 @@ hs *hs_open(const hs_req *rq, char *err, size_t errn) {
 }
 
 int hs_status(const hs *h) { return h->status; }
+const char *hs_url(const hs *h) { return h->final_url; }
+void http_resolve(const char *base, const char *ref, char *out, size_t cap) { resolve(base, ref, out, cap); }
 long long hs_length(const hs *h) { return h->length; }
 long long hs_received(const hs *h) { return h->received; }
 const char *hs_etag(const hs *h) { return h->etag; }

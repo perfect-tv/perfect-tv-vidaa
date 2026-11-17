@@ -15,7 +15,7 @@
 #include <string.h>
 
 enum { A_WATCH = 1, A_LIVE, A_FROM_START, A_SCHEDULE, A_FAV, A_RECENT, A_ABOUT, A_AUDIO, A_ASPECT, A_SLEEP, A_FAV_UP, A_FAV_DOWN,
-       A_HIDE, A_LOCK, A_CATEGORY, A_GUIDE, A_SEARCH, A_REMINDERS, A_LIST, A_PLAYLIST_EPG, A_HELP, A_SETTINGS,
+       A_HIDE, A_LOCK, A_CATEGORY, A_GUIDE, A_SEARCH, A_TELETEXT, A_SUBS, A_REMINDERS, A_LIST, A_PLAYLIST_EPG, A_HELP, A_SETTINGS,
        A_CAT_HIDE, A_CAT_LOCK, A_VIEW, A_ADAPTIVE, A_HIDDEN, A_PLAYLIST, A_REFRESH_PL, A_REFRESH_EPG };
 enum { P_MAIN, P_CATEGORY, P_LIST, P_PLAYLIST };
 enum { E_TILE, E_HEAD, E_ITEM };
@@ -66,6 +66,8 @@ static void build(void) {
         if (pi >= 0) add(E_ITEM, A_ABOUT, -1, 0, tr(S_ABOUT_PROGRAMME), NULL);
         if (playing && pl_audio_count() > 1) add(E_ITEM, A_AUDIO, -1, 0, tr(S_AUDIO_TRACKS), pl_audio_label(pl_audio_selected()));
         if (playing && !pl_software()) add(E_ITEM, A_ASPECT, -1, 0, tr(S_ASPECT), aspect_name(P.aspect));
+        if (playing) add(E_ITEM, A_TELETEXT, -1, 0, tr(S_TELETEXT), NULL);
+        if (playing) add(E_ITEM, A_SUBS, -1, 0, tr(S_SUBTITLES), tr(T.subs ? S_ON : S_OFF));
         add(E_ITEM, A_SLEEP, -1, 0, tr(S_SLEEP), sleep_name());
         add(E_HEAD, 0, -1, 0, tr(S_GROUP_CHANNEL), NULL);
         group *g = repo_group(M.group);
@@ -194,6 +196,8 @@ static void activate(ent *e, int dir) {
     case A_CATEGORY: M.main_focus = M.focus; M.page = P_CATEGORY; M.focus = 0; break;
     case A_GUIDE: close_menu(); tv_open_guide(); break;
     case A_SEARCH: close_menu(); search_open(); break;
+    case A_TELETEXT: close_menu(); tv_teletext(); break;
+    case A_SUBS: tv_set_subtitles(!T.subs); build(); break;
     case A_REMINDERS: close_menu(); tv_open_schedule(c, 1); break;
     case A_LIST: M.main_focus = M.focus; M.page = P_LIST; M.focus = 0; break;
     case A_PLAYLIST_EPG: M.main_focus = M.focus; M.page = P_PLAYLIST; M.focus = 0; break;

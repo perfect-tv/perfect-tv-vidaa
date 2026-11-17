@@ -5,6 +5,8 @@
 #include "layer.h"
 #include "screens.h"
 #include "u.h"
+#include "core/relay.h"
+#include "core/ttx.h"
 #include "core/clock.h"
 #include "core/lang.h"
 #include "core/prefs.h"
@@ -50,6 +52,22 @@ int64_t tv_position(void) {
 int64_t tv_behind(void) { return clock_now() - tv_position(); }
 
 /* ---------- открытие потока ---------- */
+/* с телетекстом / субтитрами — через ретранслятор: системный плеер эти дорожки отбрасывает */
+static void open_url(const char *url, const char *hdr, double start) {
+    if (T.tap) {
+        static char r[16384];
+        if (!relay_url(url, hdr, r, sizeof r)) {
+            relay_reset();
+            fprintf(stderr, "stream via relay\n");
+            pl_open(r, NULL, start);
+            return;
+        }
+        T.tap = T.subs = 0;
+        tv_toast(tr(S_TTX_NOT_HTTP));
+    }
+    pl_open(url, hdr, start);
+}
+
 static void start_stream(void) {
     channel *c = T.cur;
     if (!c) return;
@@ -59,7 +77,7 @@ static void start_stream(void) {
     T.why[0] = 0;
     T.opening_since = app_now();
     T.playing_since = 0;
-    if (!T.arc) { pl_open(c->url, hdr, 0); return; }
+    if (!T.arc) { open_url(c->url, hdr, 0); return; }
     int64_t now = clock_now(), t = T.arc_target;
     char tpl[4096], url[4096];
     if (catchup_template(c->url, c->cu_type, c->cu_source, tpl, sizeof tpl)) { tv_go_live(); return; }
@@ -82,7 +100,7 @@ static void start_stream(void) {
         catchup_prepare(tpl, t, now - t > 60 ? now - t : 60, now, clock_tz, url, sizeof url);
     }
     fprintf(stderr, "archive start=%lld at=%lld range=%d\n", (long long)T.arc_url_start, (long long)t, T.arc_range);
-    pl_open(url, hdr, start);
+    open_url(url, hdr, start);
 }
 
 static void request_open(double delay) {
@@ -102,7 +120,14 @@ static void remember(void) {
 
 static void really_play(channel *c, const char *gkey, int arc, int64_t t, double delay) {
     if (!c) return;
-    if (c != T.cur) { T.scored = 0; repo_add_history(c); }
+    if (c != T.cur) {
+        T.scored = 0;
+        repo_add_history(c);
+        /* субтитры включали на этом канале — поток сразу через ретранслятор */
+        char k[200];
+        snprintf(k, sizeof k, "subs.%s", c->key);
+        T.subs = T.tap = store_get(k) != NULL;
+    }
     T.cur = c;
     group *g = repo_group_of(c, gkey ? gkey : T.group[0] ? T.group : NULL);
     snprintf(T.group, sizeof T.group, "%s", g ? g->key : ALL_KEY);
@@ -355,6 +380,8 @@ int tv_key(int k, int ev) {
     case KEY_BACK: if (ev == EV_SHORT) back(); return 1;
     case KEY_GUIDE: case KEY_GREEN: tv_open_guide(); return 1;
     case KEY_SEARCH: search_open(); return 1;
+    case KEY_TEXT: tv_teletext(); return 1;
+    case KEY_SUBTITLE: tv_set_subtitles(!T.subs); tv_toast(tr(T.subs ? S_SUBS_ON : S_SUBS_OFF)); return 1;
     case KEY_INFO: case KEY_BLUE: if (info_visible() && T.info_pinned) T.info_expanded = !T.info_expanded; else tv_show_info(1); return 1;
     case KEY_LIST: tv_open_recent(); return 1;
     case KEY_RED: tv_open_schedule(T.cur, 0); return 1;
@@ -380,6 +407,56 @@ int tv_sleep_minutes(void) {
     if (!T.sleep_until) return 0;
     int m = (int)((T.sleep_until - app_now()) / 60 + 0.99);
     return m > 0 ? m : 0;
+}
+
+/* ---------- телетекст и субтитры ---------- */
+static void reopen_with_tap(void) {
+    if (T.tap || !T.cur) return;
+    T.tap = 1;
+    if (T.arc) T.arc_target = tv_position();
+    request_open(0.05);
+}
+void tv_teletext(void) {
+    if (!T.cur) return;
+    reopen_with_tap();
+    teletext_open();
+}
+void tv_set_subtitles(int on) {
+    if (!T.cur) return;
+    T.subs = on;
+    char k[200];
+    snprintf(k, sizeof k, "subs.%s", T.cur->key);
+    store_set(k, on ? "1" : NULL);
+    if (on) reopen_with_tap();
+    app_dirty();
+}
+
+/* время кадра в метках потока: первая метка, что видел ретранслятор, + позиция плеера */
+static int64_t frame_pts(void) {
+    int64_t base = relay_base_pts();
+    return base < 0 ? -1 : base + (int64_t)(pl_position() * 90000.0);
+}
+
+static void draw_subtitles(gfx_t *g, int bottom) {
+    if (!T.subs || !T.tap || !pl_has_picture()) return;
+    static ttx_page pg;
+    static ttx_grid gr;
+    static char text[2048];
+    int64_t pts = frame_pts();
+    if (pts < 0 || ttx_subtitle_at(relay_ttx(), pts, &pg)) return;
+    ttx_layout(&pg, NULL, &gr);
+    if (!ttx_subtitle_text(&gr, text, sizeof text)) return;
+    /* строки снизу вверх, каждая — на тёмной плашке */
+    const char *lines[8];
+    int n = 0;
+    for (char *p = text; *p && n < 8;) { lines[n++] = p; char *e = strchr(p, '\n'); if (!e) break; *e = 0; p = e + 1; }
+    int lh = d_line_h(1.9, F_S) + E(0.6), y = bottom - n * lh;
+    for (int i = 0; i < n; i++, y += lh) {
+        int w = d_text_w(1.9, F_S, lines[i]) + E(1.6);
+        if (w > SW - E(8)) w = SW - E(8);
+        d_round(g, (SW - w) / 2, y, w, lh - E(0.3), E(0.4), 0xc0000000u);
+        d_text_c(g, (SW - w) / 2, w, y + E(0.3), 1.9, F_S, C_WHITE, lines[i]);
+    }
 }
 
 /* ---------- плейлист ---------- */
@@ -479,6 +556,10 @@ void tv_tick(double now) {
     layer_tick_all(now);
     if (T.open_at && now >= T.open_at) { T.open_at = 0; start_stream(); }
     if (T.dig[0] && now - T.dig_at > DIGIT_SECONDS) digits_apply();
+    if (T.subs && T.tap) {   /* субтитры меняются по времени кадра */
+        static double next;
+        if (now >= next) { next = now + 0.25; app_dirty(); }
+    }
     if (T.seeking && T.seek_apply_at && now >= T.seek_apply_at) seek_apply();
     int st = pl_state();
     if (T.cur && !T.open_at) {
@@ -630,6 +711,7 @@ void tv_draw(gfx_t *g) {
             d_round(g, SW - E(4) - E(5), E(2.4), E(5), E(5), E(1), C_PANEL);
             d_spinner(g, SW - E(4) - E(2.5), E(4.9), E(1.4), now);
         }
+        draw_subtitles(g, info_visible() ? info_top() - E(1.2) : SH - E(4));
         if (!layer_count() || (layer_top() && layer_top()->name && !strcmp(layer_top()->name, "menu"))) {
             if (info_visible()) info_draw(g);
             if (T.carousel_until && !layer_count()) draw_carousel(g);

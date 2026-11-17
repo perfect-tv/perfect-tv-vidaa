@@ -8,6 +8,8 @@
 #include "core/phone.h"
 #include "core/qr.h"
 #include "core/usb.h"
+#include "core/relay.h"
+#include "core/ttx.h"
 #include "core/util.h"
 #include "data/catchup.h"
 #include "data/backup.h"
@@ -26,6 +28,8 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <pthread.h>
+#include "core/http.h"
 
 extern const unsigned char ptv_font_regular[], ptv_font_regular_end[], ptv_font_bold[], ptv_font_bold_end[];
 
@@ -765,6 +769,239 @@ static void test_tmdb(void) {
     free(h);
 }
 
+/* ---------- телетекст через разбор TS ---------- */
+static uint8_t ham(int n) {   /* Хэмминг 8/4, затем биты наоборот (как в PES) */
+    for (int b = 0; b < 256; b++) if (ttx_ham84((uint8_t)b) == n) {
+        int d1 = n & 1, d2 = (n >> 1) & 1, d3 = (n >> 2) & 1, d4 = (n >> 3) & 1;
+        int p1 = 1 ^ d1 ^ d3 ^ d4, p2 = 1 ^ d1 ^ d2 ^ d4, p3 = 1 ^ d1 ^ d2 ^ d3;
+        int low = p1 | (d1 << 1) | (p2 << 2) | (d2 << 3) | (p3 << 4) | (d3 << 5) | (d4 << 7), ones = 0;
+        for (int k = 0; k < 8; k++) ones += (low >> k) & 1;
+        return ttx_rev((uint8_t)(low | (((ones + 1) & 1) << 6)));
+    }
+    return 0;
+}
+/* блок данных телетекста: магазин, строка, 40 байт (для строки 0 первые 8 — Хэмминг) */
+static void ttx_unit(sbuf *b, int mag, int row, const uint8_t *data) {
+    uint8_t u[46] = {0x02, 44, 0x2C, 0xE4};
+    int addr = mag | (row << 3);
+    u[4] = ham(addr & 15);
+    u[5] = ham(addr >> 4);
+    for (int i = 0; i < 40; i++) u[6 + i] = ttx_rev(data[i]);
+    sb_addn(b, (const char *)u, 46);
+}
+static void ttx_head(sbuf *b, int mag, int page, int flags_s4) {
+    uint8_t d[40];
+    memset(d, 0x20, 40);
+    int nib[8] = {page & 15, (page >> 4) & 15, 0, 8 /* стирание */, 0, flags_s4, 0, 0};
+    for (int i = 0; i < 8; i++) d[i] = 0;   /* заполняется ниже — уже закодированным */
+    uint8_t row[40];
+    for (int i = 0; i < 40; i++) row[i] = 0x20;
+    memcpy(row + 8, "  NEWS  ", 8);
+    /* ttx_unit переворачивает биты — подаём заранее «развёрнутые» значения Хэмминга */
+    for (int i = 0; i < 8; i++) row[i] = ttx_rev(ham(nib[i]));
+    ttx_unit(b, mag, 0, row);
+}
+static void ts_put(sbuf *ts, int pid, int pusi, const uint8_t *pl, size_t n) {
+    size_t off = 0;
+    int first = 1;
+    static int cc;
+    while (off < n || first) {
+        uint8_t p[188];
+        size_t room = 184, take = n - off < room ? n - off : room;
+        p[0] = 0x47;
+        p[1] = (uint8_t)((pusi && first ? 0x40 : 0) | (pid >> 8));
+        p[2] = (uint8_t)pid;
+        if (take < room) {   /* добивка полем адаптации */
+            size_t af = room - take;
+            p[3] = (uint8_t)(0x30 | (cc++ & 15));
+            p[4] = (uint8_t)(af - 1);
+            if (af > 1) { p[5] = 0; memset(p + 6, 0xFF, af - 2); }
+            memcpy(p + 4 + af, pl + off, take);
+        } else {
+            p[3] = (uint8_t)(0x10 | (cc++ & 15));
+            memcpy(p + 4, pl + off, take);
+        }
+        sb_addn(ts, (const char *)p, 188);
+        off += take;
+        first = 0;
+    }
+}
+static void pes(sbuf *out, int sid, int64_t pts, const uint8_t *data, size_t n) {
+    uint8_t h[14] = {0, 0, 1, (uint8_t)sid, 0, 0, 0x80, 0x80, 5};
+    h[9] = (uint8_t)(0x21 | ((pts >> 29) & 0x0E));
+    h[10] = (uint8_t)(pts >> 22);
+    h[11] = (uint8_t)(0x01 | ((pts >> 14) & 0xFE));
+    h[12] = (uint8_t)(pts >> 7);
+    h[13] = (uint8_t)(0x01 | ((pts << 1) & 0xFE));
+    size_t len = n + 8;
+    h[4] = (uint8_t)(len >> 8);
+    h[5] = (uint8_t)len;
+    sb_addn(out, (const char *)h, 14);
+    sb_addn(out, (const char *)data, n);
+}
+/* поддельный «провайдер» для ретранслятора: плейлист HLS и сегмент */
+static struct { int fd, port; sbuf seg; } UP;
+static void *upstream(void *a) {
+    (void)a;
+    for (int k = 0; k < 8; k++) {
+        int c = accept(UP.fd, NULL, NULL);
+        if (c < 0) break;
+        char req[4096] = "";
+        size_t n = 0;
+        while (n < sizeof req - 1 && !strstr(req, "\r\n\r\n")) { ssize_t r = recv(c, req + n, sizeof req - 1 - n, 0); if (r <= 0) break; n += (size_t)r; req[n] = 0; }
+        char head[256];
+        if (strstr(req, "GET /live/pl.m3u8")) {
+            const char *pl = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:6,\nseg1.ts?x=1\n";
+            snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(pl));
+            if (send(c, head, strlen(head), 0) < 0 || send(c, pl, strlen(pl), 0) < 0) {}
+        } else if (strstr(req, "GET /live/seg1.ts?x=1") && strstr(req, "User-Agent: Test/1")) {
+            snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", UP.seg.n);
+            if (send(c, head, strlen(head), 0) < 0 || send(c, UP.seg.s, UP.seg.n, 0) < 0) {}
+        } else {
+            const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            if (send(c, nf, strlen(nf), 0) < 0) {}
+        }
+        close(c);
+    }
+    return NULL;
+}
+static char *fetch(const char *url, size_t *len) {
+    char err[120] = "";
+    hs_req rq = {.url = url, .timeout_ms = 5000};
+    hs *h = hs_open(&rq, err, sizeof err);
+    if (!h) { fprintf(stderr, "fetch: %s\n", err); return NULL; }
+    sbuf b = {0};
+    char buf[8192];
+    long r;
+    while ((r = hs_read(h, buf, sizeof buf)) > 0) sb_addn(&b, buf, (size_t)r);
+    hs_close(h);
+    *len = b.n;
+    return sb_take(&b);
+}
+static void test_relay_http(void) {
+    UP.fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET};
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    if (bind(UP.fd, (struct sockaddr *)&sa, sizeof sa) || listen(UP.fd, 8) || getsockname(UP.fd, (struct sockaddr *)&sa, &sl)) { printf("relay: нет сокета, пропуск\n"); return; }
+    UP.port = ntohs(sa.sin_port);
+    pthread_t th;
+    pthread_create(&th, NULL, upstream, NULL);
+    relay_reset();
+    char src[200], url[4096];
+    snprintf(src, sizeof src, "http://127.0.0.1:%d/live/pl.m3u8", UP.port);
+    CHECK(relay_url("udp://239.0.0.1:1234", NULL, url, sizeof url) != 0);   /* не HTTP — нельзя */
+    CHECK(!relay_url(src, "User-Agent: Test/1\r\n", url, sizeof url));
+    CHECK(starts_with(url, "http://127.0.0.1:"));
+    size_t n = 0;
+    char *pl = fetch(url, &n);
+    CHECK(pl && starts_with(pl, "#EXTM3U"));
+    /* сегмент и ключ — тоже через ретранслятор, адреса абсолютные, заголовки канала переданы */
+    char *seg = pl ? strstr(pl, "#EXTINF:6,\n") : NULL;
+    CHECK(pl && strstr(pl, "URI=\"http://127.0.0.1:") && strstr(pl, "key.bin"));
+    char segurl[4096] = "";
+    if (seg) { seg += strlen("#EXTINF:6,\n"); char *e = strchr(seg, '\n'); if (e) *e = 0; snprintf(segurl, sizeof segurl, "%s", seg); }
+    CHECK(starts_with(segurl, "http://127.0.0.1:") && strstr(segurl, "seg1.ts%3Fx%3D1") && strstr(segurl, "&h="));
+    free(pl);
+    char *body = segurl[0] ? fetch(segurl, &n) : NULL;
+    CHECK(body && n == UP.seg.n && !memcmp(body, UP.seg.s, n));   /* байты — как есть */
+    free(body);
+    CHECK(relay_has_teletext());   /* и попутно разобраны */
+    CHECK(relay_ts_bytes() >= (long long)UP.seg.n);
+    shutdown(UP.fd, SHUT_RDWR);
+    close(UP.fd);
+    pthread_join(th, NULL);
+}
+
+static void test_teletext(void) {
+    relay_reset();
+    sbuf ts = {0};
+    /* PAT: программа 1 -> PMT 0x100 */
+    uint8_t pat[] = {0, 0x00, 0xB0, 13, 0, 1, 0xC1, 0, 0, 0, 1, 0xE1, 0x00, 0, 0, 0, 0};
+    ts_put(&ts, 0, 1, pat, sizeof pat);
+    /* PMT: видео 0x102, телетекст 0x101 (rus, субтитры на 888) */
+    uint8_t pmt[] = {0, 0x02, 0xB0, 30, 0, 1, 0xC1, 0, 0, 0xE1, 0x02, 0xF0, 0,
+                     0x1B, 0xE1, 0x02, 0xF0, 0,
+                     0x06, 0xE1, 0x01, 0xF0, 7, 0x56, 5, 'r', 'u', 's', (2 << 3) | 0, 0x88,
+                     0, 0, 0, 0};
+    ts_put(&ts, 0x100, 1, pmt, sizeof pmt);
+    uint8_t es[4] = {0, 0, 1, 0xB3};
+    sbuf v = {0};
+    pes(&v, 0xE0, 900000, es, 4);
+    ts_put(&ts, 0x102, 1, (const uint8_t *)v.s, v.n);
+    /* страница 888 (субтитры, флаг C6): строка 1 — «Привет» в окне */
+    sbuf t = {0};
+    sb_addc(&t, 0x10);   /* data_identifier */
+    ttx_head(&t, 0, 0x88, 8);
+    uint8_t row[40];
+    memset(row, 0x20, 40);
+    const uint8_t text[] = {0x0B, 0x0B, 0x50, 0x72, 0x69, 0x77, 0x65, 0x74, 0x0A, 0x0A};
+    memcpy(row + 5, text, sizeof text);
+    ttx_unit(&t, 0, 1, row);
+    ttx_head(&t, 0, 0xFF, 0);   /* заполнитель: прежняя страница закончена */
+    sbuf tp = {0};
+    pes(&tp, 0xBD, 900000 + 180000, (const uint8_t *)t.s, t.n);
+    ts_put(&ts, 0x101, 1, (const uint8_t *)tp.s, tp.n);
+    ts_put(&ts, 0x101, 1, (const uint8_t *)tp.s, tp.n);   /* следующий PES завершает предыдущий */
+    if (getenv("PTV_DUMP_TS")) {   /* для проверки окна на ПК: ещё страница 100 — цвета, двойная высота, мозаика */
+        sbuf t2 = {0}, tp2 = {0}, all = {0};
+        sb_addc(&t2, 0x10);
+        ttx_head(&t2, 1, 0x00, 0);
+        uint8_t r1[40], r3[40], r5[40], r7[40], r9[40];
+        memset(r1, 0x20, 40); memset(r3, 0x20, 40); memset(r5, 0x20, 40); memset(r7, 0x20, 40); memset(r9, 0x20, 40);
+        const uint8_t t1[] = {0x0D, 0x03, 0x54, 0x45, 0x4C, 0x45, 0x54, 0x45, 0x4B, 0x53, 0x54};   /* ТЕЛЕТЕКСТ, двойная высота */
+        memcpy(r1 + 2, t1, sizeof t1);
+        const uint8_t t3[] = {0x06, 0x6E, 0x6F, 0x77, 0x6F, 0x73, 0x74, 0x69, 0x20, 0x31, 0x30, 0x31};   /* новости 101 */
+        memcpy(r3 + 2, t3, sizeof t3);
+        r5[1] = 0x11; for (int i = 2; i < 20; i++) r5[i] = (uint8_t)(0x20 | (i * 7 & 0x5F));
+        r5[20] = 0x1A; r5[21] = 0x12; for (int i = 22; i < 38; i++) r5[i] = 0x7F;
+        const uint8_t t7[] = {0x04, 0x1D, 0x07, 0x50, 0x6F, 0x67, 0x6F, 0x64, 0x61, 0x20, 0x20, 0x31, 0x30, 0x32};   /* синий фон: Погода 102 */
+        memcpy(r7 + 1, t7, sizeof t7);
+        const uint8_t t9[] = {0x01, 0x6B, 0x75, 0x72, 0x73, 0x79, 0x20, 0x77, 0x61, 0x6C, 0x60, 0x74, 0x20, 0x31, 0x30, 0x33};   /* курсы валют 103 */
+        memcpy(r9 + 2, t9, sizeof t9);
+        ttx_unit(&t2, 1, 1, r1); ttx_unit(&t2, 1, 3, r3); ttx_unit(&t2, 1, 5, r5); ttx_unit(&t2, 1, 7, r7); ttx_unit(&t2, 1, 9, r9);
+        ttx_head(&t2, 1, 0xFF, 0);
+        pes(&tp2, 0xBD, 900000 + 90000, (const uint8_t *)t2.s, t2.n);
+        sb_addn(&all, ts.s, ts.n);
+        ts_put(&all, 0x101, 1, (const uint8_t *)tp2.s, tp2.n);
+        ts_put(&all, 0x101, 1, (const uint8_t *)tp2.s, tp2.n);
+        file_write_atomic(getenv("PTV_DUMP_TS"), all.s, all.n);
+        sb_free(&t2); sb_free(&tp2); sb_free(&all);
+    }
+    for (size_t i = 0; i < ts.n; i += 77) relay_tap((const uint8_t *)ts.s + i, ts.n - i < 77 ? ts.n - i : 77);
+    CHECK(relay_has_teletext());
+    EQI(relay_base_pts(), 900000);
+    ttx *tx = relay_ttx();
+    ttx_page pg;
+    int nsub = 0;
+    CHECK(!ttx_get(tx, 0x888, -1, &pg, &nsub));
+    EQI(nsub, 1);
+    CHECK(pg.flags & TTXF_SUBTITLE);
+    CHECK(ttx_has_subtitles(tx));
+    CHECK(ttx_subtitle_at(tx, 900000, &pg) != 0);   /* раньше субтитра — ничего */
+    CHECK(!ttx_subtitle_at(tx, 900000 + 200000, &pg));
+    ttx_grid g;
+    ttx_layout(&pg, NULL, &g);
+    char out[400];
+    ttx_subtitle_text(&g, out, sizeof out);
+    EQS(out, "Привет");
+    uint8_t h0[40];
+    ttx_header_row(0x888, &pg, "", h0);
+    CHECK(!memcmp(h0 + 1, "P888", 4) && !memcmp(h0 + 8, "  NEWS", 6));
+    ttx_header_row(0x888, &pg, "12", h0);
+    CHECK(!memcmp(h0 + 1, "P12-", 4));
+    EQI(ttx_neighbour(tx, 0x100, 1), 0x888);
+    EQI(ttx_glyph(0x41, 0x24), 0x410);   /* «А» */
+    EQI(ttx_glyph(0x23, 0), 0xA3);       /* «£» в английском */
+    relay_reset();
+    CHECK(!relay_has_teletext() && ttx_count(relay_ttx()) == 0);
+    sb_free(&UP.seg);
+    sb_addn(&UP.seg, ts.s, ts.n);
+    test_relay_http();
+    sb_free(&UP.seg);
+    sb_free(&ts); sb_free(&v); sb_free(&t); sb_free(&tp);
+}
+
 static void test_lang(void) {
     lang_set(LANG_RU);
     EQS(trp(S_CHANNELS_N, 1), "1 канал");
@@ -841,6 +1078,7 @@ int main(void) {
     test_usb(dir);
     test_backup();
     test_tmdb();
+    test_teletext();
     test_lang();
     test_clock();
     char cmd[300];
