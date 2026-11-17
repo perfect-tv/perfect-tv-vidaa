@@ -94,17 +94,26 @@ static void ff_stop(struct hmc_player *h) {
 /* дорожки субтитров: ffprobe (как системный плеер — кодек и язык; язык — по-русски для известных) */
 static void probe_subs(struct hmc_player *h) {
     char cmd[17000];
+    /* у HLS ffprobe выводит поток дважды (ещё раз — в разделе программы) и пустые строки: номер потока — чтобы отсеять */
     snprintf(cmd, sizeof cmd, "env -u http_proxy -u HTTP_PROXY -u https_proxy -u HTTPS_PROXY ffprobe -v error -select_streams s "
-             "-show_entries stream=codec_name:stream_tags=language -of csv=p=0 '%s' 2>/dev/null", h->url);
+             "-show_entries stream=index,codec_name:stream_tags=language -of csv=p=0 '%s' 2>/dev/null", h->url);
     FILE *f = popen(cmd, "r");
     char line[200];
+    int seen[8], ns = 0;
     while (f && fgets(line, sizeof line, f) && h->nsub < 8) {
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
-        char *comma = strchr(line, ',');
+        char *codec = strchr(line, ',');
+        if (!line[0] || !codec || !codec[1]) continue;
+        *codec++ = 0;
+        int idx = atoi(line), dup = 0;
+        for (int k = 0; k < ns; k++) dup |= seen[k] == idx;
+        if (dup) continue;
+        seen[ns++] = idx;
+        char *comma = strchr(codec, ',');
         if (comma) *comma = 0;
         const char *lang = comma ? comma + 1 : "";
-        snprintf(h->sub_codec[h->nsub], 32, "%s", line);
+        snprintf(h->sub_codec[h->nsub], 32, "%s", codec);
         snprintf(h->sub_lang[h->nsub], 32, "%s", !strncmp(lang, "rus", 3) ? "Русский" : !strncmp(lang, "eng", 3) ? "Английский" : lang);
         h->nsub++;
     }
