@@ -7,6 +7,7 @@
 #include "core/unpack.h"
 #include "core/phone.h"
 #include "core/qr.h"
+#include "core/usb.h"
 #include "core/util.h"
 #include "data/catchup.h"
 #include "data/epg.h"
@@ -18,6 +19,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <zlib.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -626,6 +628,34 @@ static void test_phone(void) {
     CHECK(!phone_running());   /* одноразовая */
 }
 
+/* ---------- файлы с флешки ---------- */
+static void test_usb(const char *tmp) {
+    char d[600], p[700];
+    snprintf(d, sizeof d, "%s/usb", tmp);
+    mkdir(d, 0755);
+    const char *files[] = {"b.M3U", "a.m3u8", "guide.xml.gz", "photo.jpg", ".hidden.m3u", "list.txt"};
+    for (int i = 0; i < 6; i++) { snprintf(p, sizeof p, "%s/%s", d, files[i]); file_write_atomic(p, "x", 1); }
+    snprintf(p, sizeof p, "%s/Папка", d);
+    mkdir(p, 0755);
+    usb_entry *e;
+    int n = usb_list(d, &e);
+    EQI(n, 5);
+    if (n == 5) {
+        EQS(e[0].name, "Папка"); EQI(e[0].dir, 1);
+        EQS(e[1].name, "a.m3u8");
+        EQS(e[2].name, "b.M3U");
+        EQS(e[3].name, "guide.xml.gz");
+        EQS(e[4].name, "list.txt");
+    }
+    free(e);
+    CHECK(usb_is_epg("guide.xml.gz") && usb_is_epg("a.XMLTV") && !usb_is_epg("pl.m3u") && !usb_is_epg("x.gz"));
+    CHECK(usb_list("/nonexistent-dir", &e) < 0);
+    setenv("PTV_USB_ROOT", d, 1);
+    usb_root r[4];
+    CHECK(usb_roots(r, 4) >= 1 && !strcmp(r[0].path, d) && !strcmp(r[0].name, "usb"));
+    unsetenv("PTV_USB_ROOT");
+}
+
 static void test_lang(void) {
     lang_set(LANG_RU);
     EQS(trp(S_CHANNELS_N, 1), "1 канал");
@@ -699,6 +729,7 @@ int main(void) {
         big_epg(10000, 17, 300, 1);
     }
     test_phone();
+    test_usb(dir);
     test_lang();
     test_clock();
     char cmd[300];

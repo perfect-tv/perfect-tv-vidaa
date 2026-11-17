@@ -18,6 +18,7 @@
     "src/core/unpack.c",
     "src/core/qr.c",
     "src/core/phone.c",
+    "src/core/usb.c",
     "src/data/names.c",
     "src/data/m3u.c",
     "src/data/xmltv.c",
@@ -41,6 +42,7 @@
     "src/ui/kbd.c",
     "src/ui/form.c",
     "src/ui/phone.c",
+    "src/ui/files.c",
     "src/ui/search.c",
     "src/main.c"
   ],

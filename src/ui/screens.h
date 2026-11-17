@@ -45,6 +45,10 @@ typedef void (*text_fn)(const char *text, void *ctx);
 void form_text(const char *title, const char *initial, int multiline, text_fn done, void *ctx);
 void form_playlist_phone(void);                     /* новый плейлист и сразу окно ввода с телефона */
 
+/* files.c — файл с флешки; epg — файл программы XMLTV (по расширению) */
+typedef void (*file_fn)(const char *path, int epg, void *ctx);
+void files_open(file_fn done, void *ctx);
+
 /* search.c — поиск */
 void search_open(void);
 void search_open_query(const char *q);              /* с готовым запросом */

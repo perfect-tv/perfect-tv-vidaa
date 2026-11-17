@@ -131,6 +131,7 @@ int main(int argc, char **argv) {
             else if (!strcmp(a + 5, "phone")) form_playlist_phone();
             else if (!strcmp(a + 5, "search")) search_open();
             else if (!strcmp(a + 5, "form")) form_playlist(-1);
+            else if (!strcmp(a + 5, "files")) { form_playlist(-1); files_open(NULL, NULL); }
             run(0.1);
         } else if (!strncmp(a, "search:", 7)) { search_open_query(a + 7); run(0.1); }
         else if (!strncmp(a, "lang:", 5)) { P.lang = !strcmp(a + 5, "en") ? LANG_EN : LANG_RU; lang_set(P.lang); app_dirty(); }

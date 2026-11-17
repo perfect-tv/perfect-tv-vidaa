@@ -89,6 +89,9 @@ static void set_url(const char *t, void *c) {
         snprintf(PF.name, sizeof PF.name, "%s", s && s[1] ? s + 1 : t);
         char *q = strchr(PF.name, '?');
         if (q) *q = 0;
+        static const char *const ext[] = {".m3u8", ".m3u", ".txt"};   /* имя файла — без расширения */
+        for (int i = 0; i < 3; i++)
+            if (ends_with_ci(PF.name, ext[i]) && strlen(PF.name) > strlen(ext[i])) { PF.name[strlen(PF.name) - strlen(ext[i])] = 0; break; }
     }
 }
 static void set_epg(const char *t, void *c) {
@@ -142,8 +145,21 @@ static void del_yes(void *c) {
     }
 }
 
-/* кнопки: Сохранить, С телефона, [Удалить], Отмена */
-static int nbuttons(void) { return PF.index >= 0 ? 4 : 3; }
+/* кнопки: Сохранить, С телефона, С флешки, [Удалить], Отмена */
+enum { B_SAVE, B_PHONE, B_USB, B_DELETE };
+static int nbuttons(void) { return PF.index >= 0 ? 5 : 4; }
+static void from_usb(const char *path, int epg, void *c) {
+    (void)c;
+    if (epg) {
+        if (sl_find(&PF.epg, path) < 0) sl_add(&PF.epg, path);
+        if (PF.epg_mode == EPG_PLAYLIST) PF.epg_mode = EPG_BOTH;
+        tv_toast(tr(S_USB_EPG_ADDED));
+        return;
+    }
+    set_url(path, NULL);
+    PF.focus = buttons_row();
+    PF.btn = B_SAVE;
+}
 static void from_phone(const phone_result *r, void *c) {
     (void)c;
     if (r->name[0]) snprintf(PF.name, sizeof PF.name, "%s", r->name);
@@ -164,9 +180,10 @@ static int pf_key(layer *l, int k, int ev) {
     if (f == buttons_row()) {
         if (k == KEY_LEFT || k == KEY_RIGHT) PF.btn = CLAMP(PF.btn + (k == KEY_RIGHT ? 1 : -1), 0, nbuttons() - 1);
         else if (k == KEY_OK && ev == EV_SHORT) {
-            if (PF.btn == 0) save();
-            else if (PF.btn == 1) phone_open(from_phone, NULL);
-            else if (PF.index >= 0 && PF.btn == 2) confirm_open(trf(S_CONFIRM_DELETE, PF.name), tr(S_DELETE), del_yes, NULL);
+            if (PF.btn == B_SAVE) save();
+            else if (PF.btn == B_PHONE) phone_open(from_phone, NULL);
+            else if (PF.btn == B_USB) files_open(from_usb, NULL);
+            else if (PF.index >= 0 && PF.btn == B_DELETE) confirm_open(trf(S_CONFIRM_DELETE, PF.name), tr(S_DELETE), del_yes, NULL);
             else layer_pop(&PL);
         }
         return 1;
@@ -216,7 +233,7 @@ static void pf_draw(layer *l, gfx_t *g) {
         d_text(g, fx + E(1.2), ly + r * row + E(0.6), 1.05, F_R, C_TEXT3, ro, fw - E(2.4));
     }
     int by = y + h - E(4.6), bx = fx;
-    const char *b[4] = {tr(S_SAVE), tr(S_PHONE), PF.index >= 0 ? tr(S_DELETE) : tr(S_CANCEL), tr(S_CANCEL)};
+    const char *b[5] = {tr(S_SAVE), tr(S_PHONE), tr(S_USB), PF.index >= 0 ? tr(S_DELETE) : tr(S_CANCEL), tr(S_CANCEL)};
     for (int i = 0; i < nbuttons(); i++) {
         int foc = PF.focus == buttons_row() && PF.btn == i;
         int bw = d_text_w(1.25, F_S, b[i]) + E(3);
