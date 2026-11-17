@@ -496,6 +496,17 @@ hs *hs_open(const hs_req *rq, char *err, size_t errn) {
 
 int hs_status(const hs *h) { return h->status; }
 const char *hs_url(const hs *h) { return h->final_url; }
+int http_split_url(const char *url, http_url *out) {
+    url_t u;
+    if (parse_url(url, &u)) return -1;
+    snprintf(out->scheme, sizeof out->scheme, "%s", u.scheme);
+    snprintf(out->host, sizeof out->host, "%s", u.host);
+    snprintf(out->port, sizeof out->port, "%s", u.port);
+    snprintf(out->path, sizeof out->path, "%s", u.path);
+    snprintf(out->auth, sizeof out->auth, "%s", u.auth);
+    return 0;
+}
+void *http_ssl_ctx(int any) { http_init(NULL, 0); return any ? ctx_any : ctx_verify; }
 const char *hs_headers(const hs *h) { return h->resp; }
 void http_resolve(const char *base, const char *ref, char *out, size_t cap) { resolve(base, ref, out, cap); }
 long long hs_length(const hs *h) { return h->length; }

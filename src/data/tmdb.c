@@ -230,7 +230,7 @@ static void search_work(void *p) {
     if (!v4) { sb_add(&url, "&api_key="); urlenc(&url, j->key); }
     sb_add(&hdr, "Accept: application/json\r\n");
     if (v4) sb_printf(&hdr, "Authorization: Bearer %s\r\n", j->key);
-    hs_req rq = {.url = url.s, .headers = hdr.s, .timeout_ms = 10000};
+    hs_req rq = {.url = url.s, .headers = hdr.s, .timeout_ms = 10000, .keepalive = 1};   /* поиски подряд — одно соединение */
     hs *h = hs_open(&rq, j->err, sizeof j->err);
     sbuf body = {0};
     if (h) {

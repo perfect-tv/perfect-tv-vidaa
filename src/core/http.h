@@ -22,6 +22,11 @@ void http_init(const char *ca_pem, size_t ca_len);   /* один раз в гл�
 hs *hs_open(const hs_req *rq, char *err, size_t errn);
 int hs_status(const hs *h);
 const char *hs_url(const hs *h);          /* адрес после редиректов */
+/* Разбор адреса http(s): host без скобок IPv6, port — всегда (80/443 по умолчанию), auth — Basic в base64. */
+typedef struct { char scheme[8], host[256], port[8], path[4096], auth[300]; } http_url;
+int http_split_url(const char *url, http_url *out);
+/* Контекст TLS (SSL_CTX *): any — без проверки сертификата («Принимать любые сертификаты»). */
+void *http_ssl_ctx(int any);
 const char *hs_headers(const hs *h);      /* заголовки ответа «Имя: значение\r\n…» */
 /* Относительный адрес ref от base (как браузер). */
 void http_resolve(const char *base, const char *ref, char *out, size_t cap);

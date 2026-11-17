@@ -18,6 +18,7 @@
 #include "data/m3u.h"
 #include "data/names.h"
 #include "data/xmltv.h"
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -842,7 +843,7 @@ static void pes(sbuf *out, int sid, int64_t pts, const uint8_t *data, size_t n) 
 }
 /* поддельный «провайдер» для ретранслятора: плейлист HLS и сегмент; keep-alive, после 3 запросов на соединении
  * молча закрывает его (как сервер по пределу или простою) */
-static struct { int fd, port; sbuf seg; atomic_int conns, reqs; } UP;
+static struct { int fd, port; sbuf seg; atomic_int conns, reqs; atomic_llong big_sent; } UP;
 static void up_answer(int c, const char *req) {
     char head[400];
     if (strstr(req, "GET /live/pl.m3u8")) {
@@ -860,6 +861,17 @@ static void up_answer(int c, const char *req) {
         } else {
             snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", UP.seg.n);
             if (send(c, head, strlen(head), 0) < 0 || send(c, UP.seg.s, UP.seg.n, 0) < 0) {}
+        }
+    } else if (strstr(req, "GET /live/big.ts")) {   /* 64 МБ: сколько провайдер успел отдать, пока плеер не читает */
+        long long total = 64ll << 20;
+        snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\n\r\n", total);
+        if (send(c, head, strlen(head), 0) < 0) return;
+        static char blk[65536];
+        for (long long sent = 0; sent < total;) {
+            ssize_t w = send(c, blk, sizeof blk, MSG_NOSIGNAL);
+            if (w <= 0) break;
+            sent += w;
+            atomic_store(&UP.big_sent, sent);
         }
     } else if (strstr(req, "GET /live/chunked.ts")) {   /* длина неизвестна: куски */
         const char *h0 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
@@ -893,6 +905,75 @@ static void *upstream(void *a) {
     }
     return NULL;
 }
+static char *fetch(const char *url, size_t *len);
+/* потоки ретранслятора (имена ptv-relay / ptv-dns) */
+static int threads_now(void) {
+    int n = 0;
+    DIR *d = opendir("/proc/self/task");
+    struct dirent *e;
+    while (d && (e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char p[300], name[32] = "";
+        snprintf(p, sizeof p, "/proc/self/task/%s/comm", e->d_name);
+        FILE *f = fopen(p, "r");
+        if (f) { if (!fgets(name, sizeof name, f)) name[0] = 0; fclose(f); }
+        if (!strncmp(name, "ptv-", 4)) n++;
+    }
+    if (d) closedir(d);
+    return n;
+}
+static int relay_sock(const char *rurl) {
+    int port = atoi(strchr(rurl + 7, ':') + 1);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa)) { close(fd); return -1; }
+    char q[9000];
+    snprintf(q, sizeof q, "GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", strstr(rurl + 7, "/"));
+    if (send(fd, q, strlen(q), 0) < 0) {}
+    return fd;
+}
+/* 20 плееров сразу: все получают сегмент целиком, а потоков в процессе не прибавляется (один цикл событий) */
+static void relay_many(const char *segurl) {
+    int fds[20], th0 = threads_now(), thmax = th0;
+    size_t got[20] = {0};
+    for (int i = 0; i < 20; i++) fds[i] = relay_sock(segurl);
+    double end = mono_now() + 5;
+    int open_n = 20;
+    while (open_n && mono_now() < end) {
+        open_n = 0;
+        for (int i = 0; i < 20; i++) {
+            if (fds[i] < 0) continue;
+            char buf[8192];
+            ssize_t r = recv(fds[i], buf, sizeof buf, MSG_DONTWAIT);
+            if (r > 0) got[i] += (size_t)r;
+            if (r == 0) { close(fds[i]); fds[i] = -1; continue; }
+            open_n++;
+        }
+        int t = threads_now();
+        if (t > thmax) thmax = t;
+        usleep(2000);
+    }
+    int full = 0;
+    for (int i = 0; i < 20; i++) { if (got[i] > UP.seg.n) full++; if (fds[i] >= 0) close(fds[i]); }
+    EQI(full, 20);
+    EQI(thmax, 1);   /* один поток цикла; DNS 127.0.0.1 — из кэша, не поток на соединение */
+    (void)th0;
+}
+/* плеер не читает 64 МБ — ретранслятор не выкачивает их у провайдера; другой плеер тем временем обслужен */
+static void relay_backpressure(const char *bigurl, const char *segurl) {
+    int slow = relay_sock(bigurl);
+    usleep(800000);
+    long long sent = atomic_load(&UP.big_sent);
+    CHECK(sent > 0 && sent < (24ll << 20));   /* очередь ретранслятора (256 КБ) + буферы сокетов, а не всё */
+    double t = mono_now();
+    size_t n = 0;
+    char *b = fetch(segurl, &n);
+    CHECK(b && n == UP.seg.n && mono_now() - t < 2);
+    free(b);
+    close(slow);
+}
+
 /* несколько запросов в одном соединении с ретранслятором (keep-alive со стороны плеера) */
 static int two_on_one(const char *relay_url_a, const char *relay_url_b) {
     const char *pa = strstr(relay_url_a + 7, "/"), *pb = strstr(relay_url_b + 7, "/");
@@ -985,6 +1066,11 @@ static void test_relay_http(void) {
     snprintf(churl, sizeof churl, "http://127.0.0.1:%d/live/chunked.ts", UP.port);
     CHECK(!relay_url(churl, "User-Agent: Test/1\r\n", rch, sizeof rch));
     CHECK(two_on_one(segurl, rch) == 1);
+    relay_many(segurl);
+    char bigsrc[300], bigurl[4096];
+    snprintf(bigsrc, sizeof bigsrc, "http://127.0.0.1:%d/live/big.ts", UP.port);
+    CHECK(!relay_url(bigsrc, "User-Agent: Test/1\r\n", bigurl, sizeof bigurl));
+    relay_backpressure(bigurl, segurl);
     CHECK(relay_has_teletext());   /* и попутно разобраны */
     CHECK(relay_ts_bytes() >= (long long)UP.seg.n);
     shutdown(UP.fd, SHUT_RDWR);

@@ -3,6 +3,14 @@
 #include "http.h"
 #include "util.h"
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/tcp.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#include <sys/epoll.h>
+#include "prefs.h"
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -230,16 +238,6 @@ int relay_url(const char *url, const char *headers, char *out, size_t cap) {
     return ok ? 0 : -1;
 }
 
-static int send_all(int fd, const char *p, size_t n) {
-    while (n) {
-        ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
-        if (w <= 0) { if (w < 0 && errno == EINTR) continue; return -1; }
-        p += w;
-        n -= (size_t)w;
-    }
-    return 0;
-}
-
 /* адрес из плейлиста -> через ретранслятор */
 static void rewrite_uri(sbuf *o, const char *base, const char *ref, const char *headers) {
     char abs[4096];
@@ -276,12 +274,6 @@ static void rewrite_playlist(sbuf *o, const char *text, size_t n, const char *ba
         free(line);
         p = e < end ? e + 1 : end;
     }
-}
-
-static void reply_status(int fd, int code) {
-    char b[160];
-    snprintf(b, sizeof b, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", code, code == 404 ? "Not Found" : "Bad Gateway");
-    send_all(fd, b, strlen(b));
 }
 
 static int is_playlist(const char *s, size_t n) {
@@ -368,155 +360,831 @@ static const char *reason(int code) {
     }
 }
 
-#define MAX_CONN 16
-static atomic_int active;
+/* ================= цикл событий =================
+ * Один поток: epoll по всем сокетам, неблокирующие сокеты и TLS (SSL_ERROR_WANT_READ/WRITE). Соединение плеера (cl)
+ * получает запрос, к нему цепляется соединение с провайдером (up): адрес → connect → TLS → запрос → заголовки →
+ * тело. Плейлист HLS копится и переписывается, остальное — плееру как есть (известна длина — Content-Length,
+ * нет — кусками) и попутно в разбор TS. Плеер не успевает читать (в очереди > OUT_HIGH) — чтение у провайдера
+ * приостанавливается. Дочитанное соединение с провайдером — в пул (keep-alive). DNS (getaddrinfo блокирующий) —
+ * короткий поток на запрос, итог — через трубу в цикл; адреса кэшируются на минуту. Объекты, закрытые в обработке
+ * пачки событий, освобождаются после неё. */
+#define MAX_CLIENTS 64
+#define OUT_HIGH (256 * 1024)
+#define POOL_MAX 8
+#define T_CONNECT 20.0
+#define T_BODY 20.0
+#define T_IDLE 15.0
+#define T_POOL 20.0
+#define DNS_TTL 60.0
+#define NADDR 4
 
-static int send_chunk(int fd, const char *d, size_t n) {
-    char h[24];
-    snprintf(h, sizeof h, "%zx\r\n", n);
-    return send_all(fd, h, strlen(h)) || send_all(fd, d, n) || send_all(fd, "\r\n", 2);
+enum { K_LISTEN = 1, K_WAKE, K_CLIENT, K_UP };
+typedef struct { int kind; void *p; } tag;
+typedef struct cl cl;
+typedef struct up up;
+
+enum { U_RESOLVE, U_CONNECT, U_TLS, U_SEND, U_HEAD, U_BODY, U_IDLE };
+typedef struct dns_job dns_job;
+struct up {
+    tag t;
+    int fd, st, ev, dead, paused, reused, again;
+    SSL *ssl;
+    http_url u;
+    char key[300];
+    cl *c;
+    dns_job *dns;
+    struct sockaddr_storage addr[NADDR];
+    socklen_t alen[NADDR];
+    int naddr, ai;
+    sbuf req;
+    size_t req_off;
+    char *in;
+    size_t in_n, in_cap;
+    int status, chunked, server_close, phase;   /* phase: 0 — размер куска, 1 — данные, 2 — CRLF, 3 — трейлеры */
+    long long length, received, chunk_left;
+    sbuf headers;
+    char location[4096];
+    double deadline;
+    up *next;
+};
+struct cl {
+    tag t;
+    int fd, ev, dead, busy, finishing, keep;
+    char in[16384];
+    size_t in_n;
+    up *u;
+    char url[4096], chan[4096];
+    sbuf fwd;
+    int client_close, gen, redirects, no_pool;
+    int head_sent, decided, playlist, chunked_out, content_mpegurl;
+    sbuf head, body, out;
+    size_t out_off;
+    double deadline;
+    cl *next;
+};
+struct dns_job { char host[256], port[8]; up *u; int cancelled, n; struct sockaddr_storage a[NADDR]; socklen_t l[NADDR]; };
+typedef struct { char host[256], port[8]; struct sockaddr_storage a[NADDR]; socklen_t l[NADDR]; int n; double t; } dns_entry;
+
+static int ep = -1, wake_r = -1, wake_w = -1;
+static tag t_listen = {K_LISTEN, NULL}, t_wake = {K_WAKE, NULL};
+static cl *clients;
+static up *ups;
+static void *dead[256];
+static int ndead;
+static dns_entry dns_cache[16];
+static int nclients;
+
+static void set_ev(int fd, tag *t, int *cur, int want) {
+    if (fd < 0 || *cur == want) return;
+    struct epoll_event e = {.events = (uint32_t)want, .data.ptr = t};
+    epoll_ctl(ep, *cur < 0 ? EPOLL_CTL_ADD : EPOLL_CTL_MOD, fd, &e);
+    *cur = want;
+}
+static void bury(void *p) { if (ndead < (int)(sizeof dead / sizeof dead[0])) dead[ndead++] = p; else free(p); }
+
+/* ---------- провайдер ---------- */
+static void client_upstream_done(cl *c, int ok);
+static void client_upstream_failed(cl *c, int code);
+static void up_start_request(up *u);
+static void up_readable(up *u);
+
+static void up_free(up *u) {
+    if (u->dead) return;
+    u->dead = 1;
+    if (u->dns) u->dns->cancelled = 1;   /* поток DNS ещё работает: итог выбросит цикл */
+    if (u->fd >= 0) { epoll_ctl(ep, EPOLL_CTL_DEL, u->fd, NULL); }
+    if (u->ssl) SSL_free(u->ssl);
+    if (u->fd >= 0) close(u->fd);
+    u->fd = -1;
+    u->ssl = NULL;
+    for (up **pp = &ups; *pp; pp = &(*pp)->next) if (*pp == u) { *pp = u->next; break; }
+    sb_free(&u->req);
+    sb_free(&u->headers);
+    free(u->in);
+    bury(u);
 }
 
-/* Один запрос плеера (заголовки — до пустой строки, без неё). 1 — соединение можно оставить для следующего. */
-static int serve(int fd, char *req) {
-    char path[12000] = "";
-    if (sscanf(req, "GET %11999s", path) != 1 || strncmp(path, "/s?", 3)) { reply_status(fd, 404); return 0; }
-    int client_close = strcasestr(req, "\nConnection: close") != NULL;
-    char *url = malloc(4096), *hdr = malloc(4096);
-    query_get(path + 3, "u", url, 4096);
-    query_get(path + 3, "h", hdr, 4096);
-    /* заголовки запроса плеера (после строки запроса) — провайдеру, кроме заголовков соединения */
-    sbuf fwd = {0};
-    sb_add(&fwd, hdr);
-    char *hs0 = strstr(req, "\r\n");
-    if (hs0) each_line(hs0 + 2, req_fn, &fwd, hdr);
-    pthread_mutex_lock(&D.mu);
-    int gen = D.gen;
-    pthread_mutex_unlock(&D.mu);
-    volatile int cancel = 0;
-    hs_req rq = {.url = url, .headers = fwd.n ? fwd.s : NULL, .timeout_ms = 20000, .cancel = &cancel, .raw = 1, .keepalive = 1};
-    char err[120] = "";
-    hs *h = hs_open(&rq, err, sizeof err);
-    if (!h) {
-        int code = !strncmp(err, "http_", 5) ? atoi(err + 5) : 502;
-        reply_status(fd, code >= 300 && code < 600 ? code : 502);
-        fprintf(stderr, "relay_open_failed %s\n", strncmp(err, "http_", 5) ? "network" : err);
-        sb_free(&fwd); free(url); free(hdr);
-        return 0;
-    }
-    int status = hs_status(h), keep = 0;
-    sbuf head = {0};
-    sb_printf(&head, "HTTP/1.1 %d %s\r\n", status, reason(status));
-    each_line(hs_headers(h), resp_fn, &head, NULL);
-    const char *conn = client_close ? "Connection: close\r\n\r\n" : "Connection: keep-alive\r\n\r\n";
-    char *buf = malloc(65536);
-    long n = buf && status != 304 ? hs_read(h, buf, 65536) : 0;
-    const char *enc = strcasestr(hs_headers(h), "\nContent-Encoding:");
-    if (!enc && !strncasecmp(hs_headers(h), "Content-Encoding:", 17)) enc = hs_headers(h);
-    if (n > 0 && !enc && is_playlist(buf, (size_t)n)) {
-        /* HLS: адреса — через ретранслятор; длина — новая */
-        sbuf body = {0}, out = {0};
-        sb_addn(&body, buf, (size_t)n);
-        while ((n = hs_read(h, buf, 65536)) > 0 && body.n < PLAYLIST_MAX) sb_addn(&body, buf, (size_t)n);
-        rewrite_playlist(&out, body.s, body.n, hs_url(h), hdr);
-        sb_printf(&head, "Content-Length: %zu\r\n%s", out.n, conn);
-        keep = !send_all(fd, head.s, head.n) && !send_all(fd, out.s ? out.s : "", out.n) && n == 0;
-        sb_free(&body);
-        sb_free(&out);
-    } else if (n >= 0) {
-        long long len = status == 304 ? 0 : hs_length(h);
-        int chunked = len < 0;   /* длина неизвестна — куски, чтобы соединение пережило ответ */
-        if (chunked) sb_add(&head, "Transfer-Encoding: chunked\r\n");
-        else sb_printf(&head, "Content-Length: %lld\r\n", len);
-        sb_add(&head, conn);
-        int ok = !send_all(fd, head.s, head.n);
-        while (ok && n > 0) {
-            pthread_mutex_lock(&D.mu);
-            if (D.gen == gen) tap_locked((const uint8_t *)buf, (size_t)n);   /* прежняя ссылка — не разбирать */
-            pthread_mutex_unlock(&D.mu);
-            if (chunked ? send_chunk(fd, buf, (size_t)n) : send_all(fd, buf, (size_t)n)) { ok = 0; break; }   /* плеер закрыл */
-            n = hs_read(h, buf, 65536);
-        }
-        if (ok && n == 0 && chunked) ok = !send_all(fd, "0\r\n\r\n", 5);
-        keep = ok && n == 0;
-    }
-    sb_free(&head);
-    sb_free(&fwd);
-    free(buf);
-    hs_close(h);   /* дочитанное соединение к провайдеру — в пул */
-    free(url);
-    free(hdr);
-    return keep && !client_close;
+static void client_attach(cl *c);
+static void up_fail(up *u, int code) {
+    cl *c = u->c;
+    /* соединение из пула закрыто сервером в тот же миг — запрос ещё раз на новом */
+    int retry = c && u->reused && (u->st == U_SEND || u->st == U_HEAD) && !u->in_n && !c->head_sent && !c->no_pool;
+    u->c = NULL;
+    up_free(u);
+    if (!c) return;
+    c->u = NULL;
+    if (retry) { c->no_pool = 1; client_attach(c); return; }
+    client_upstream_failed(c, code);
 }
 
-static void *client(void *arg) {
-    int fd = (int)(intptr_t)arg;
-    struct timeval tv = {15, 0};   /* и предел простоя между запросами плеера */
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    if (atomic_fetch_add(&active, 1) >= MAX_CONN) {
-        const char *busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        send_all(fd, busy, strlen(busy));
-    } else {
-        char req[16384];
-        size_t rl = 0;
-        for (;;) {   /* keep-alive: запросы плеера один за другим */
-            char *end;
-            while (!(req[rl] = 0, end = strstr(req, "\r\n\r\n"))) {
-                if (rl + 1 >= sizeof req) { rl = 0; break; }
-                ssize_t r = recv(fd, req + rl, sizeof req - 1 - rl, 0);
-                if (r <= 0) { rl = 0; break; }
-                rl += (size_t)r;
-            }
-            if (!rl || !end) break;
-            size_t used = (size_t)(end - req) + 4;
-            *end = 0;
-            int keep = serve(fd, req);
-            memmove(req, req + used, rl - used);
-            rl -= used;
-            if (!keep) break;
-        }
+static int pool_count(void) { int n = 0; for (up *u = ups; u; u = u->next) n += u->st == U_IDLE; return n; }
+
+static void up_to_pool(up *u) {
+    u->c = NULL;
+    u->st = U_IDLE;
+    u->in_n = 0;
+    u->deadline = mono_now() + T_POOL;
+    if (pool_count() > POOL_MAX) {   /* самое старое — закрыть */
+        up *old = NULL;
+        for (up *x = ups; x; x = x->next) if (x->st == U_IDLE && x != u && (!old || x->deadline < old->deadline)) old = x;
+        if (old) up_free(old);
     }
-    atomic_fetch_sub(&active, 1);
-    close(fd);
+    set_ev(u->fd, &u->t, &u->ev, EPOLLIN | EPOLLRDHUP);   /* сервер закрыл — узнаем сразу */
+}
+
+static void dns_store(const char *host, const char *port_, const struct sockaddr_storage *a, const socklen_t *l, int n) {
+    int slot = 0;
+    for (int i = 0; i < 16; i++) {
+        if (!strcmp(dns_cache[i].host, host) && !strcmp(dns_cache[i].port, port_)) { slot = i; break; }
+        if (dns_cache[i].t < dns_cache[slot].t) slot = i;
+    }
+    dns_entry *e = &dns_cache[slot];
+    snprintf(e->host, sizeof e->host, "%s", host);
+    snprintf(e->port, sizeof e->port, "%s", port_);
+    e->n = n;
+    memcpy(e->a, a, sizeof e->a);
+    memcpy(e->l, l, sizeof e->l);
+    e->t = mono_now();
+}
+
+static void *dns_thread(void *arg) {
+    dns_job *j = arg;
+    pthread_setname_np(pthread_self(), "ptv-dns");
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (!getaddrinfo(j->host, j->port, &hints, &res)) {
+        for (struct addrinfo *a = res; a && j->n < NADDR; a = a->ai_next) {
+            memcpy(&j->a[j->n], a->ai_addr, a->ai_addrlen);
+            j->l[j->n++] = a->ai_addrlen;
+        }
+        freeaddrinfo(res);
+    }
+    if (write(wake_w, &j, sizeof j) != sizeof j) free(j);
     return NULL;
 }
 
-static void *acceptor(void *arg) {
-    (void)arg;
+static void up_connect_next(up *u) {
+    while (u->ai < u->naddr) {
+        int i = u->ai++;
+        int fd = socket(u->addr[i].ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0) continue;
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        if (connect(fd, (struct sockaddr *)&u->addr[i], u->alen[i]) && errno != EINPROGRESS) { close(fd); continue; }
+        u->fd = fd;
+        u->ev = -1;
+        u->st = U_CONNECT;
+        u->deadline = mono_now() + T_CONNECT;
+        set_ev(fd, &u->t, &u->ev, EPOLLOUT);
+        return;
+    }
+    fprintf(stderr, "relay_open_failed network\n");
+    up_fail(u, 502);
+}
+
+static void up_resolved(up *u) {
+    u->ai = 0;
+    if (!u->naddr) { fprintf(stderr, "relay_open_failed dns\n"); up_fail(u, 502); return; }
+    up_connect_next(u);
+}
+
+static void up_resolve(up *u) {
+    double now = mono_now();
+    for (int i = 0; i < 16; i++) {
+        dns_entry *e = &dns_cache[i];
+        if (e->n && now - e->t < DNS_TTL && !strcmp(e->host, u->u.host) && !strcmp(e->port, u->u.port)) {
+            memcpy(u->addr, e->a, sizeof u->addr);
+            memcpy(u->alen, e->l, sizeof u->alen);
+            u->naddr = e->n;
+            up_resolved(u);
+            return;
+        }
+    }
+    dns_job *j = calloc(1, sizeof *j);
+    if (!j) { up_fail(u, 502); return; }
+    snprintf(j->host, sizeof j->host, "%s", u->u.host);
+    snprintf(j->port, sizeof j->port, "%s", u->u.port);
+    j->u = u;
+    u->dns = j;
+    u->st = U_RESOLVE;
+    u->deadline = now + T_CONNECT;
+    pthread_t t;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&a, 128 * 1024);
+    if (pthread_create(&t, &a, dns_thread, j)) { u->dns = NULL; free(j); up_fail(u, 502); }
+    pthread_attr_destroy(&a);
+}
+
+static void dns_done(void) {
+    dns_job *j;
+    while (read(wake_r, &j, sizeof j) == sizeof j) {
+        if (j->cancelled) { free(j); continue; }
+        up *u = j->u;
+        u->dns = NULL;
+        memcpy(u->addr, j->a, sizeof u->addr);
+        memcpy(u->alen, j->l, sizeof u->alen);
+        u->naddr = j->n;
+        if (j->n) dns_store(j->host, j->port, j->a, j->l, j->n);
+        free(j);
+        up_resolved(u);
+    }
+}
+
+/* TLS: шаг рукопожатия; 1 — готово, 0 — ждём, -1 — ошибка */
+static int up_tls_step(up *u) {
+    int r = SSL_connect(u->ssl);
+    if (r == 1) return 1;
+    int e = SSL_get_error(u->ssl, r);
+    if (e == SSL_ERROR_WANT_READ) { set_ev(u->fd, &u->t, &u->ev, EPOLLIN); return 0; }
+    if (e == SSL_ERROR_WANT_WRITE) { set_ev(u->fd, &u->t, &u->ev, EPOLLOUT); return 0; }
+    long vr = SSL_get_verify_result(u->ssl);
+    const char *why = vr != X509_V_OK ? X509_verify_cert_error_string(vr) : ERR_reason_error_string(ERR_peek_last_error());
+    fprintf(stderr, "relay_tls_failed %s\n", why ? why : "handshake");
+    ERR_clear_error();
+    return -1;
+}
+
+static void up_send(up *u) {
+    while (u->req_off < u->req.n) {
+        size_t n = u->req.n - u->req_off;
+        ssize_t w;
+        if (u->ssl) {
+            int r = SSL_write(u->ssl, u->req.s + u->req_off, (int)n);
+            if (r <= 0) {
+                int e = SSL_get_error(u->ssl, r);
+                if (e == SSL_ERROR_WANT_WRITE) { set_ev(u->fd, &u->t, &u->ev, EPOLLOUT); return; }
+                if (e == SSL_ERROR_WANT_READ) { set_ev(u->fd, &u->t, &u->ev, EPOLLIN); return; }
+                ERR_clear_error();
+                up_fail(u, 502);
+                return;
+            }
+            w = r;
+        } else {
+            w = send(u->fd, u->req.s + u->req_off, n, MSG_NOSIGNAL);
+            if (w < 0) {
+                if (errno == EAGAIN || errno == EINTR) { set_ev(u->fd, &u->t, &u->ev, EPOLLOUT); return; }
+                up_fail(u, 502);
+                return;
+            }
+        }
+        u->req_off += (size_t)w;
+    }
+    u->st = U_HEAD;
+    u->in_n = 0;
+    u->deadline = mono_now() + T_CONNECT;
+    set_ev(u->fd, &u->t, &u->ev, EPOLLIN | EPOLLRDHUP);
+}
+
+static void up_after_connect(up *u) {
+    if (!strcmp(u->u.scheme, "https")) {
+        int any = P.any_cert;
+        SSL_CTX *ctx = http_ssl_ctx(any);
+        u->ssl = ctx ? SSL_new(ctx) : NULL;
+        if (!u->ssl) { up_fail(u, 502); return; }
+        SSL_set_fd(u->ssl, u->fd);
+        SSL_set_tlsext_host_name(u->ssl, u->u.host);
+        if (!any) X509_VERIFY_PARAM_set1_host(SSL_get0_param(u->ssl), u->u.host, 0);
+        u->st = U_TLS;
+        int r = up_tls_step(u);
+        if (r < 0) { up_fail(u, 502); return; }
+        if (!r) return;
+    }
+    u->st = U_SEND;
+    up_send(u);
+}
+
+/* запрос к провайдеру (заголовки — как у блокирующего клиента; соединение — keep-alive) */
+static void build_request(up *u, cl *c) {
+    sb_clear(&u->req);
+    u->req_off = 0;
+    sb_printf(&u->req, "GET %s HTTP/1.1\r\nHost: %s", u->u.path, u->u.host);
+    if ((!strcmp(u->u.scheme, "https") && strcmp(u->u.port, "443")) || (!strcmp(u->u.scheme, "http") && strcmp(u->u.port, "80")))
+        sb_printf(&u->req, ":%s", u->u.port);
+    sb_add(&u->req, "\r\n");
+    const char *f = c->fwd.s ? c->fwd.s : "";
+    if (!strcasestr(f, "user-agent:")) sb_add(&u->req, "User-Agent: PerfectTV/" PTV_VERSION " (VIDAA; native)\r\n");
+    if (strncasecmp(f, "accept:", 7) && !strcasestr(f, "\naccept:")) sb_add(&u->req, "Accept: */*\r\n");
+    sb_add(&u->req, "Accept-Encoding: identity\r\nConnection: keep-alive\r\n");
+    if (u->u.auth[0]) sb_printf(&u->req, "Authorization: Basic %s\r\n", u->u.auth);
+    sb_add(&u->req, f);
+    sb_add(&u->req, "\r\n");
+}
+
+static void up_start_request(up *u) {
+    cl *c = u->c;
+    build_request(u, c);
+    u->status = u->chunked = u->server_close = u->phase = 0;
+    u->length = -1;
+    u->received = u->chunk_left = 0;
+    u->in_n = 0;
+    u->location[0] = 0;
+    sb_clear(&u->headers);
+    u->paused = 0;
+    if (u->st == U_IDLE) { u->st = U_SEND; u->reused = 1; u->deadline = mono_now() + T_CONNECT; up_send(u); }   /* из пула */
+    else up_resolve(u);
+}
+
+/* Соединение к провайдеру для запроса клиента: из пула (тот же адрес и режим сертификатов) или новое. */
+static void client_attach(cl *c) {
+    http_url hu;
+    if (http_split_url(c->url, &hu)) { client_upstream_failed(c, 404); return; }
+    char key[300];
+    snprintf(key, sizeof key, "%s://%s:%s|%d", hu.scheme, hu.host, hu.port, P.any_cert);
+    up *u = NULL;
+    for (up *x = ups; x && !c->no_pool; x = x->next) if (x->st == U_IDLE && !x->dead && !strcmp(x->key, key)) { u = x; break; }
+    if (!u) {
+        u = calloc(1, sizeof *u);
+        if (!u) { client_upstream_failed(c, 502); return; }
+        u->t = (tag){K_UP, u};
+        u->fd = -1;
+        u->ev = -1;
+        u->st = -1;
+        snprintf(u->key, sizeof u->key, "%s", key);
+        u->next = ups;
+        ups = u;
+    }
+    u->u = hu;
+    u->c = c;
+    c->u = u;
+    up_start_request(u);
+}
+
+/* разбор заголовков ответа; 1 — готовы, 0 — ждём ещё, -1 — ошибка */
+static int up_parse_head(up *u) {
+    char *e = memmem(u->in, u->in_n, "\r\n\r\n", 4);
+    if (!e) return u->in_n > 64 * 1024 ? -1 : 0;
+    *e = 0;
+    char *line = u->in, *nl = strstr(line, "\r\n");
+    if (strncmp(line, "HTTP/", 5) || !strchr(line, ' ')) return -1;
+    u->status = atoi(strchr(line, ' ') + 1);
+    u->server_close = !strncmp(line, "HTTP/1.0", 8);
+    while (nl) {
+        line = nl + 2;
+        nl = strstr(line, "\r\n");
+        if (nl) *nl = 0;
+        char *colon = strchr(line, ':');
+        if (!colon) continue;
+        const char *v = colon + 1;
+        while (*v == ' ') v++;
+        size_t kl = (size_t)(colon - line);
+        if (kl == 14 && !strncasecmp(line, "Content-Length", 14)) u->length = atoll(v);
+        else if (kl == 17 && !strncasecmp(line, "Transfer-Encoding", 17)) u->chunked = strcasestr(v, "chunked") != NULL;
+        else if (kl == 10 && !strncasecmp(line, "Connection", 10)) u->server_close = strcasestr(v, "close") != NULL;
+        else if (kl == 8 && !strncasecmp(line, "Location", 8)) snprintf(u->location, sizeof u->location, "%s", v);
+        sb_add(&u->headers, line);
+        sb_add(&u->headers, "\r\n");
+    }
+    if (u->chunked) u->length = -1;
+    size_t used = (size_t)(e - u->in) + 4;
+    memmove(u->in, u->in + used, u->in_n - used);
+    u->in_n -= used;
+    return 1;
+}
+
+/* ---------- плеер ---------- */
+static void client_free(cl *c) {
+    if (c->dead) return;
+    c->dead = 1;
+    if (c->u) { c->u->c = NULL; up_free(c->u); c->u = NULL; }   /* недочитанное соединение в пул не идёт */
+    epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
+    close(c->fd);
+    for (cl **pp = &clients; *pp; pp = &(*pp)->next) if (*pp == c) { *pp = c->next; break; }
+    sb_free(&c->fwd);
+    sb_free(&c->head);
+    sb_free(&c->body);
+    sb_free(&c->out);
+    nclients--;
+    bury(c);
+}
+
+static size_t out_pending(cl *c) { return c->out.n - c->out_off; }
+
+static void client_flush(cl *c);
+
+static void out_add(cl *c, const char *d, size_t n) {
+    if (c->out_off && c->out_off == c->out.n) { sb_clear(&c->out); c->out_off = 0; }
+    else if (c->out_off > (1u << 20)) {   /* отправленное — выкинуть */
+        memmove(c->out.s, c->out.s + c->out_off, c->out.n - c->out_off);
+        c->out.n -= c->out_off;
+        c->out.s[c->out.n] = 0;
+        c->out_off = 0;
+    }
+    sb_addn(&c->out, d, n);
+}
+
+static void client_reply_simple(cl *c, int code) {
+    char b[200];
+    snprintf(b, sizeof b, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", code, reason(code));
+    out_add(c, b, strlen(b));
+    c->busy = 0;
+    c->finishing = 1;
+    c->keep = 0;
+    client_flush(c);
+}
+
+static void client_upstream_failed(cl *c, int code) {
+    if (c->head_sent) { client_free(c); return; }   /* ответ уже начат — только оборвать */
+    client_reply_simple(c, code);
+}
+
+/* заголовки ответа плееру; len < 0 — длина неизвестна (куски) */
+static void client_send_head(cl *c, up *u, long long len) {
+    sb_clear(&c->head);
+    sb_printf(&c->head, "HTTP/1.1 %d %s\r\n", u->status, reason(u->status));
+    each_line(u->headers.s ? u->headers.s : "", resp_fn, &c->head, NULL);
+    c->chunked_out = len < 0;
+    if (c->chunked_out) sb_add(&c->head, "Transfer-Encoding: chunked\r\n");
+    else sb_printf(&c->head, "Content-Length: %lld\r\n", len);
+    sb_add(&c->head, c->client_close ? "Connection: close\r\n\r\n" : "Connection: keep-alive\r\n\r\n");
+    out_add(c, c->head.s, c->head.n);
+    c->head_sent = 1;
+}
+
+/* кусок тела от провайдера */
+static void client_deliver(cl *c, up *u, const char *d, size_t n) {
+    if (!c->decided) {
+        int enc = u->headers.s && strcasestr(u->headers.s, "Content-Encoding:") && !strcasestr(u->headers.s, "Content-Encoding: identity");
+        c->playlist = !enc && (c->content_mpegurl || is_playlist(d, n));
+        c->decided = 1;
+        if (!c->playlist) client_send_head(c, u, u->length);
+    }
+    if (c->playlist) {
+        if (c->body.n + n > PLAYLIST_MAX) { client_upstream_failed(c, 502); return; }
+        sb_addn(&c->body, d, n);
+        return;
+    }
+    pthread_mutex_lock(&D.mu);
+    if (D.gen == c->gen) tap_locked((const uint8_t *)d, n);   /* прежняя ссылка — не разбирать */
+    pthread_mutex_unlock(&D.mu);
+    if (c->chunked_out) {
+        char h[24];
+        snprintf(h, sizeof h, "%zx\r\n", n);
+        out_add(c, h, strlen(h));
+        out_add(c, d, n);
+        out_add(c, "\r\n", 2);
+    } else out_add(c, d, n);
+}
+
+/* ответ провайдера кончился: плейлист — переписать и отдать, иначе — завершить куски */
+static void client_upstream_done(cl *c, int clean) {
+    up *u = c->u;
+    if (!c->decided) {   /* тела не было */
+        c->decided = 1;
+        client_send_head(c, u, 0);
+    } else if (c->playlist) {
+        sbuf out = {0};
+        rewrite_playlist(&out, c->body.s ? c->body.s : "", c->body.n, c->url, c->chan);
+        client_send_head(c, u, (long long)out.n);
+        out_add(c, out.s ? out.s : "", out.n);
+        sb_free(&out);
+    } else if (c->chunked_out) out_add(c, "0\r\n\r\n", 5);
+    c->u = NULL;
+    if (clean && !u->server_close && !u->in_n) up_to_pool(u);
+    else up_free(u);
+    c->busy = 0;
+    c->finishing = 1;
+    c->keep = !c->client_close;
+    client_flush(c);
+}
+
+/* тело из буфера провайдера: длина, куски или до закрытия */
+static void up_body(up *u, int eof) {
+    cl *c = u->c;
+    size_t pos = 0;
+    while (c && !c->dead && pos < u->in_n) {
+        if (!u->chunked) {
+            size_t take = u->in_n - pos;
+            if (u->length >= 0 && (long long)take > u->length - u->received) take = (size_t)(u->length - u->received);
+            client_deliver(c, u, u->in + pos, take);
+            pos += take;
+            u->received += (long long)take;
+            if (u->length >= 0 && u->received >= u->length) break;
+            continue;
+        }
+        if (u->phase == 0 || u->phase == 3) {
+            char *e = memmem(u->in + pos, u->in_n - pos, "\r\n", 2);
+            if (!e) break;
+            size_t ll = (size_t)(e - (u->in + pos));
+            if (u->phase == 0) {
+                u->chunk_left = strtoll(u->in + pos, NULL, 16);
+                u->phase = u->chunk_left > 0 ? 1 : 3;
+            } else if (!ll) { pos += 2; u->phase = 4; break; }   /* пустая строка после трейлеров — конец */
+            pos += ll + 2;
+        } else if (u->phase == 1) {
+            size_t take = u->in_n - pos;
+            if ((long long)take > u->chunk_left) take = (size_t)u->chunk_left;
+            client_deliver(c, u, u->in + pos, take);
+            pos += take;
+            u->chunk_left -= (long long)take;
+            if (!u->chunk_left) u->phase = 2;
+        } else if (u->phase == 2) {
+            if (u->in_n - pos < 2) break;
+            pos += 2;
+            u->phase = 0;
+        }
+    }
+    memmove(u->in, u->in + pos, u->in_n - pos);
+    u->in_n -= pos;
+    if (!c || c->dead) return;
+    int done = u->chunked ? u->phase == 4 : u->length >= 0 && u->received >= u->length;
+    if (done) { client_upstream_done(c, 1); return; }
+    if (eof) {
+        if (!u->chunked && u->length < 0) { u->server_close = 1; client_upstream_done(c, 0); }   /* до закрытия — норма */
+        else up_fail(u, 502);
+        return;
+    }
+    /* плеер не успевает — провайдера пока не читать */
+    if (!c->playlist && out_pending(c) > OUT_HIGH && !u->paused) { u->paused = 1; set_ev(u->fd, &u->t, &u->ev, EPOLLRDHUP); }
+    client_flush(c);
+}
+
+/* читать у провайдера, пока есть; потом — заголовки или тело */
+static void up_readable(up *u) {
+    int eof = 0;
     for (;;) {
-        int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
-        if (fd < 0) { if (errno == EINTR || errno == ECONNABORTED) continue; usleep(100000); continue; }
-        pthread_t t;
-        pthread_attr_t a;
-        pthread_attr_init(&a);
-        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-        pthread_attr_setstacksize(&a, 256 * 1024);
-        if (pthread_create(&t, &a, client, (void *)(intptr_t)fd)) close(fd);
-        pthread_attr_destroy(&a);
+        if (u->in_cap - u->in_n < 16384) {
+            size_t cap = u->in_cap ? u->in_cap * 2 : 65536;
+            if (cap > 1 << 20 && u->in_n + 16384 > 1 << 20) break;   /* хватит в этот раз */
+            char *n = realloc(u->in, cap);
+            if (!n) break;
+            u->in = n;
+            u->in_cap = cap;
+        }
+        ssize_t r;
+        size_t room = u->in_cap - u->in_n;
+        if (room > 65536) room = 65536;
+        if (u->ssl) {
+            int x = SSL_read(u->ssl, u->in + u->in_n, (int)room);
+            if (x <= 0) {
+                int e = SSL_get_error(u->ssl, x);
+                if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) break;
+                if (e == SSL_ERROR_ZERO_RETURN) { eof = 1; break; }
+                ERR_clear_error();
+                eof = 1;
+                break;
+            }
+            r = x;
+        } else {
+            r = recv(u->fd, u->in + u->in_n, room, 0);
+            if (r < 0) { if (errno == EAGAIN || errno == EINTR) break; eof = 1; break; }
+            if (r == 0) { eof = 1; break; }
+        }
+        u->in_n += (size_t)r;
+        if (u->st == U_BODY && u->in_n >= 65536) break;   /* отдать плееру, потом читать дальше */
+    }
+    if (u->st == U_IDLE) { up_free(u); return; }   /* в пуле: сервер закрыл или прислал лишнее */
+    /* TLS держит расшифрованное, о чём epoll не знает: дочитать на следующем проходе цикла */
+    u->again = !eof && u->ssl && SSL_pending(u->ssl) > 0;
+    u->deadline = mono_now() + T_BODY;
+    if (u->st == U_HEAD) {
+        int h = up_parse_head(u);
+        if (h < 0 || (!h && eof)) { up_fail(u, 502); return; }
+        u->reused = 0;   /* ответ пошёл — повтора уже не будет */
+        if (!h) return;
+        cl *c = u->c;
+        /* редирект — тем же клиентом по новому адресу */
+        if (u->status >= 300 && u->status < 400 && u->status != 304 && u->location[0] && c && c->redirects < 8) {
+            char next[4096];
+            http_resolve(c->url, u->location, next, sizeof next);
+            snprintf(c->url, sizeof c->url, "%s", next);
+            c->redirects++;
+            c->u = NULL;
+            u->c = NULL;
+            up_free(u);
+            client_attach(c);
+            return;
+        }
+        if (u->status >= 400 || (u->status != 200 && u->status != 206 && u->status != 304)) {
+            fprintf(stderr, "relay_open_failed http_%d\n", u->status);
+            up_fail(u, u->status >= 300 && u->status < 600 ? u->status : 502);
+            return;
+        }
+        if (c) {
+            const char *ct = u->headers.s ? strcasestr(u->headers.s, "Content-Type:") : NULL;
+            if (ct) {   /* только в строке Content-Type */
+                const char *e2 = strstr(ct, "\r\n");
+                char line[200];
+                snprintf(line, sizeof line, "%.*s", (int)(e2 ? (size_t)(e2 - ct) : strlen(ct)), ct);
+                c->content_mpegurl = strcasestr(line, "mpegurl") != NULL;
+            }
+        }
+        u->st = U_BODY;
+        if (u->status == 304 || u->length == 0) { u->length = 0; if (c) client_upstream_done(c, !eof); return; }
+    }
+    if (u->st == U_BODY) up_body(u, eof);
+}
+
+/* ---------- плеер: запросы ---------- */
+static void client_start(cl *c, char *req) {
+    char path[12000] = "";
+    if (sscanf(req, "GET %11999s", path) != 1 || strncmp(path, "/s?", 3)) { client_reply_simple(c, 404); return; }
+    c->client_close = strcasestr(req, "\nConnection: close") != NULL;
+    query_get(path + 3, "u", c->url, sizeof c->url);
+    query_get(path + 3, "h", c->chan, sizeof c->chan);
+    sb_clear(&c->fwd);
+    sb_add(&c->fwd, c->chan);
+    char *h0 = strstr(req, "\r\n");
+    if (h0) each_line(h0 + 2, req_fn, &c->fwd, c->chan);
+    pthread_mutex_lock(&D.mu);
+    c->gen = D.gen;
+    pthread_mutex_unlock(&D.mu);
+    c->busy = 1;
+    c->no_pool = 0;
+    c->redirects = c->head_sent = c->decided = c->playlist = c->chunked_out = c->content_mpegurl = 0;
+    sb_clear(&c->body);
+    c->deadline = 0;
+    set_ev(c->fd, &c->t, &c->ev, EPOLLRDHUP);   /* пока идёт ответ — только закрытие (и запись, если есть что) */
+    client_attach(c);
+}
+
+/* в буфере — полный запрос? тогда начать */
+static void client_next(cl *c) {
+    if (c->busy || c->finishing || c->dead) return;
+    c->in[c->in_n] = 0;
+    char *end = strstr(c->in, "\r\n\r\n");
+    if (!end) {
+        if (c->in_n >= sizeof c->in - 1) { client_free(c); return; }
+        c->deadline = mono_now() + T_IDLE;
+        set_ev(c->fd, &c->t, &c->ev, EPOLLIN | EPOLLRDHUP);
+        return;
+    }
+    size_t used = (size_t)(end - c->in) + 4;
+    char req[sizeof c->in];
+    memcpy(req, c->in, used - 4);
+    req[used - 4] = 0;
+    memmove(c->in, c->in + used, c->in_n - used);
+    c->in_n -= used;
+    client_start(c, req);
+}
+
+static void client_flush(cl *c) {
+    while (out_pending(c)) {
+        ssize_t w = send(c->fd, c->out.s + c->out_off, out_pending(c), MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EAGAIN || errno == EINTR) break;
+            client_free(c);   /* плеер закрыл */
+            return;
+        }
+        c->out_off += (size_t)w;
+    }
+    if (!out_pending(c)) { sb_clear(&c->out); c->out_off = 0; }
+    /* провайдер стоял — плеер догнал */
+    if (c->u && c->u->paused && out_pending(c) < OUT_HIGH / 2) {
+        up *u = c->u;
+        u->paused = 0;
+        set_ev(u->fd, &u->t, &u->ev, EPOLLIN | EPOLLRDHUP);
+        up_readable(u);   /* у TLS могли остаться расшифрованные данные, epoll о них не скажет */
+        if (c->dead) return;
+    }
+    if (out_pending(c)) { set_ev(c->fd, &c->t, &c->ev, EPOLLOUT | EPOLLRDHUP | (c->busy ? 0 : EPOLLIN)); return; }
+    if (c->finishing) {
+        c->finishing = 0;
+        if (!c->keep) { client_free(c); return; }
+        client_next(c);   /* keep-alive: следующий запрос (мог уже прийти) */
+        return;
+    }
+    set_ev(c->fd, &c->t, &c->ev, c->busy ? EPOLLRDHUP : EPOLLIN | EPOLLRDHUP);
+}
+
+static void client_event(cl *c, uint32_t ev) {
+    if (ev & EPOLLIN) {
+        ssize_t r = recv(c->fd, c->in + c->in_n, sizeof c->in - 1 - c->in_n, 0);
+        if (r == 0 || (r < 0 && errno != EAGAIN && errno != EINTR)) { client_free(c); return; }
+        if (r > 0) c->in_n += (size_t)r;
+    }
+    if ((ev & (EPOLLERR | EPOLLHUP)) || ((ev & EPOLLRDHUP) && !(ev & EPOLLIN))) { client_free(c); return; }
+    if (ev & EPOLLOUT) { client_flush(c); if (c->dead) return; }
+    client_next(c);
+}
+
+static void accept_all(void) {
+    for (;;) {
+        int fd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (fd < 0) return;
+        if (nclients >= MAX_CLIENTS) {
+            const char *busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            if (send(fd, busy, strlen(busy), MSG_NOSIGNAL) < 0) {}
+            close(fd);
+            continue;
+        }
+        cl *c = calloc(1, sizeof *c);
+        if (!c) { close(fd); continue; }
+        c->t = (tag){K_CLIENT, c};
+        c->fd = fd;
+        c->ev = -1;
+        c->next = clients;
+        clients = c;
+        nclients++;
+        c->deadline = mono_now() + T_IDLE;
+        set_ev(fd, &c->t, &c->ev, EPOLLIN | EPOLLRDHUP);
+    }
+}
+
+static void up_event(up *u, uint32_t ev) {
+    if (u->st == U_CONNECT) {
+        int e = 0;
+        socklen_t l = sizeof e;
+        getsockopt(u->fd, SOL_SOCKET, SO_ERROR, &e, &l);
+        if (e || (ev & (EPOLLERR | EPOLLHUP))) {   /* следующий адрес */
+            epoll_ctl(ep, EPOLL_CTL_DEL, u->fd, NULL);
+            close(u->fd);
+            u->fd = -1;
+            u->ev = -1;
+            up_connect_next(u);
+            return;
+        }
+        up_after_connect(u);
+        return;
+    }
+    if (u->st == U_TLS) {
+        int r = up_tls_step(u);
+        if (r < 0) up_fail(u, 502);
+        else if (r) { u->st = U_SEND; up_send(u); }
+        return;
+    }
+    if (u->st == U_SEND) { up_send(u); return; }
+    if (u->st == U_IDLE) { up_free(u); return; }   /* в пуле что-то пришло (обычно — закрытие) */
+    if (ev & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) up_readable(u);
+}
+
+static void timeouts(void) {
+    double now = mono_now();
+    for (up *u = ups, *n; u; u = n) {
+        n = u->next;
+        if (!u->dead && !u->paused && u->deadline && now > u->deadline) {
+            if (u->st == U_IDLE) up_free(u);
+            else { fprintf(stderr, "relay_timeout state=%d\n", u->st); up_fail(u, 504); }
+        }
+    }
+    for (cl *c = clients, *n; c; c = n) {
+        n = c->next;
+        if (!c->dead && !c->busy && !out_pending(c) && c->deadline && now > c->deadline) client_free(c);
+    }
+}
+
+static void *loop(void *arg) {
+    (void)arg;
+    pthread_setname_np(pthread_self(), "ptv-relay");
+    struct epoll_event ev[64];
+    for (;;) {
+        int pending = 0;
+        for (up *u = ups; u; u = u->next) pending |= u->again && !u->paused && !u->dead;
+        int n = epoll_wait(ep, ev, 64, pending ? 0 : 500);
+        for (int i = 0; i < n; i++) {
+            tag *t = ev[i].data.ptr;
+            if (t->kind == K_LISTEN) accept_all();
+            else if (t->kind == K_WAKE) dns_done();
+            else if (t->kind == K_CLIENT) { cl *c = t->p; if (!c->dead) client_event(c, ev[i].events); }
+            else if (t->kind == K_UP) { up *u = t->p; if (!u->dead) up_event(u, ev[i].events); }
+        }
+        for (up *u = ups, *nx; u; u = nx) {   /* дочитать TLS (список мог измениться — следующий берём заранее) */
+            nx = u->next;
+            if (u->again && !u->paused && !u->dead && (u->st == U_HEAD || u->st == U_BODY)) { u->again = 0; up_readable(u); }
+        }
+        timeouts();
+        for (int i = 0; i < ndead; i++) free(dead[i]);   /* после пачки: на них могли ссылаться её события */
+        ndead = 0;
     }
     return NULL;
 }
 
 int relay_start(void) {
-    if (lfd >= 0) return 0;
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -1;
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    for (int p = PORT; p < PORT + 10 && !port; p++) {
-        struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)p)};
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    if (lfd >= 0) { pthread_mutex_unlock(&mu); return 0; }
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    int one = 1, p[2] = {-1, -1};
+    if (fd >= 0) setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    for (int pp = PORT; fd >= 0 && pp < PORT + 10 && !port; pp++) {
+        struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)pp)};
         sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (!bind(fd, (struct sockaddr *)&sa, sizeof sa)) port = p;
+        if (!bind(fd, (struct sockaddr *)&sa, sizeof sa)) port = pp;
     }
-    if (!port || listen(fd, 16)) { close(fd); port = 0; return -1; }
+    ep = epoll_create1(EPOLL_CLOEXEC);
+    if (fd < 0 || !port || listen(fd, 32) || ep < 0 || pipe2(p, O_NONBLOCK | O_CLOEXEC)) {
+        if (fd >= 0) close(fd);
+        port = 0;
+        pthread_mutex_unlock(&mu);
+        return -1;
+    }
     lfd = fd;
+    wake_r = p[0];
+    wake_w = p[1];
+    struct epoll_event e = {.events = EPOLLIN, .data.ptr = &t_listen};
+    epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &e);
+    e.data.ptr = &t_wake;
+    epoll_ctl(ep, EPOLL_CTL_ADD, wake_r, &e);
     pthread_mutex_lock(&D.mu);
     init_once();
     pthread_mutex_unlock(&D.mu);
+    http_init(NULL, 0);
     pthread_t t;
-    if (pthread_create(&t, NULL, acceptor, NULL)) { close(lfd); lfd = -1; port = 0; return -1; }
+    if (pthread_create(&t, NULL, loop, NULL)) { close(lfd); lfd = -1; port = 0; pthread_mutex_unlock(&mu); return -1; }
     pthread_detach(t);
+    pthread_mutex_unlock(&mu);
     fprintf(stderr, "relay_start port=%d\n", port);
     return 0;
 }
