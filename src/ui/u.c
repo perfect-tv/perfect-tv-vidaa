@@ -89,6 +89,30 @@ void d_round(gfx_t *g, int x, int y, int w, int h, int r, uint32_t c) {
     }
 }
 
+/* скругление каждого угла своё: tl — левый верхний, дальше по часовой */
+void d_round4(gfx_t *g, int x, int y, int w, int h, int tl, int tr, int br, int bl, uint32_t c) {
+    if (w <= 0 || h <= 0) return;
+    int lim = (w < h ? w : h) / 2;
+    int rr[4] = {tl, tr, br, bl};
+    for (int k = 0; k < 4; k++) rr[k] = rr[k] < 0 ? 0 : rr[k] > lim ? lim : rr[k];
+    unsigned a = c >> 24;
+    for (int j = clipy0(g, y); j < clipy1(g, y + h); j++) {
+        uint32_t *row = g->px + (size_t)j * g->stride;
+        float py = j + 0.5f;
+        for (int i = clipx0(g, x); i < clipx1(g, x + w); i++) {
+            float px = i + 0.5f;
+            int left = px < x + w / 2.0f, top = py < y + h / 2.0f;
+            int k = top ? (left ? 0 : 1) : (left ? 3 : 2), r = rr[k];
+            unsigned cv = 255;
+            if (r > 0) {
+                float cx = left ? x + r : x + w - r, cy = top ? y + r : y + h - r;
+                if ((left ? px < cx : px > cx) && (top ? py < cy : py > cy)) cv = corner(px, py, cx, cy, (float)r);
+            }
+            if (cv) row[i] = over(row[i], c, a * cv / 255);
+        }
+    }
+}
+
 void d_stroke(gfx_t *g, int x, int y, int w, int h, int r, int t, uint32_t c) {
     if (w <= 0 || h <= 0 || t <= 0) return;
     if (r * 2 > w) r = w / 2;
@@ -475,19 +499,18 @@ void d_logo(gfx_t *g, const channel *c, int x, int y, int w, int h, int r, int b
         d_text_c(g, x, w, y + shift + (h - d_line_h(em, F_B)) / 2, em, F_B, 0xfff4f4f4u, c->mono);
     }
     if (badge && P.number_mode == NUM_BADGE && c->num > 0) {
-        /* как Logos.drawBadge у Android-версии: кегль — не мельче 0,9 em и 26 % высоты логотипа; бейдж отступает от угла
-         * подложки на 6 % высоты (не больше половины радиуса, не меньше 0,15 em), радиус вложенный. Цифры Onest на
-         * пятую часть выше цифр Roboto — кегль меньше, чтобы бейдж выглядел так же. */
+        /* как Logos.drawBadge у Android-версии: кегль — не мельче 0,9 em и 26 % высоты логотипа. Бейдж — вплотную
+         * к левому верхнему углу подложки: этот угол скруглён как у подложки, правый верхний и левый нижний — прямые,
+         * правый нижний скруглён (радиус подложки, не меньше четверти высоты бейджа). Цифры Onest на пятую часть
+         * выше цифр Roboto — кегль меньше, чтобы бейдж выглядел так же. */
         char n[16];
         snprintf(n, sizeof n, "%d", c->num);
         double size = h * 0.26 > E(0.9) ? h * 0.26 : E(0.9), em = size / EM * 0.82;
         int bh = (int)(size * 1.35), tw = d_text_w(em, F_B, n), bw = tw + (int)(size * 0.75);
         if (bw < bh * 6 / 5) bw = bh * 6 / 5;
-        double in = r * 0.5 < h * 0.06 ? r * 0.5 : h * 0.06;
-        if (in < EM * 0.15) in = EM * 0.15;
-        int m = (int)(in + 0.5), br = r - m > bh / 4 ? r - m : bh / 4;
+        int br = r > bh / 4 ? r : bh / 4;
         if (br > bh / 2) br = bh / 2;
-        d_round(g, x + m, y + m, bw, bh, br, C_NUM_PLATE);
-        d_text_c(g, x + m, bw, y + m + (bh - d_line_h(em, F_B)) / 2, em, F_B, WA(0.92), n);
+        d_round4(g, x, y, bw, bh, r, 0, br, 0, C_NUM_PLATE);
+        d_text_c(g, x, bw, y + (bh - d_line_h(em, F_B)) / 2, em, F_B, WA(0.92), n);
     }
 }
