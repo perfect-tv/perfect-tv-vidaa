@@ -1549,6 +1549,43 @@ static void test_dvbsub(void) {
 }
 
 /* ---------- DVB-субтитры на записанном потоке (PTV_DVBSUB_SAMPLE=файл.ts; без него — пропуск) ---------- */
+/* настоящая запись с закрытыми субтитрами (PTV_CC_SAMPLE=файл.ts, PTV_CC_NUM=1…4 или S1…): каждая смена показа —
+ * время от начала и строки */
+static void cc_sample(void) {
+    const char *path = getenv("PTV_CC_SAMPLE");
+    if (!path) return;
+    FILE *f = fopen(path, "rb");
+    if (!f) { printf("cc: нет файла\n"); return; }
+    relay_reset();
+    const char *num = getenv("PTV_CC_NUM");   /* 1…4 — CC1…CC4, S1… — сервис 708 */
+    if (num && *num == 'S') relay_cc_select(CC_708, atoi(num + 1));
+    else relay_cc_select(CC_608, num ? atoi(num) : 1);
+    static uint8_t buf[188 * 512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) relay_tap(buf, n);
+    fclose(f);
+    relay_cc cl[8];
+    int ncl = relay_cc_list(cl, 8);
+    printf("cc: каналов %d:", ncl);
+    for (int i = 0; i < ncl; i++) printf(" %s%d(%s)", cl[i].kind == CC_608 ? "CC" : "S", cl[i].num, cl[i].lang);
+    printf("\n");
+    cc_show sh, prev;
+    memset(&prev, 0, sizeof prev);
+    prev.pts = -1;
+    int64_t base = relay_base_pts();
+    for (int64_t t = base; t < base + 90000LL * 600; t += 3003) {
+        int r = relay_cc_at(t, &sh);
+        if (!r) sh.n = 0;
+        if (sh.n == prev.n && (!sh.n || sh.pts == prev.pts)) continue;
+        printf("cc %7.3f с:", (t - base) / 90000.0);
+        for (int i = 0; i < sh.n; i++) printf(" [стр %2d кол %2d %08x%s] «%s»", (int)(sh.row[i].y * 15 + 0.5) + 1, (int)(sh.row[i].x * 32 + 0.5), sh.row[i].color, sh.row[i].italic ? " курсив" : "", sh.row[i].text);
+        printf("\n");
+        prev = sh;
+        if (!sh.n) prev.pts = -1;
+    }
+    relay_reset();
+}
+
 static void dvbsub_sample(void) {
     const char *path = getenv("PTV_DVBSUB_SAMPLE"), *out = getenv("PTV_DVBSUB_OUT");
     if (!path) return;
@@ -1902,6 +1939,7 @@ int main(void) {
     test_dvbsub();
     test_webvtt();
     dvbsub_sample();
+    cc_sample();
     test_lang();
     test_clock();
     char cmd[300];
