@@ -475,13 +475,19 @@ void d_logo(gfx_t *g, const channel *c, int x, int y, int w, int h, int r, int b
         d_text_c(g, x, w, y + shift + (h - d_line_h(em, F_B)) / 2, em, F_B, 0xfff4f4f4u, c->mono);
     }
     if (badge && P.number_mode == NUM_BADGE && c->num > 0) {
+        /* как Logos.drawBadge у Android-версии: кегль — не мельче 0,9 em и 26 % высоты логотипа; бейдж отступает от угла
+         * подложки на 6 % высоты (не больше половины радиуса, не меньше 0,15 em), радиус вложенный. Цифры Onest на
+         * пятую часть выше цифр Roboto — кегль меньше, чтобы бейдж выглядел так же. */
         char n[16];
         snprintf(n, sizeof n, "%d", c->num);
-        double em = h / EM * 0.22;
-        if (em < 0.9) em = 0.9;
-        if (em > 1.2) em = 1.2;
-        int tw = d_text_w(em, F_B, n), bh = (int)(em * EM * 1.5), bw = tw + (int)(em * EM * 1.2), m = E(0.25);
-        d_round(g, x + m, y + m, bw, bh, r - m > 1 ? r - m : 1, C_NUM_PLATE);
-        d_text_c(g, x + m, bw, y + m + (bh - d_line_h(em, F_B)) / 2, em, F_B, C_WHITE, n);
+        double size = h * 0.26 > E(0.9) ? h * 0.26 : E(0.9), em = size / EM * 0.82;
+        int bh = (int)(size * 1.35), tw = d_text_w(em, F_B, n), bw = tw + (int)(size * 0.75);
+        if (bw < bh * 6 / 5) bw = bh * 6 / 5;
+        double in = r * 0.5 < h * 0.06 ? r * 0.5 : h * 0.06;
+        if (in < EM * 0.15) in = EM * 0.15;
+        int m = (int)(in + 0.5), br = r - m > bh / 4 ? r - m : bh / 4;
+        if (br > bh / 2) br = bh / 2;
+        d_round(g, x + m, y + m, bw, bh, br, C_NUM_PLATE);
+        d_text_c(g, x + m, bw, y + m + (bh - d_line_h(em, F_B)) / 2, em, F_B, WA(0.92), n);
     }
 }
