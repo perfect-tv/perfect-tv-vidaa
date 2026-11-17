@@ -36,9 +36,15 @@ int ttx_neighbour(ttx *t, int number, int dir);
 /* Страница субтитров, показанная на кадре pts (последняя не позже); 0 — есть. */
 int ttx_subtitle_at(ttx *t, int64_t pts, ttx_page *out);
 int ttx_has_subtitles(ttx *t);
+/* номер страницы субтитров (0 — ещё не определена); объявлены ли субтитры в потоке (дескриптор / страница) */
+int ttx_subtitle_number(ttx *t);
+int ttx_subtitles_known(ttx *t);
+/* принятые номера страниц по возрастанию (без повторов); сколько */
+int ttx_numbers(ttx *t, uint16_t *out, int max);
 
 /* ---- раскладка ---- */
-enum { TA_MOSAIC = 1 << 6, TA_SEPARATED = 1 << 7, TA_DH = 1 << 8, TA_DH_BOTTOM = 1 << 9, TA_CONCEAL = 1 << 11, TA_BOX = 1 << 12 };
+enum { TA_MOSAIC = 1 << 6, TA_SEPARATED = 1 << 7, TA_DH = 1 << 8, TA_DH_BOTTOM = 1 << 9, TA_FLASH = 1 << 10, TA_CONCEAL = 1 << 11,
+       TA_BOX = 1 << 12, TA_DW = 1 << 13, TA_DW_RIGHT = 1 << 14 };
 typedef struct { uint32_t ch[TTX_COLS * TTX_ROWS]; uint16_t attr[TTX_COLS * TTX_ROWS]; } ttx_grid;   /* attr: fg 0–2, bg 3–5, TA_* */
 /* row0 — строка 0 (заголовок «P100 …»), NULL — пустая */
 void ttx_layout(const ttx_page *p, const uint8_t *row0, ttx_grid *g);

@@ -27,6 +27,8 @@ static int_pref *ints(int *n) {
         {"playlist_hours", &P.playlist_hours, 24},
         {"any_cert", &P.any_cert, 1},
         {"relay_all", &P.relay_all, 1},
+        {"ttx_keypad", &P.ttx_keypad, 0},
+        {"ttx_mix", &P.ttx_mix, 1},
         {"logo_priority", &P.logo_priority, 0},
         {"aspect", &P.aspect, ASPECT_FIT},
         {"remind_before", &P.remind_before, 1},

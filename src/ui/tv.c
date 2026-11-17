@@ -451,6 +451,8 @@ int tv_sleep_minutes(void) {
 }
 
 /* ---------- телетекст и субтитры ---------- */
+int tv_has_teletext(void) { return T.relayed && relay_has_teletext(); }
+int tv_has_subtitles(void) { return tv_has_teletext() && ttx_subtitles_known(relay_ttx()); }
 static void reopen_with_tap(void) {
     if (T.tap || !T.cur) return;
     T.tap = 1;
@@ -460,6 +462,8 @@ static void reopen_with_tap(void) {
 }
 void tv_teletext(void) {
     if (!T.cur) return;
+    /* поток уже разобран, а дорожки нет — так и сказать (PMT приходит в первые доли секунды) */
+    if (T.relayed && !relay_has_teletext() && relay_ts_bytes() > 512 * 1024) { tv_toast(tr(relay_has_dvbsub() ? S_TTX_DVB_ONLY : S_TTX_NONE)); return; }
     reopen_with_tap();
     teletext_open();
 }
@@ -474,7 +478,7 @@ void tv_set_subtitles(int on) {
 }
 
 /* время кадра в метках потока: первая метка, что видел ретранслятор, + позиция плеера */
-static int64_t frame_pts(void) {
+int64_t tv_frame_pts(void) {
     int64_t base = relay_base_pts();
     return base < 0 ? -1 : base + (int64_t)(pl_position() * 90000.0);
 }
@@ -484,7 +488,7 @@ static void draw_subtitles(gfx_t *g, int bottom) {
     static ttx_page pg;
     static ttx_grid gr;
     static char text[2048];
-    int64_t pts = frame_pts();
+    int64_t pts = tv_frame_pts();
     if (pts < 0 || ttx_subtitle_at(relay_ttx(), pts, &pg)) return;
     ttx_layout(&pg, NULL, &gr);
     if (!ttx_subtitle_text(&gr, text, sizeof text)) return;

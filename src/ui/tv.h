@@ -73,6 +73,10 @@ void tv_restart(void);               /* после восстановления 
 void tv_teletext(void);              /* открыть телетекст (поток — через ретранслятор) */
 void tv_set_subtitles(int on);       /* субтитры телетекста поверх видео (запоминается за каналом) */
 int tv_direct_count(void);           /* каналов с прямым подключением */
+int64_t tv_frame_pts(void);          /* время кадра в метках потока (90 кГц); -1 — неизвестно */
+/* в потоке есть телетекст / субтитры телетекста (поток через ретранслятор и уже разобран) */
+int tv_has_teletext(void);
+int tv_has_subtitles(void);
 void tv_direct_reset(void);
 /* Шаг по категории: +1 / -1, с пропуском закрытых при отмене PIN. */
 channel *tv_neighbour(int dir);

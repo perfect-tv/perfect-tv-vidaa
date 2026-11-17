@@ -1157,6 +1157,24 @@ static void test_teletext(void) {
     ttx_header_row(0x888, &pg, "12", h0);
     CHECK(!memcmp(h0 + 1, "P12-", 4));
     EQI(ttx_neighbour(tx, 0x100, 1), 0x888);
+    uint16_t nums[8];
+    EQI(ttx_numbers(tx, nums, 8), 1);
+    EQI(nums[0], 0x888);
+    EQI(ttx_subtitle_number(tx), 0x888);
+    CHECK(ttx_subtitles_known(tx));
+    /* двойная ширина (0x0E): знак на две ячейки, у правой своего нет; мигание (0x08) — со следующей ячейки */
+    {
+        ttx_page dp;
+        memset(&dp, 0, sizeof dp);
+        dp.has[2] = 1;
+        memset(dp.rows[2], 0x20, 40);
+        const uint8_t r2[] = {0x0E, 'A', 'B', 0x0C, 0x08, 'C'};
+        memcpy(dp.rows[2], r2, sizeof r2);
+        ttx_grid dg;
+        ttx_layout(&dp, NULL, &dg);
+        CHECK((dg.attr[80 + 1] & TA_DW) && (dg.attr[80 + 2] & TA_DW_RIGHT) && !(dg.attr[80 + 5] & TA_DW));
+        CHECK(!(dg.attr[80 + 4] & TA_FLASH) && (dg.attr[80 + 5] & TA_FLASH));
+    }
     EQI(ttx_glyph(0x41, 0x24), 0x410);   /* «А» */
     EQI(ttx_glyph(0x23, 0), 0xA3);       /* «£» в английском */
     relay_reset();

@@ -74,6 +74,9 @@ void info_draw(gfx_t *g) {
     if (quality_badge(b, sizeof b)) bx += d_badge(g, bx, ny, 1.1, C_FILL_BTN, C_WHITE, -1, b) + E(0.5);
     if (pl_software() && pl_has_picture()) bx += d_badge(g, bx, ny, 1.1, C_FILL_BTN, C_WHITE, -1, "SW") + E(0.5);
     if (pl_audio_count() > 1) { snprintf(b, sizeof b, tr(S_AUDIO_N), pl_audio_count()); bx += d_badge(g, bx, ny, 1.1, C_FILL_BTN, C_WHITE, -1, b) + E(0.5); }
+    /* как у Android-версии: субтитры и телетекст в потоке (известно, когда поток идёт через ретранслятор) */
+    if (tv_has_subtitles()) bx += d_badge(g, bx, ny, 1.1, T.subs ? C_WHITE : C_FILL_BTN, T.subs ? 0xff101010u : C_WHITE, -1, "SUB") + E(0.5);
+    if (tv_has_teletext()) bx += d_badge(g, bx, ny, 1.1, C_FILL_BTN, C_WHITE, -1, "TTX") + E(0.5);
     if (repo_has_archive(c)) bx += d_badge(g, bx, ny, 1.1, C_FILL_BTN, C_WHITE, I_ARCHIVE, trp(S_DAYS_SHORT, c->archive_days));
     /* передача */
     int py = y + logo_h - E(2.6);

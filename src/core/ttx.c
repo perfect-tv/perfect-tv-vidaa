@@ -301,6 +301,24 @@ int ttx_subtitle_at(ttx *t, int64_t pts, ttx_page *out) {
     return rc;
 }
 int ttx_has_subtitles(ttx *t) { return t->hn > 0; }
+int ttx_subtitle_number(ttx *t) { return t->sub_number; }
+int ttx_subtitles_known(ttx *t) { return t->sub_number || t->ndeclared > 0; }
+int ttx_numbers(ttx *t, uint16_t *out, int max) {
+    pthread_mutex_lock(&t->mu);
+    int n = 0;
+    for (int i = 0; i < t->n; i++) {
+        uint16_t x = t->pages[i].number;
+        int k = 0;
+        while (k < n && out[k] < x) k++;
+        if (k < n && out[k] == x) continue;
+        if (n == max) { if (k == n) continue; n--; }
+        memmove(out + k + 1, out + k, (size_t)(n - k) * sizeof *out);
+        out[k] = x;
+        n++;
+    }
+    pthread_mutex_unlock(&t->mu);
+    return n;
+}
 
 /* ---------- раскладка (последовательные атрибуты уровня 1) ---------- */
 void ttx_layout(const ttx_page *p, const uint8_t *row0, ttx_grid *g) {
@@ -318,7 +336,8 @@ void ttx_layout(const ttx_page *p, const uint8_t *row0, ttx_grid *g) {
             continue;
         }
         if (!data) continue;
-        int fg = 7, bg = 0, mosaic = 0, sep = 0, hold = 0, held = 0x20, held_sep = 0, dh = 0, conceal = 0, box = 0, prev = 0, any_dh = 0;
+        int fg = 7, bg = 0, mosaic = 0, sep = 0, hold = 0, held = 0x20, held_sep = 0, dh = 0, dw = 0, flash = 0, conceal = 0, box = 0, prev = 0,
+            any_dh = 0, right_half = 0;
         for (int c = 0; c < TTX_COLS; c++) {
             int code = data[c] & 0x7F, shown_mosaic = 0, shown_sep = sep;
             uint32_t shown;
@@ -327,7 +346,8 @@ void ttx_layout(const ttx_page *p, const uint8_t *row0, ttx_grid *g) {
                 else shown = ttx_glyph(code, r == 0 && c < 8 ? 0 : p->charset);   /* «P100» — латиница */
             } else {
                 switch (code) {   /* «Set-At» */
-                case 0x0C: dh = 0; break;
+                case 0x09: flash = 0; break;
+                case 0x0C: dh = 0; dw = 0; break;
                 case 0x18: conceal = 1; break;
                 case 0x19: sep = 0; break;
                 case 0x1A: sep = 1; break;
@@ -339,16 +359,23 @@ void ttx_layout(const ttx_page *p, const uint8_t *row0, ttx_grid *g) {
                 else { shown = 0x20; shown_sep = sep; }
             }
             int i = r * TTX_COLS + c;
+            /* двойная ширина: знак на эту и правую ячейку, у правой своего знака нет */
+            int wide = dw && !right_half && code >= 0x20 && c < TTX_COLS - 1;
             g->ch[i] = shown;
             g->attr[i] = (uint16_t)((fg & 7) | ((bg & 7) << 3) | (shown_mosaic ? TA_MOSAIC : 0) | (shown_mosaic && shown_sep ? TA_SEPARATED : 0) |
-                                    (dh ? TA_DH : 0) | (conceal ? TA_CONCEAL : 0) | (box ? TA_BOX : 0));
+                                    (dh ? TA_DH : 0) | (flash ? TA_FLASH : 0) | (conceal ? TA_CONCEAL : 0) | (box ? TA_BOX : 0) |
+                                    (wide ? TA_DW : 0) | (right_half ? TA_DW_RIGHT : 0));
+            right_half = wide;
             if (dh) any_dh = 1;
             if (code < 0x20) {   /* «Set-After» */
                 if (code <= 0x07) { fg = code; mosaic = 0; held = 0x20; conceal = 0; }
                 else if (code >= 0x10 && code <= 0x17) { fg = code - 0x10; mosaic = 1; conceal = 0; }
                 else if (code == 0x0A) { if (prev == 0x0A) box = 0; }
                 else if (code == 0x0B) { if (prev == 0x0B) box = 1; }
-                else if (code == 0x0D || code == 0x0F) dh = 1;
+                else if (code == 0x08) flash = 1;
+                else if (code == 0x0D) { dh = 1; dw = 0; }
+                else if (code == 0x0E) { dw = 1; dh = 0; }
+                else if (code == 0x0F) { dh = 1; dw = 1; }
                 else if (code == 0x1F) hold = 0;
             }
             prev = code;
@@ -381,6 +408,7 @@ size_t ttx_subtitle_text(const ttx_grid *g, char *out, size_t cap) {
             int i = r * TTX_COLS + c;
             uint32_t ch = g->ch[i];
             int vis = (!boxes || (g->attr[i] & TA_BOX)) && !(g->attr[i] & (TA_DH_BOTTOM | TA_CONCEAL));
+            if (g->attr[i] & TA_DW_RIGHT) continue;   /* правая половина двойной ширины — без своего знака */
             if (!vis || (g->attr[i] & TA_MOSAIC)) ch = 0x20;
             l += (size_t)u8_put(line + l, ch);
         }
