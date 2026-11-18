@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "relay.h"
+#include "cookies.h"
 #include "http.h"
 #include "util.h"
 #include <arpa/inet.h>
@@ -90,8 +91,10 @@ void relay_reset(void) {
     memset(D.cc_lang708, 0, sizeof D.cc_lang708);
     D.cc_decl608 = D.cc_decl708 = 0;
     D.gen++;
+    cookies_clear();   /* cookie провайдера — свои у каждого потока */
     pthread_mutex_unlock(&D.mu);
 }
+static int relay_gen(void) { pthread_mutex_lock(&D.mu); int g = D.gen; pthread_mutex_unlock(&D.mu); return g; }
 ttx *relay_ttx(void) { pthread_mutex_lock(&D.mu); init_once(); pthread_mutex_unlock(&D.mu); return D.t; }
 long long relay_ts_bytes(void) { return D.bytes; }
 int relay_has_teletext(void) { return D.ttx_pid >= 0; }
@@ -497,10 +500,11 @@ static int hname(const char *line, const char *name) {
     size_t n = strlen(name);
     return !strncasecmp(line, name, n) && line[n] == ':';
 }
-/* от плеера к провайдеру: всё, кроме заголовков соединения; заголовки канала (h=) важнее */
+/* от плеера к провайдеру: всё, кроме заголовков соединения и Cookie (их ставит ретранслятор); заголовки канала (h=)
+ * важнее */
 static int pass_request(const char *line) {
     static const char *const drop[] = {"Host", "Connection", "Keep-Alive", "Accept-Encoding", "TE", "Upgrade", "Proxy-Connection",
-                                       "Proxy-Authorization", "Transfer-Encoding", "Content-Length"};
+                                       "Proxy-Authorization", "Transfer-Encoding", "Content-Length", "Cookie"};
     for (size_t i = 0; i < sizeof drop / sizeof drop[0]; i++) if (hname(line, drop[i])) return 0;
     return strchr(line, ':') != NULL;
 }
@@ -510,20 +514,6 @@ static int pass_response(const char *line) {
                                        "Upgrade", "Alt-Svc", "Strict-Transport-Security"};
     for (size_t i = 0; i < sizeof drop / sizeof drop[0]; i++) if (hname(line, drop[i])) return 0;
     return 1;
-}
-/* Set-Cookie: плеер обращается к 127.0.0.1 — Domain и Secure мешали бы ему вернуть cookie */
-static void cookie_line(sbuf *o, const char *line) {
-    const char *p = line;
-    while (*p) {
-        const char *e = strchr(p, ';');
-        size_t l = e ? (size_t)(e - p) : strlen(p);
-        const char *t = p;
-        while (*t == ' ') t++;
-        int skip = p != line && (!strncasecmp(t, "Domain=", 7) || !strncasecmp(t, "Secure", 6) || !strncasecmp(t, "SameSite", 8));
-        if (!skip) { if (p != line) sb_addc(o, ';'); sb_addn(o, p, l); }
-        if (!e) break;
-        p = e + 1;
-    }
 }
 static void each_line(const char *block, void (*fn)(sbuf *, const char *, void *), sbuf *o, void *ctx) {
     for (const char *p = block; p && *p;) {
@@ -552,9 +542,8 @@ static void req_fn(sbuf *o, const char *line, void *ctx) {
 }
 static void resp_fn(sbuf *o, const char *line, void *ctx) {
     (void)ctx;
-    if (!pass_response(line)) return;
-    if (hname(line, "Set-Cookie")) cookie_line(o, line);
-    else sb_add(o, line);
+    if (!pass_response(line) || hname(line, "Set-Cookie")) return;   /* cookie хранит ретранслятор (core/cookies.c) */
+    sb_add(o, line);
     sb_add(o, "\r\n");
 }
 static const char *reason(int code) {
@@ -900,7 +889,7 @@ static void build_request(up *u, cl *c) {
     if (strncasecmp(f, "accept:", 7) && !strcasestr(f, "\naccept:")) sb_add(&u->req, "Accept: */*\r\n");
     sb_add(&u->req, "Accept-Encoding: identity\r\nConnection: keep-alive\r\n");
     if (u->u.auth[0]) sb_printf(&u->req, "Authorization: Basic %s\r\n", u->u.auth);
-    sb_add(&u->req, f);
+    cookies_merge(&u->req, f, c->url);   /* Cookie канала и хранилища — одной строкой */
     sb_add(&u->req, "\r\n");
 }
 
@@ -971,6 +960,7 @@ static int up_parse_head(up *u) {
         sb_add(&u->headers, "\r\n");
     }
     if (u->chunked) u->length = -1;
+    if (u->c && u->c->gen == relay_gen()) cookies_from_headers(u->c->url, u->headers.s);   /* и у редиректа */
     size_t used = (size_t)(e - u->in) + 4;
     memmove(u->in, u->in + used, u->in_n - used);
     u->in_n -= used;

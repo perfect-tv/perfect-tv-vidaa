@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "http.h"
+#include "cookies.h"
 #include "clock.h"
 #include "prefs.h"
 #include "util.h"
@@ -417,7 +418,8 @@ static int request1(hs *h, const char *url, const hs_req *rq, const url_t *uu) {
     if (u.auth[0]) sb_printf(&b, "Authorization: Basic %s\r\n", u.auth);
     if (rq->etag && *rq->etag) sb_printf(&b, "If-None-Match: %s\r\n", rq->etag);
     if (rq->last_modified && *rq->last_modified) sb_printf(&b, "If-Modified-Since: %s\r\n", rq->last_modified);
-    if (rq->headers) sb_add(&b, rq->headers);
+    if (rq->cookies) cookies_merge(&b, rq->headers, url);
+    else if (rq->headers) sb_add(&b, rq->headers);
     sb_add(&b, "\r\n");
     int rc = raw_write(h, b.s, b.n);
     sb_free(&b);
@@ -450,6 +452,7 @@ static int request1(hs *h, const char *url, const hs_req *rq, const url_t *uu) {
     }
     if (h->chunked) h->length = -1;
     h->chunk_left = h->chunked ? -1 : 0;
+    if (rq->cookies) cookies_from_headers(url, h->resp);
     return 0;
 }
 

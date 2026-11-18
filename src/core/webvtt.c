@@ -599,7 +599,7 @@ static void add_cue(void *ctx, int64_t s, int64_t e, const char *text) {
 
 static char *get(job *j, const char *url, size_t *len) {
     char err[120] = "";
-    hs_req rq = {.url = url, .headers = j->hdr[0] ? j->hdr : NULL, .timeout_ms = 10000, .cancel = &j->cancel, .keepalive = 1};
+    hs_req rq = {.url = url, .headers = j->hdr[0] ? j->hdr : NULL, .timeout_ms = 10000, .cancel = &j->cancel, .keepalive = 1, .cookies = 1};
     hs *h = hs_open(&rq, err, sizeof err);
     if (!h) return NULL;
     sbuf b = {0};

@@ -15,6 +15,7 @@
     "src/core/clock.c",
     "src/core/prefs.c",
     "src/core/http.c",
+    "src/core/cookies.c",
     "src/core/unpack.c",
     "src/core/qr.c",
     "src/core/phone.c",

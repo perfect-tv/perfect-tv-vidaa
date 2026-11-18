@@ -12,6 +12,7 @@
 #include "core/ttx.h"
 #include "core/dvbsub.h"
 #include "core/cc.h"
+#include "core/cookies.h"
 #include "core/substyle.h"
 #include "core/webvtt.h"
 #include "core/util.h"
@@ -908,12 +909,13 @@ static void up_answer(int c, const char *req) {
         const char *pl = "#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"s\",NAME=\"Русские\",LANGUAGE=\"ru\",URI=\"subs/ru.m3u8\"\n"
                          "#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS=\"avc1.64001f,mp4a.40.2,stpp.ttml.im1t\",SUBTITLES=\"s\"\nvar.m3u8\n"
                          "#EXT-X-TARGETDURATION:6\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:6,\nseg1.ts?x=1\n";
-        snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nSet-Cookie: sid=abc; Domain=.provider.tv; Path=/; Secure; HttpOnly\r\n\r\n", strlen(pl));
+        snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nSet-Cookie: sid=abc; Path=/live; HttpOnly\r\n"
+                 "Set-Cookie: evil=1; Domain=provider.tv\r\nSet-Cookie: sec=1; Secure\r\n\r\n", strlen(pl));
         if (send(c, head, strlen(head), 0) < 0 || send(c, pl, strlen(pl), 0) < 0) {}
     } else if (strstr(req, "GET /live/seg1.ts?x=1") && strstr(req, "User-Agent: Test/1") && !strstr(req, "PerfectTV/") &&
                !strstr(req, "Accept-Encoding: gzip")) {
         const char *rg = strstr(req, "Range: bytes=");
-        if (rg && strstr(req, "Cookie: sid=abc")) {   /* часть — 206, как у настоящего сервера */
+        if (rg && strstr(req, "\r\nCookie: sid=abc\r\n")) {   /* только из хранилища: чужой домен, Secure и cookie плеера — нет */   /* часть — 206, как у настоящего сервера */
             size_t a0 = (size_t)atol(rg + 13), b0 = (size_t)atol(strchr(rg, '-') + 1);
             snprintf(head, sizeof head, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes %zu-%zu/%zu\r\nContent-Length: %zu\r\n\r\n",
                      a0, b0, UP.seg.n, b0 - a0 + 1);
@@ -933,7 +935,7 @@ static void up_answer(int c, const char *req) {
             sent += w;
             atomic_store(&UP.big_sent, sent);
         }
-    } else if (strstr(req, "GET /live/subs/ru.m3u8") && strstr(req, "User-Agent: Test/1")) {
+    } else if (strstr(req, "GET /live/subs/ru.m3u8") && strstr(req, "User-Agent: Test/1") && strstr(req, "\r\nCookie: sid=abc\r\n")) {
         const char *pl = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nru0.vtt\n#EXT-X-ENDLIST\n";
         snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", strlen(pl));
         if (send(c, head, strlen(head), 0) < 0 || send(c, pl, strlen(pl), 0) < 0) {}
@@ -1111,9 +1113,9 @@ static void test_relay_http(void) {
     size_t n = 0;
     char *pl = fetch(url, &n);
     CHECK(pl && starts_with(pl, "#EXTM3U"));
-    /* cookie — плееру, без Domain и Secure (он ходит на 127.0.0.1) */
-    CHECK(strstr(resp_hdr, "Set-Cookie: sid=abc; Path=/; HttpOnly") != NULL);
-    CHECK(!strstr(resp_hdr, "Domain") && !strstr(resp_hdr, "Secure"));
+    /* cookie плееру не уходят — их хранит ретранслятор */
+    CHECK(!strstr(resp_hdr, "Set-Cookie"));
+    EQI(cookies_count(), 1);
     /* сегмент и ключ — тоже через ретранслятор, адреса абсолютные, заголовки канала переданы */
     char *seg = pl ? strstr(pl, "#EXTINF:6,\n") : NULL;
     CHECK(pl && strstr(pl, "URI=\"http://127.0.0.1:") && strstr(pl, "key.bin"));
@@ -1124,8 +1126,8 @@ static void test_relay_http(void) {
     char *body = segurl[0] ? fetch(segurl, &n) : NULL;
     CHECK(body && n == UP.seg.n && !memcmp(body, UP.seg.s, n));   /* байты — как есть */
     free(body);
-    /* Range и Cookie плеера — провайдеру, 206 и Content-Range — обратно */
-    body = segurl[0] ? fetch_h(segurl, "Range: bytes=188-375\r\nCookie: sid=abc\r\n", &n) : NULL;
+    /* Range плеера — провайдеру (его Cookie — нет, вместо них — из хранилища), 206 и Content-Range — обратно */
+    body = segurl[0] ? fetch_h(segurl, "Range: bytes=188-375\r\nCookie: bogus=1\r\n", &n) : NULL;
     CHECK(body && n == 188 && !memcmp(body, UP.seg.s + 188, 188));
     CHECK(starts_with(resp_hdr, "206\n") && strstr(resp_hdr, "Content-Range: bytes 188-375/"));
     free(body);
@@ -1839,6 +1841,53 @@ static void test_cc(void) {
     sb_free(&ts);
 }
 
+static void test_cookies(void) {
+    cookies_clear();
+    clock_fake(1800000000);
+    const char *h = "HTTP/1.1 200 OK\r\nDate: Fri, 15 Jan 2027 08:00:00 GMT\r\n"
+                    "Set-Cookie: a=1; Domain=.Example.com; Path=/\r\n"                     /* все поддомены */
+                    "Set-Cookie: b=2\r\n"                                                  /* только этот хост, каталог /live */
+                    "Set-Cookie: s=3; Secure; Path=/\r\n"                                  /* только https */
+                    "Set-Cookie: p=4; Path=/live/hd\r\n"                                   /* путь длиннее — раньше */
+                    "Set-Cookie: x=5; Domain=other.com\r\n"                                /* чужой домен — нет */
+                    "Set-Cookie: t=6; Expires=Fri, 15-Jan-27 09:00:00 GMT\r\n"             /* час по Date ответа */
+                    "Set-Cookie: old=7; Expires=Mon, 01 Jan 1990 00:00:00 GMT\r\n";
+    cookies_from_headers("https://cdn.example.com/live/index.m3u8", h);
+    EQI(cookies_count(), 5);
+    char c[512];
+    cookies_header("https://cdn.example.com/live/hd/seg.ts?x=1", c, sizeof c);
+    EQS(c, "p=4; b=2; t=6; a=1; s=3");
+    cookies_header("http://cdn.example.com/live/seg.ts", c, sizeof c);
+    EQS(c, "b=2; t=6; a=1");
+    cookies_header("http://other.example.com/livex/seg.ts", c, sizeof c);   /* «/live» не префикс «/livex» */
+    EQS(c, "a=1");
+    cookies_header("http://example.com/", c, sizeof c);
+    EQS(c, "a=1");
+    cookies_header("http://notexample.com/", c, sizeof c);
+    EQS(c, "");
+    clock_fake(1800000000 + 3601);   /* t — истёк */
+    cookies_header("http://cdn.example.com/live/seg.ts", c, sizeof c);
+    EQS(c, "b=2; a=1");
+    /* замена и удаление: Max-Age=0 */
+    cookies_set("http://cdn.example.com/live/x", "b=new", 0);
+    cookies_set("http://cdn.example.com/", "a=; Domain=example.com; Path=/; Max-Age=0", 0);
+    cookies_header("http://cdn.example.com/live/seg.ts", c, sizeof c);
+    EQS(c, "b=new");
+    /* Cookie канала — первыми, одной строкой с хранилищем */
+    sbuf o = {0};
+    cookies_merge(&o, "User-Agent: T\r\nCookie: ch=9\r\n", "http://cdn.example.com/live/seg.ts");
+    EQS(o.s, "User-Agent: T\r\nCookie: ch=9; b=new\r\n");
+    sb_free(&o);
+    /* IP: Domain не принимается, без него — только этот адрес */
+    cookies_clear();
+    cookies_set("http://10.0.0.1/a/b", "k=1; Domain=0.0.1", 0);
+    cookies_set("http://10.0.0.1/a/b", "k=2", 0);
+    cookies_header("http://10.0.0.1/a/c", c, sizeof c);
+    EQS(c, "k=2");
+    cookies_clear();
+    clock_fake(0);
+}
+
 static void test_ttml(void) {
     /* тики, кадры, вложенные div (время — от родителя), br, span, сущности, пробелы */
     const char *x = "<?xml version=\"1.0\"?><!-- c --><tt xmlns=\"http://www.w3.org/ns/ttml\" xmlns:ttp=\"http://www.w3.org/ns/ttml#parameter\" "
@@ -1985,6 +2034,7 @@ int main(void) {
     test_usb(dir);
     test_backup();
     test_tmdb();
+    test_cookies();
     test_ttml();
     test_cc();
     test_teletext();

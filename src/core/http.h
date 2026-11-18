@@ -15,6 +15,7 @@ typedef struct {
     volatile int *cancel;       /* != 0 — прервать */
     int raw;                    /* без сжатия (Accept-Encoding: identity) — ретранслятор */
     int keepalive;              /* соединение — из пула и обратно в пул, если ответ дочитан */
+    int cookies;                /* хранилище cookie потока канала (core/cookies.h): ставить и запоминать */
 } hs_req;
 
 void http_init(const char *ca_pem, size_t ca_len);   /* один раз в главном потоке */
