@@ -320,6 +320,7 @@ static int load_channels(int pl_id) {
             c->cu_type = sp_dup(&R.pool, fld[9]);
             c->cu_source = sp_dup(&R.pool, fld[10]);
             int d = atoi(fld[11]);
+            if (d > 30) d = 30;
             c->archive_days = d > 0 ? d : P.archive_days;
         }
         c->ua = sp_dup(&R.pool, fld[12]);

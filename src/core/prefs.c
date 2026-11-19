@@ -1,6 +1,7 @@
 #include "prefs.h"
 #include "app.h"
 #include "lang.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,8 +60,33 @@ void prefs_load(void) {
     snprintf(P.last_channel, sizeof P.last_channel, "%s", s ? s : "");
     s = store_get("last_group");
     snprintf(P.last_group, sizeof P.last_group, "%s", s ? s : "");
+    /* Копия с другого ТВ или правка settings.json не должна давать вечную загрузку/сдвиг времени. */
+    if (P.lang < LANG_AUTO || P.lang > LANG_RU) P.lang = LANG_AUTO;
+    if (P.tz != TZ_AUTO && (P.tz < -48 || P.tz > 56)) P.tz = TZ_AUTO;   /* UTC−12…UTC+14 */
+    if (P.ui_scale < 0 || P.ui_scale > 2) P.ui_scale = 0;
     if (P.archive_days < 1 || P.archive_days > 30) P.archive_days = 7;
-    if (P.info_hide < 2) P.info_hide = 5;
+    if (P.info_hide < 2 || P.info_hide > 60) P.info_hide = 5;
+    if (P.number_mode < NUM_NONE || P.number_mode > NUM_BADGE) P.number_mode = NUM_BADGE;
+    if (P.guide_mode < GUIDE_GRID || P.guide_mode > GUIDE_LIST) P.guide_mode = GUIDE_GRID;
+    if (P.guide_header < 0 || P.guide_header > 2) P.guide_header = 0;
+    if (P.up_key < UP_SCHEDULE || P.up_key > UP_RECENT) P.up_key = UP_SCHEDULE;
+    P.hints = !!P.hints;
+    P.adaptive = !!P.adaptive;
+    P.start_last = !!P.start_last;
+    P.any_cert = !!P.any_cert;
+    P.relay_all = !!P.relay_all;
+    P.ttx_keypad = !!P.ttx_keypad;
+    P.ttx_mix = !!P.ttx_mix;
+    P.logo_priority = !!P.logo_priority;
+    if (P.aspect < ASPECT_FIT || P.aspect > ASPECT_4_3) P.aspect = ASPECT_FIT;
+    if (P.remind_before < 0 || P.remind_before > 10) P.remind_before = 1;
+    if (P.pin_ask < PIN_EACH || P.pin_ask > PIN_ONCE) P.pin_ask = PIN_EACH;
+    if (P.pin_input < PIN_IN_RING || P.pin_input > PIN_IN_KEYS) P.pin_input = PIN_IN_ROWS;
+    if (P.epg_hours < 1 || P.epg_hours > 24) P.epg_hours = 12;
+    if (P.playlist_hours < 1 || P.playlist_hours > 48) P.playlist_hours = 24;
+    size_t pl = strlen(P.pin);
+    if (pl < 4 || pl > 6) P.pin[0] = 0;
+    for (const char *p = P.pin; *p; p++) if (!isdigit((unsigned char)*p)) { P.pin[0] = 0; break; }
     lang_set(P.lang);
 }
 
