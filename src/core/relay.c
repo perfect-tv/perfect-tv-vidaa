@@ -1003,6 +1003,7 @@ static void client_reply_simple(cl *c, int code) {
     snprintf(b, sizeof b, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", code, reason(code));
     out_add(c, b, strlen(b));
     c->busy = 0;
+    c->head_sent = 1;   /* ответ начат: следующие ошибки только обрывают соединение */
     c->finishing = 1;
     c->keep = 0;
     client_flush(c);
@@ -1028,6 +1029,7 @@ static void client_send_head(cl *c, up *u, long long len) {
 
 /* кусок тела от провайдера */
 static void client_deliver(cl *c, up *u, const char *d, size_t n) {
+    if (c->dead || c->finishing) return;
     if (!c->decided) {
         int enc = u->headers.s && strcasestr(u->headers.s, "Content-Encoding:") && !strcasestr(u->headers.s, "Content-Encoding: identity");
         c->playlist = !enc && (c->content_mpegurl || is_playlist(d, n));
@@ -1082,6 +1084,7 @@ static void up_body(up *u, int eof) {
             size_t take = u->in_n - pos;
             if (u->length >= 0 && (long long)take > u->length - u->received) take = (size_t)(u->length - u->received);
             client_deliver(c, u, u->in + pos, take);
+            if (!c || c->dead) return;   /* ответ уже завершён/плеер закрыт — u->in мог быть освобождён */
             pos += take;
             u->received += (long long)take;
             if (u->length >= 0 && u->received >= u->length) break;
@@ -1100,6 +1103,7 @@ static void up_body(up *u, int eof) {
             size_t take = u->in_n - pos;
             if ((long long)take > u->chunk_left) take = (size_t)u->chunk_left;
             client_deliver(c, u, u->in + pos, take);
+            if (!c || c->dead) return;   /* ответ уже завершён/плеер закрыт — u->in мог быть освобождён */
             pos += take;
             u->chunk_left -= (long long)take;
             if (!u->chunk_left) u->phase = 2;
@@ -1109,9 +1113,9 @@ static void up_body(up *u, int eof) {
             u->phase = 0;
         }
     }
+    if (!c || c->dead) return;
     memmove(u->in, u->in + pos, u->in_n - pos);
     u->in_n -= pos;
-    if (!c || c->dead) return;
     int done = u->chunked ? u->phase == 4 : u->length >= 0 && u->received >= u->length;
     if (done) { client_upstream_done(c, 1); return; }
     if (eof) {
