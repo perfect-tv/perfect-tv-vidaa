@@ -347,12 +347,9 @@ static int rem_archive(const reminder *r) {
 }
 static void rem_rebuild(void) {
     int64_t now = clock_now();
-    playlist *cp = repo_cur();
-    int curid = cp ? cp->id : 0;
     RM.n = 0;
     for (int i = 0; i < R.nrem && RM.n < 32; i++) {
         reminder *r = &R.rem[i];
-        if (r->playlist != curid) continue;   /* показывать в своём плейлисте, не в чужом */
         if (r->snooze > now) continue;
         int due = r->start - (int64_t)P.remind_before * 60 <= now && now < r->stop;
         int missed = r->stop <= now && !r->shown && rem_archive(r);
@@ -385,6 +382,22 @@ static int rem_key(layer *l, int k, int ev) {
         int64_t start = r->start;
         switch (RM.focus) {
         case 0:
+            if (!c && r->playlist != (repo_cur() ? repo_cur()->id : 0)) {
+                /* напоминание другого плейлиста: перейти в него, затем включить канал */
+                int idx = -1;
+                for (int i2 = 0; i2 < R.npl; i2++) if (R.pl[i2].id == r->playlist) { idx = i2; break; }
+                char key[160], path[700];
+                snprintf(key, sizeof key, "%s", r->key);
+                if (idx >= 0) repo_channels_path(R.pl[idx].id, path, sizeof path);
+                if (idx >= 0 && file_exists(path)) {
+                    rem_done(1);
+                    layer_pop_all();
+                    tv_preview_playlist(idx);
+                    channel *nc = repo_by_key(key);
+                    if (nc) { if (missed) tv_play_archive(nc, start, NULL); else tv_play(nc, NULL); }
+                } else tv_toast(tr(S_LOADING_PLAYLIST));
+                break;
+            }
             rem_done(!missed);
             layer_pop_all();
             if (c) { if (missed) tv_play_archive(c, start, NULL); else tv_play(c, NULL); }
