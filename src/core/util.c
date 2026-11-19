@@ -272,8 +272,10 @@ void sl_insert(strlist *l, int at, const char *s) {
         l->cap = cap;
     }
     if (at < 0 || at > l->n) at = l->n;
+    char *d = strdup(s ? s : "");
+    if (!d) return;
     memmove(l->v + at + 1, l->v + at, (size_t)(l->n - at) * sizeof *l->v);
-    l->v[at] = strdup(s ? s : "");
+    l->v[at] = d;
     l->n++;
 }
 void sl_add(strlist *l, const char *s) { sl_insert(l, l->n, s); }

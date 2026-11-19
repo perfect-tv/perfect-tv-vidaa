@@ -604,7 +604,8 @@ static void add_cue(void *ctx, int64_t s, int64_t e, const char *text) {
                 cue *n2 = realloc(W.c, (size_t)cap * sizeof *n2);
                 if (n2) { W.c = n2; W.cap = cap; }
             }
-            if (W.n < W.cap) W.c[W.n++] = (cue){s, e, strdup(text)};
+            char *t = W.n < W.cap ? strdup(text) : NULL;
+            if (t) W.c[W.n++] = (cue){s, e, t};
         }
     }
     pthread_mutex_unlock(&W.mu);
