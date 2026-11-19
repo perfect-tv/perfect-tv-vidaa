@@ -147,10 +147,20 @@ static void draw_more(gfx_t *g, int x, int y, int cw, int bh, channel *c, int ha
         size_t tl = strlen(tags);
         if (p->cat[0]) tl += (size_t)snprintf(tags + tl, sizeof tags - tl, " · %s", p->cat);
         if (p->sub[0] && tl < sizeof tags) tl += (size_t)snprintf(tags + tl, sizeof tags - tl, " · %s", p->sub);
-        if (tm && tm->year[0] && tl < sizeof tags) tl += (size_t)snprintf(tags + tl, sizeof tags - tl, " · %s", tm->year);
-        if (tm && tm->vote > 0 && tl < sizeof tags) snprintf(tags + tl, sizeof tags - tl, " · ★ %.1f", tm->vote);
+        if (tm && tm->year[0] && tl < sizeof tags) snprintf(tags + tl, sizeof tags - tl, " · %s", tm->year);
     } else snprintf(tags, sizeof tags, "%s", tr(S_NO_PROGRAMME));
     d_text(g, dx, y, 1.2, F_R, WA(0.65), tags, dw);
+    if (has && tm && tm->vote > 0) {
+        /* ★ в шрифтах нет — значок I_STAR, число рядом */
+        int tw = d_text_w(1.2, F_R, tags), sz = E(1.0), sx = dx + tw + E(0.7);
+        if (sx + sz + E(2.5) < dx + dw) {
+            d_icon(g, I_STAR, sx + sz / 2, y + d_line_h(1.2, F_R) / 2, sz, WA(0.65));
+            char v[16];
+            snprintf(v, sizeof v, "%.1f", tm->vote);
+            int rx = sx + sz + E(0.35);
+            d_text(g, rx, y, 1.2, F_R, WA(0.65), v, dw - (rx - dx));
+        }
+    }
     if (has) {
         const char *desc = tm && tm->overview[0] && (!p->desc[0] || tm->unique) ? tm->overview : p->desc[0] ? p->desc : tst == TMDB_LOADING ? "…" : "";
         double gap = 1.3 * 0.12;
