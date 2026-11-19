@@ -289,7 +289,7 @@ static void block708(c708 *b, const uint8_t *p, int n) {
             continue;
         }
         if (c < 0x20) {
-            if (c == 0x08) { if (w->defined && w->pcol > 0) { w->pcol--; w->t[w->prow][w->pcol] = 0; if (w->visible) b->changed = 1; } }
+            if (c == 0x08) { if (w->defined && w->pcol > 0) { w->pcol--; if (w->pcol < w->cols) w->t[w->prow][w->pcol] = 0; if (w->visible) b->changed = 1; } }
             else if (c == 0x0C) { if (w->defined) { w_clear(w); if (w->visible) b->changed = 1; } }
             else if (c == 0x0D) w_cr(b);
             else if (c == 0x0E) { if (w->defined) { memset(w->t[w->prow], 0, sizeof w->t[0]); w->pcol = 0; if (w->visible) b->changed = 1; } }
@@ -334,7 +334,12 @@ static void block708(c708 *b, const uint8_t *p, int n) {
         }
         if (c == 0x92) {   /* SPL */
             if (i + 2 >= n) break;
-            if (w->defined) { w->prow = p[i + 1] & 0x0F; w->pcol = p[i + 2] & 0x3F; if (w->prow >= w->rows) w->prow = w->rows - 1; }
+            if (w->defined) {
+                w->prow = p[i + 1] & 0x0F;
+                w->pcol = p[i + 2] & 0x3F;
+                if (w->prow >= w->rows) w->prow = w->rows - 1;
+                if (w->pcol >= w->cols) w->pcol = w->cols - 1;
+            }
             i += 2;
             continue;
         }
