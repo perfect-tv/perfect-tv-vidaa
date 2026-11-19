@@ -412,7 +412,7 @@ int tv_key(int k, int ev) {
         if (ev == EV_LONG) { tv_open_recent(); return 1; }
         if (ev != EV_SHORT) return 1;
         if (!info_visible()) tv_show_info(1);
-        else if (!T.info_pinned) { T.info_pinned = 1; T.info_expanded = 1; }
+        else if (!T.info_pinned) T.info_pinned = 1;   /* ↓ ↓: закрепить, затем раскрыть описание */
         else T.info_expanded = 1;
         return 1;
     case KEY_LEFT: case KEY_RIGHT: {
