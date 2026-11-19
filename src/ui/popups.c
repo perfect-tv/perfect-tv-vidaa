@@ -137,7 +137,7 @@ void card_open(channel *c, const prog *p) {
 }
 
 /* ================= недавние каналы ================= */
-static struct { channel *ch[HISTORY_SIZE]; int n, focus; } RC;
+static struct { channel *ch[HISTORY_SIZE]; int n, focus, top; } RC;
 static layer RL;
 static int recent_has_long(layer *l, int k) { (void)l; return k == KEY_OK; }
 static int recent_key(layer *l, int k, int ev) {
@@ -150,18 +150,33 @@ static int recent_key(layer *l, int k, int ev) {
     else if (k == KEY_MENU) { channel *c = RC.ch[RC.focus]; layer_pop(&RL); tv_open_menu(c, NULL, 1); }
     return 1;
 }
+/* Сколько строк влезает между верхним и нижним полем (окно не выше экрана). */
+static int recent_vis(void) {
+    int row = E(5.0), v = (SH - E(4.8) - E(6)) / row;
+    return v < 1 ? 1 : v;
+}
 static void recent_draw(layer *l, gfx_t *g) {
     (void)l;
-    int w = E(44), row = E(5.0), h = E(6) + (RC.n ? RC.n : 1) * row, x = E(4), y = SH - E(2.4) - h;
+    int vis = recent_vis();
+    if (RC.n > vis) {
+        if (RC.focus < RC.top) RC.top = RC.focus;
+        if (RC.focus >= RC.top + vis) RC.top = RC.focus - vis + 1;
+        if (RC.top > RC.n - vis) RC.top = RC.n - vis;
+        if (RC.top < 0) RC.top = 0;
+    } else RC.top = 0;
+    int rows = RC.n ? RC.n : 1;
+    if (rows > vis) rows = vis;
+    int w = E(44), row = E(5.0), h = E(6) + rows * row, x = E(4), y = SH - E(2.4) - h;
     d_hgrad(g, 0, 0, SW / 2, SH, BA(0.6), 0);
     d_round(g, x, y, w, h, E(1), C_POPUP);
     d_text(g, x + E(1.5), y + E(1.2), 1.5, F_B, C_WHITE, tr(S_RECENT_CHANNELS), w - E(3));
     int ly = y + E(4.4);
     if (!RC.n) d_text(g, x + E(1.5), ly, 1.25, F_R, C_TEXT3, tr(S_NO_RECENT), w - E(3));
     int64_t now = clock_now();
-    for (int i = 0; i < RC.n; i++) {
+    for (int k = 0; k < rows && RC.top + k < RC.n; k++) {
+        int i = RC.top + k;
         channel *c = RC.ch[i];
-        int ry = ly + i * row, foc = i == RC.focus;
+        int ry = ly + k * row, foc = i == RC.focus;
         if (foc) d_round(g, x + E(0.8), ry, w - E(1.6), row - E(0.4), E(0.5), C_WHITE);
         uint32_t fg = foc ? 0xff101010u : C_WHITE, fg2 = foc ? 0xff404040u : C_TEXT3;
         int lh = row - E(1.2), lw = lh * 96 / 66;
@@ -185,7 +200,7 @@ void recent_open(void) {
     RL.has_long = recent_has_long;
     RL.draw = recent_draw;
     RC.n = repo_recent(T.cur, RC.ch, HISTORY_SIZE - 1);
-    RC.focus = 0;
+    RC.focus = RC.top = 0;
     layer_push(&RL);
 }
 
