@@ -41,7 +41,7 @@ IPTV-плеер Perfect TV для телевизоров Hisense / Toshiba на 
 в `native_app/toolchain/`, или путь в `ZIG`).
 
 ```bash
-python3 tools/build.py            # build/arm/perfecttv-app (ELF ARM32, glibc ≤ 2.28)
+python3 tools/build.py            # build/arm/perfecttv-app (ELF ARM32, символы glibc ≤ 2.25, цель 2.28)
 python3 tools/pack.py             # build/arm/tv.rootu.perfecttv.ipk (не подписан)
 ```
 
@@ -55,9 +55,9 @@ python3 tools/pack.py             # build/arm/tv.rootu.perfecttv.ipk (не по�
 
 ### AppId и имя пакета
 
-`appId` (`99010100`) и `package` (`tv.rootu.perfecttv`) в `app.json` — из сертификата автора `rootu` в VidaApp Store
-(пакеты `tv.rootu.*`, AppId 99010100–99010199). AppId вне этого диапазона магазин не подпишет, а чужой
-перезапишет установленное приложение. Для другой сборки — `python3 tools/pack.py --app-id N --package tv.x.y`. `registerName` (`PerfectTVNative`) должен совпадать
+`appId` (`99010100`) и `package` (`tv.rootu.perfecttv`) в `app.json` выданы сертификатом автора магазина VIDAA;
+чужой AppId перезапишет установленное приложение. Для другого сертификата — свои значения
+(или `python3 tools/pack.py --app-id N --package tv.x.y`). `registerName` (`PerfectTVNative`) должен совпадать
 со строкой в `src/main.c`.
 
 ## Проверка на ПК
@@ -94,7 +94,7 @@ L — недавние, T — телетекст, S — субтитры, F — 
 **Сценарием и снимками** (без окна):
 
 ```bash
-build/host/perfecttv-host wait:3 shot:live key:down shot:info key:ok shot:guide key:right shot:grid open:settings shot:settings
+build/host/perfecttv-host wait:3 shot:live key:guide shot:guide key:right shot:grid open:settings shot:settings
 ```
 
 Шаги сценария: `key:ИМЯ`, `long:ИМЯ` (удержание 1 с), `hold:ИМЯ:СЕК`, `wait:СЕК`, `shot:ИМЯ`, `open:settings|guide|schedule|recent|menu`,

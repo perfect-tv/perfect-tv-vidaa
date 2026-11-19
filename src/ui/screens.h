@@ -18,6 +18,9 @@ void schedule_open(channel *c, int reminders);
 /* menu.c — меню канала */
 void menu_open(channel *c, const char *group, int from_guide);
 
+/* guide.c */
+const char *guide_mode_name(void);                 /* название вида гида для настроек и меню */
+
 /* popups.c */
 void card_open(channel *c, const prog *p);          /* карточка передачи */
 void recent_open(void);                             /* недавние каналы */
@@ -30,6 +33,9 @@ void confirm_open(const char *text, const char *yes, confirm_fn yes_fn, void *ct
 /* выбор из списка: OK — fn(index) */
 typedef void (*choose_fn)(int index, void *ctx);
 void choose_open(const char *title, const char *const *items, int n, int selected, choose_fn fn, void *ctx);
+/* Ссылка QR-кодом (Настройки → О программе) и текст с переносом (лицензии) */
+void qr_open(const char *title, const char *url);
+void text_open(const char *title, const char *text);
 
 /* pin.c */
 typedef void (*pin_fn)(void *ctx);

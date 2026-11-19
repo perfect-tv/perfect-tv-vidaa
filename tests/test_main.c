@@ -20,9 +20,12 @@
 #include "data/backup.h"
 #include "data/tmdb.h"
 #include "data/epg.h"
+#include "data/repo.h"
 #include "data/m3u.h"
 #include "data/names.h"
 #include "data/xmltv.h"
+#include "ui/u.h"
+#include "img.h"
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +40,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include "core/http.h"
+#include "core/logocache.h"
 
 extern const unsigned char ptv_font_regular[], ptv_font_regular_end[], ptv_font_bold[], ptv_font_bold_end[];
 
@@ -669,6 +673,65 @@ static void test_usb(const char *tmp) {
     unsetenv("PTV_USB_ROOT");
 }
 
+/* ---------- кэш логотипов: картинка с диска декодируется без сети ---------- */
+static void test_logocache(void) {
+    static const unsigned char png[] = {137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1,8,6,0,0,0,31,21,196,137,
+        0,0,0,13,73,68,65,84,120,218,99,252,207,192,80,15,0,4,133,1,128,132,169,140,33,0,0,0,0,73,69,78,68,174,66,96,130};
+    char path[700];
+    CHECK(logo_cache_path("http://logo.invalid/a.png", path, sizeof path) == 1);
+    if (!path[0]) return;
+    CHECK(!file_write_atomic(path, png, sizeof png));
+    /* декод с диска — в рабочем потоке: в главном кадр не ждёт */
+    CHECK(logo_img("http://logo.invalid/a.png", 8, 8, IMG_FIT) == NULL);
+    const gfx_image *im = NULL;
+    for (int i = 0; i < 200 && !im; i++) {
+        struct timespec w = {0, 5000000};
+        nanosleep(&w, NULL);
+        app_frame();
+        im = logo_img("http://logo.invalid/a.png", 8, 8, IMG_FIT);
+    }
+    CHECK(im && im->w == 8 && im->h == 8);
+    logo_clear();
+    CHECK(!file_exists(path));
+}
+
+/* ---------- значки: маска рисуется один раз на пару «вид + размер» ---------- */
+static void test_icons(void) {
+    static uint32_t px[64 * 64];
+    memset(px, 0, sizeof px);
+    gfx_t g;
+    gfx_init(&g, px, 64, 64, 64);
+    d_icon(&g, I_ARCHIVE, 32, 32, 24, WA(0.7));
+    int drawn = 0, outside = 0;
+    for (int j = 0; j < 64; j++)
+        for (int i = 0; i < 64; i++) {
+            uint32_t c = px[j * 64 + i];
+            if (c >> 24) drawn++;
+            if (c && (i < 32 - 24 || i > 32 + 24 || j < 32 - 24 || j > 32 + 24)) outside++;
+        }
+    CHECK(drawn > 20);
+    CHECK(!outside);                         /* маска обрезана по значку, холст вокруг не тронут */
+    uint32_t before = px[32 * 64 + 32];
+    d_icon(&g, I_ARCHIVE, 32, 32, 24, 0x00ffffffu);   /* прозрачный цвет — ничего не меняет */
+    CHECK(px[32 * 64 + 32] == before);
+    d_icon(&g, I_CLOCK, 10, 10, 12, C_WHITE);
+    CHECK(px[10 * 64 + 10] >> 24);
+}
+
+/* ---------- напоминания: глубина архива хранится в самом напоминании ---------- */
+static void test_reminders(void) {
+    const char *rem = "[{\"key\":\"ch\",\"name\":\"Канал\",\"start\":100,\"stop\":200,\"playlist\":2,\"archive_days\":7,\"desc\":\"Описание\"}]";
+    file_write_atomic(data_path("reminders.json"), rem, strlen(rem));
+    repo_init();
+    EQI(R.nrem, 1);
+    if (R.nrem == 1) { EQI(R.rem[0].archive_days, 7); EQI(R.rem[0].playlist, 2); EQS(R.rem[0].key, "ch"); EQS(R.rem[0].desc, "Описание"); }
+    repo_reminders_save();
+    size_t n;
+    char *t = file_read(data_path("reminders.json"), &n);
+    CHECK(t && strstr(t, "\"archive_days\":7"));
+    free(t);
+}
+
 /* ---------- резервная копия ---------- */
 static void test_backup(void) {
     store_set("fav.1", "первый\nвторой");
@@ -935,6 +998,14 @@ static void up_answer(int c, const char *req) {
             sent += w;
             atomic_store(&UP.big_sent, sent);
         }
+    } else if (strstr(req, "GET /live/slow.ts")) {   /* тело идёт кусками: первые байты — задолго до конца */
+        static char blk[8192];
+        memset(blk, 0x47, sizeof blk);
+        snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", (int)(2 * sizeof blk));
+        if (send(c, head, strlen(head), 0) < 0) return;
+        if (send(c, blk, sizeof blk, MSG_NOSIGNAL) < 0) return;
+        usleep(900000);
+        if (send(c, blk, sizeof blk, MSG_NOSIGNAL) < 0) return;
     } else if (strstr(req, "GET /live/subs/ru.m3u8") && strstr(req, "User-Agent: Test/1") && strstr(req, "\r\nCookie: sid=abc\r\n")) {
         const char *pl = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nru0.vtt\n#EXT-X-ENDLIST\n";
         snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", strlen(pl));
@@ -1052,6 +1123,29 @@ static void relay_backpressure(const char *bigurl, const char *segurl) {
     close(slow);
 }
 
+/* тело отдаётся по мере чтения, а не после конца ответа: провайдер молчит 0,9 с — байты уже у плеера */
+static void relay_streaming(const char *src) {
+    char rurl[4096];
+    CHECK(!relay_url(src, NULL, rurl, sizeof rurl));
+    int fd = relay_sock(rurl);
+    CHECK(fd >= 0);
+    double t0 = mono_now(), first = -1;
+    sbuf b = {0};
+    char buf[4096];
+    struct timeval tv = {3, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    ssize_t r;
+    while ((r = recv(fd, buf, sizeof buf, 0)) > 0) {
+        sb_addn(&b, buf, (size_t)r);
+        if (first < 0 && b.n >= 8192) first = mono_now() - t0;   /* первые 8 КБ — до конца ответа */
+        if (mono_now() - t0 > 2) break;
+    }
+    close(fd);
+    CHECK(first >= 0 && first < 0.6);   /* первые 8 КБ пришли, пока провайдер ещё спит */
+    CHECK(b.n >= 2 * 8192);
+    sb_free(&b);
+}
+
 /* несколько запросов в одном соединении с ретранслятором (keep-alive со стороны плеера) */
 static int two_on_one(const char *relay_url_a, const char *relay_url_b) {
     const char *pa = strstr(relay_url_a + 7, "/"), *pb = strstr(relay_url_b + 7, "/");
@@ -1138,6 +1232,11 @@ static void test_relay_http(void) {
     CHECK(body && n == UP.seg.n);
     free(body);
     EQI(atomic_load(&UP.conns), 2);
+    {   /* сквозная отдача: куски HLS/TS не копятся в ретрансляторе */
+        char slow[300];
+        snprintf(slow, sizeof slow, "http://127.0.0.1:%d/live/slow.ts", UP.port);
+        relay_streaming(slow);
+    }
     /* keep-alive к плееру: два запроса в одном соединении, второй — кусками (длина у провайдера неизвестна) */
     char churl[300], rch[4096];
     snprintf(churl, sizeof churl, "http://127.0.0.1:%d/live/chunked.ts", UP.port);
@@ -1515,6 +1614,25 @@ static void test_teletext(void) {
     }
     EQI(ttx_glyph(0x41, 0x24), 0x410);   /* «А» */
     EQI(ttx_glyph(0x23, 0), 0xA3);       /* «£» в английском */
+    /* X/26: «е» + ¨ = «ё», знак G2, конец пачки; мозаика и правая половина двойной ширины не трогаются */
+    {
+        ttx_page xp;
+        memset(&xp, 0, sizeof xp);
+        xp.charset = 0x24;
+        xp.has[1] = 1;
+        memset(xp.rows[1], 0x20, 40);
+        xp.rows[1][5] = 0x65;                                 /* е */
+        xp.enh_has = 1;                                        /* пришло обозначение 0 */
+        xp.enh[0][0] = 41 | (0x04 << 6);                       /* группа строки: 41 − 40 = строка 1 */
+        xp.enh[0][1] = 5 | (0x18 << 6) | (0x65 << 11);         /* столбец 5: е + диакритика ¨ */
+        xp.enh[0][2] = 6 | (0x0F << 6) | (0x60 << 11);         /* столбец 6: знак G2 0x60 — «Ω» */
+        xp.enh[0][3] = 40 | (0x1F << 6);                       /* конец */
+        ttx_grid xg;
+        ttx_layout(&xp, NULL, &xg);
+        EQI(xg.ch[40 + 5], 0x451);
+        EQI(xg.ch[40 + 6], 0x3A9);
+        EQI(ttx_g2(0x7F), 0x25A0);
+    }
     relay_reset();
     CHECK(!relay_has_teletext() && ttx_count(relay_ttx()) == 0);
     sb_free(&UP.seg);
@@ -1943,6 +2061,30 @@ static void test_ttml(void) {
     EQI(vt_s[0], 7 * 90000);
     EQI(vt_e[0], 10 * 90000);
     EQS(vt_t[0], "Реплика {b}MP4");
+    /* битый fMP4: base_data_offset у края uint64 и trun без полей не читают память и не зацикливаются */
+    {
+        sbuf seg2 = {0}, traf2 = {0}, moof2 = {0};
+        uint8_t tf[12] = {0}, tr[20] = {0};
+        put32(tf, 1);                       /* base_data_offset */
+        uint64_t base = ~(uint64_t)0 - 4;
+        for (int i = 0; i < 8; i++) tf[4 + i] = (uint8_t)(base >> (56 - 8 * i));
+        put32(tr, 0x301); put32(tr + 4, 1); put32(tr + 8, 0); put32(tr + 12, 1000); put32(tr + 16, 10);
+        box(&traf2, "tfhd", tf, sizeof tf);
+        box(&traf2, "trun", tr, sizeof tr);
+        box(&moof2, "traf", traf2.s, traf2.n);
+        box(&seg2, "moof", moof2.s, moof2.n);
+        mp4sub_init bad = {.kind = MP4SUB_STPP, .timescale = 1000};
+        EQI(mp4sub_parse((const uint8_t *)seg2.s, seg2.n, &bad, vt_cb, NULL), 0);
+        sb_clear(&traf2); sb_clear(&moof2); sb_clear(&seg2);
+        uint8_t tf2[8] = {0, 2, 0, 0, 0, 0, 0, 1}, tr2[8] = {0};
+        put32(tr2 + 4, 0xffffffffu);        /* sample_count, полей нет и size по умолчанию 0 */
+        box(&traf2, "tfhd", tf2, sizeof tf2);
+        box(&traf2, "trun", tr2, sizeof tr2);
+        box(&moof2, "traf", traf2.s, traf2.n);
+        box(&seg2, "moof", moof2.s, moof2.n);
+        EQI(mp4sub_parse((const uint8_t *)seg2.s, seg2.n, &bad, vt_cb, NULL), 0);
+        sb_free(&seg2); sb_free(&traf2); sb_free(&moof2);
+    }
     /* голый TTML-сегмент и WebVTT — тем же входом */
     vt_n = 0;
     EQI(webvtt_segment("\n<tt><body><p begin=\"1s\" end=\"2s\">XML</p></body></tt>", 52, NULL, vt_cb, NULL), 1);
@@ -1956,6 +2098,26 @@ static void test_ttml(void) {
     sb_free(&sm[0]);
     sb_free(&init);
     sb_free(&segb);
+}
+
+static int lang_forms(const char *s) {
+    int n = 1;
+    for (const char *p = s; (p = strchr(p, '|')); p++) n++;
+    return n;
+}
+/* подстановок в форме form (без «%%»); форма за пределами строки — последняя */
+static int lang_form_ph(const char *s, int form) {
+    const char *p = s;
+    for (int f = 0; f < form; f++) {
+        const char *q = strchr(p, '|');
+        if (!q) break;
+        p = q + 1;
+    }
+    const char *e = strchr(p, '|');
+    if (!e) e = p + strlen(p);
+    int n = 0;
+    for (const char *q = p; q < e; q++) if (*q == '%' && q[1] != '%') n++;
+    return n;
 }
 
 static void test_lang(void) {
@@ -1974,15 +2136,41 @@ static void test_lang(void) {
         lang_set(LANG_RU);
         const char *r = tr(i);
         CHECK(*e && *r);
-        int pe = 0, pr = 0;
-        for (const char *p = e; (p = strchr(p, '%')); p++) pe++;
-        for (const char *p = r; (p = strchr(p, '%')); p++) pr++;
-        int fe = 1, fr = 1;
-        for (const char *p = e; (p = strchr(p, '|')); p++) fe++;
-        for (const char *p = r; (p = strchr(p, '|')); p++) fr++;
-        /* подстановок на одну форму — поровну */
-        if (pe / fe != pr / fr) { fails++; fprintf(stderr, "строка %d: подстановки en «%s» / ru «%s»\n", i, e, r); }
+        int fe = lang_forms(e), fr = lang_forms(r);
+        CHECK(fe == 2 || fe == 1);
+        CHECK(fr == 3 || fr == 1);
+        int pe = lang_form_ph(e, 0), pr = lang_form_ph(r, 0);
+        if (pe != pr) { fails++; fprintf(stderr, "строка %d: подстановки en «%s» / ru «%s»\n", i, e, r); }
+        for (int f = 1; f < fe; f++) if (lang_form_ph(e, f) != pe) { fails++; fprintf(stderr, "строка %d: форма %d en «%s»\n", i, f, e); }
+        for (int f = 1; f < fr; f++) if (lang_form_ph(r, f) != pr) { fails++; fprintf(stderr, "строка %d: форма %d ru «%s»\n", i, f, r); }
     }
+}
+
+static void test_epg_urls(void) {
+    playlist p = {0};
+    strlist o = {0};
+    p.epg_mode = EPG_MINE;
+    p.user_epg = "http://a/epg\nhttp://a/epg\nhttp://b/epg";
+    repo_epg_urls(&p, &o);
+    EQI(o.n, 2);
+    EQS(o.v[0], "http://a/epg");
+    EQS(o.v[1], "http://b/epg");
+    sl_clear(&o);
+    p.epg_mode = EPG_BOTH;
+    p.user_epg = "http://a/epg";
+    p.header_epg = "http://a/epg\nhttp://b/epg";
+    repo_epg_urls(&p, &o);
+    EQI(o.n, 2);
+    EQS(o.v[0], "http://a/epg");
+    EQS(o.v[1], "http://b/epg");
+    sl_clear(&o);
+    p.epg_mode = EPG_PLAYLIST;
+    p.user_epg = NULL;
+    p.header_epg = "http://c/epg\nhttp://c/epg";
+    repo_epg_urls(&p, &o);
+    EQI(o.n, 1);
+    EQS(o.v[0], "http://c/epg");
+    sl_clear(&o);
 }
 
 static void test_clock(void) {
@@ -2032,6 +2220,9 @@ int main(void) {
     }
     test_phone();
     test_usb(dir);
+    test_logocache();
+    test_icons();
+    test_reminders();
     test_backup();
     test_tmdb();
     test_cookies();
@@ -2043,6 +2234,7 @@ int main(void) {
     dvbsub_sample();
     cc_sample();
     test_lang();
+    test_epg_urls();
     test_clock();
     char cmd[300];
     snprintf(cmd, sizeof cmd, "rm -rf %s", dir);

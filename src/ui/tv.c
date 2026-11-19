@@ -5,15 +5,18 @@
 #include "layer.h"
 #include "screens.h"
 #include "u.h"
+#include "core/http.h"
 #include "core/relay.h"
 #include "core/ttx.h"
 #include "core/clock.h"
 #include "core/lang.h"
 #include "core/prefs.h"
+#include "core/logocache.h"
 #include "data/catchup.h"
 #include "data/loaders.h"
 #include "player/player.h"
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +27,10 @@ tv_t T;
 #define SEEK_APPLY 0.9
 #define CAROUSEL_SECONDS 1.5
 #define DIGIT_SECONDS 2.0
+
+static void preview_commit(void);
+static int preview_active;
+static channel *preview_hold;
 
 static char toast_msg[300];
 static double toast_until;
@@ -46,7 +53,11 @@ void tv_show_info(int pin) {
 int64_t tv_position(void) {
     int64_t now = clock_now();
     if (!T.arc) return T.paused ? T.pause_at : now;
-    int64_t p = pl_has_picture() ? T.arc_url_start + (int64_t)pl_position() : T.arc_target;
+    /* PL_ENDED: картинки уже нет, но плеер ещё жив — позиция в ссылке верна. Иначе конец
+     * shift-ссылки брал старый arc_target и открывал тот же участок заново. */
+    double pos = pl_position();
+    int at_end = pl_state() == PL_ENDED && pos > 0;
+    int64_t p = (pl_has_picture() || at_end) ? T.arc_url_start + (int64_t)pos : T.arc_target;
     return p > now ? now : p;
 }
 int64_t tv_behind(void) { return clock_now() - tv_position(); }
@@ -94,12 +105,117 @@ static void open_url(const char *url, const char *hdr, double start) {
             subs_stream_changed();
             T.relayed = 1;
             fprintf(stderr, "stream via relay\n");
-            pl_open(r, NULL, start);
+            pl_open(r, NULL, start, T.arc);
             return;
         }
         if (T.tap) { T.tap = T.subs = 0; tv_toast(tr(S_TTX_NOT_HTTP)); }
     }
-    pl_open(url, hdr, start);
+    pl_open(url, hdr, start, T.arc);
+}
+
+/* ---------- прогрев ретранслятора при листании ---------- */
+/* Пока идёт задержка переключения (ZAP_DELAY), тянем главный плейлист канала через ретранслятор: DNS, TCP и TLS
+ * к провайдеру, плейлист и соединение остаются в его пуле — плееру не платить за них при открытии. Прямой TS
+ * (не плейлист) читаем только началом: хватит DNS/TCP/TLS. Свой поток «ptv-warm», новая заявка отменяет прежнюю;
+ * интерфейс не ждёт. */
+typedef struct { char url[4096], hdr[1024]; volatile int *cancel; } warm_job;
+static pthread_mutex_t warm_mu = PTHREAD_MUTEX_INITIALIZER;
+static volatile int *warm_cur;
+
+static void warm_cancel(void) {
+    pthread_mutex_lock(&warm_mu);
+    if (warm_cur) *warm_cur = 1;
+    warm_cur = NULL;
+    pthread_mutex_unlock(&warm_mu);
+}
+
+/* Один запрос прогрева: читаем начало; плейлист (начинается с #EXTM3U) — целиком в body, чтобы вытащить вариант. */
+static long warm_read(const char *url, volatile int *cancel, int *hls, char **body) {
+    hs_req rq = {.url = url, .timeout_ms = 4000, .cancel = cancel};
+    char err[80] = "";
+    hs *h = hs_open(&rq, err, sizeof err);
+    if (!h) return 0;
+    sbuf b = {0};
+    char buf[4096], head[8];
+    size_t hn = 0;
+    int decided = 0;
+    long r, n = 0;
+    if (hls) *hls = 0;
+    while (!*cancel && (r = hs_read(h, buf, sizeof buf)) > 0) {
+        if (hls && !decided) {   /* первое чтение может прийти куском: ждём семь байт «#EXTM3U» */
+            for (long i = 0; i < r && hn < 7; i++) head[hn++] = buf[i];
+            if (hn >= 7) { *hls = !strncmp(head, "#EXTM3U", 7); decided = 1; }
+        }
+        n += r;
+        if (hls && *hls) { if (b.n < (1u << 20)) sb_addn(&b, buf, (size_t)r); }
+        else if (decided && n >= 4096) break;   /* не плейлист: хватит DNS/TCP/TLS */
+        if (n > (2l << 20)) break;              /* плейлисты маленькие: дальше — только зря тянуть */
+    }
+    hs_close(h);
+    if (body) *body = b.s;
+    else sb_free(&b);
+    return n;
+}
+
+static void *warm_thread(void *vp) {
+    warm_job *j = vp;
+    char relay[16384];
+    double t0 = app_now();
+    long total = 0, total2 = 0;
+    int hls = 0, hls2 = 0;
+    if (!relay_url(j->url, j->hdr, relay, sizeof relay) && !*j->cancel) {
+        char *body = NULL;
+        total = warm_read(relay, j->cancel, &hls, &body);
+        /* главный плейлист: вариант — тоже плейлист (обычно другой хост/CDN) — прогреем и его;
+         * у медиаплейлиста строка без «#» — это сегмент, его качать не будем */
+        if (hls && body && !*j->cancel && !strstr(body, "#EXTINF")) {
+            for (const char *l = body; l && *l && !*j->cancel;) {
+                const char *e = strchr(l, '\n');
+                size_t n = e ? (size_t)(e - l) : strlen(l);
+                while (n && (l[n - 1] == '\r' || l[n - 1] == ' ')) n--;
+                if (n && l[0] != '#' && n < sizeof relay) {
+                    char u[4096];
+                    snprintf(u, sizeof u, "%.*s", (int)n, l);
+                    total2 = warm_read(u, j->cancel, &hls2, NULL);
+                    break;
+                }
+                l = e ? e + 1 : NULL;
+            }
+        }
+        free(body);
+    }
+    fprintf(stderr, "relay_warm hls=%d bytes=%ld variant=%ld ms=%.0f\n", hls, total, total2, (app_now() - t0) * 1000);
+    pthread_mutex_lock(&warm_mu);
+    if (warm_cur == j->cancel) warm_cur = NULL;
+    pthread_mutex_unlock(&warm_mu);
+    free((void *)j->cancel);
+    free(j);
+    return NULL;
+}
+
+static void warm_start(const char *url, const char *hdr) {
+    if (!url || !*url) return;
+    warm_cancel();
+    warm_job *j = calloc(1, sizeof *j);
+    volatile int *c = calloc(1, sizeof *c);
+    if (!j || !c) { free(j); free((void *)c); return; }
+    snprintf(j->url, sizeof j->url, "%s", url);
+    snprintf(j->hdr, sizeof j->hdr, "%s", hdr ? hdr : "");
+    j->cancel = c;
+    pthread_mutex_lock(&warm_mu);
+    warm_cur = c;
+    pthread_mutex_unlock(&warm_mu);
+    pthread_t th;
+    if (pthread_create(&th, NULL, warm_thread, j)) {
+        pthread_mutex_lock(&warm_mu);
+        if (warm_cur == c) warm_cur = NULL;
+        pthread_mutex_unlock(&warm_mu);
+        free((void *)c);
+        free(j);
+        return;
+    }
+    pthread_setname_np(th, "ptv-warm");
+    pthread_detach(th);
 }
 
 static void start_stream(void);
@@ -153,6 +269,8 @@ static void request_open(double delay) {
     T.attempts = 0;
     T.failed = 0;
     T.paused = 0;
+    T.stall_at = 0;
+    T.stall_pos = -1;
     app_dirty();
 }
 
@@ -165,8 +283,11 @@ static void remember(void) {
 
 static void really_play(channel *c, const char *gkey, int arc, int64_t t, double delay) {
     if (!c) return;
+    if (preview_active && c != T.cur) preview_commit();
+    T.switch_at = app_now();
     if (c != T.cur) {
         T.scored = 0;
+        T.audio_pref_done = 0;
         repo_add_history(c);
         /* субтитры включали на этом канале — поток сразу через ретранслятор */
         T.cur = c;
@@ -180,12 +301,20 @@ static void really_play(channel *c, const char *gkey, int arc, int64_t t, double
     snprintf(T.group, sizeof T.group, "%s", g ? g->key : ALL_KEY);
     T.arc = arc;
     T.arc_target = t;
+    T.stall_at = 0;
+    T.stall_pos = -1;
     T.seeking = 0;
     T.dig[0] = 0;
     if (!repo_is_locked(c)) { T.pin_passed = 0; snprintf(T.last_unlocked, sizeof T.last_unlocked, "%s", c->key); }
     tv_show_info(0);
     request_open(delay);
     remember();
+    /* задержка листания — время на прогрев: DNS, TCP, TLS и плейлист уже к открытию плеера */
+    if (!arc && delay >= 0.3 && (T.tap || (P.relay_all && !T.direct))) {
+        char hdr[1024];
+        repo_headers(c, hdr, sizeof hdr);
+        warm_start(c->url, hdr);
+    } else warm_cancel();
 }
 
 typedef struct { channel *c; char group[160]; int arc; int64_t t; int dir; } pin_ctx;
@@ -408,7 +537,7 @@ int tv_key(int k, int ev) {
         if (ev == EV_LONG) { tv_open_recent(); return 1; }
         if (ev != EV_SHORT) return 1;
         if (!info_visible()) tv_show_info(1);
-        else if (!T.info_pinned) { T.info_pinned = 1; T.info_expanded = 1; }
+        else if (!T.info_pinned) T.info_pinned = 1;   /* ↓ ↓: закрепить, затем раскрыть описание */
         else T.info_expanded = 1;
         return 1;
     case KEY_LEFT: case KEY_RIGHT: {
@@ -491,10 +620,84 @@ int64_t tv_frame_pts(void) {
 }
 
 /* ---------- плейлист ---------- */
+/* ---------- предпросмотр плейлиста без остановки канала ---------- */
+static int preview_from = -1, preview_last;
+
+static channel *chan_copy(const channel *s) {
+    if (!s) return NULL;
+    channel *d = calloc(1, sizeof *d);
+    if (!d) return NULL;
+    *d = *s;
+#define CP(f) do { if (s->f) { d->f = strdup(s->f); if (!d->f) { free(d->key); free(d->name); free(d->url); free(d->group); free(d->logo); \
+    free(d->tvg_id); free(d->tvg_name); free(d->mkey); free(d->tkey); free(d->cu_type); free(d->cu_source); free(d->ua); free(d->ref); \
+    free(d->headers_json); free(d); return NULL; } } } while (0)
+    CP(key); CP(name); CP(url); CP(group); CP(logo); CP(tvg_id); CP(tvg_name); CP(mkey); CP(tkey);
+    CP(cu_type); CP(cu_source); CP(ua); CP(ref); CP(headers_json);
+#undef CP
+    d->epg_src = d->epg_ch = -1;   /* индексы старого плейлиста к новому не относятся */
+    return d;
+}
+static void chan_free(channel *c) {
+    if (!c) return;
+    free(c->key); free(c->name); free(c->url); free(c->group); free(c->logo); free(c->tvg_id); free(c->tvg_name);
+    free(c->mkey); free(c->tkey); free(c->cu_type); free(c->cu_source); free(c->ua); free(c->ref); free(c->headers_json);
+    free(c);
+}
+
+int tv_is_preview(void) { return preview_active; }
+
+int tv_preview_playlist(int index) {
+    if (index < 0 || index >= R.npl || index == R.cur) return 0;
+    if (!preview_active) {
+        preview_from = R.cur;
+        preview_last = P.last_playlist;
+        if (T.cur) {
+            preview_hold = chan_copy(T.cur);
+            T.cur = preview_hold;   /* NULL при нехватке памяти: видео продолжает играть, инфопанель скрыта */
+        }
+        preview_active = 1;
+    }
+    repo_select(index);
+    P.last_playlist = preview_last;   /* выбранный канал нового плейлиста запишет его сам */
+    app_dirty();
+    return 1;
+}
+
+void tv_preview_back(void) {
+    if (!preview_active) return;
+    int from = preview_from, last = preview_last;
+    char key[160] = "";
+    if (preview_hold) snprintf(key, sizeof key, "%s", preview_hold->key);
+    else if (T.cur) snprintf(key, sizeof key, "%s", T.cur->key);
+    preview_active = 0;
+    T.cur = NULL;
+    repo_select(from);
+    P.last_playlist = last;
+    channel *c = key[0] ? repo_by_key(key) : NULL;
+    chan_free(preview_hold);
+    preview_hold = NULL;
+    T.cur = c;
+    if (c) {
+        group *g = repo_group_of(c, NULL);
+        snprintf(T.group, sizeof T.group, "%s", g ? g->key : ALL_KEY);
+    } else T.group[0] = 0;
+    app_dirty();
+}
+
+static void preview_commit(void) {
+    if (!preview_active) return;
+    preview_active = 0;
+    chan_free(preview_hold);
+    preview_hold = NULL;
+    playlist *p = repo_cur();
+    P.last_playlist = p ? p->id : 0;
+}
+
 static int keep_layer(const layer *l) {
     return l->name && (!strcmp(l->name, "settings") || !strcmp(l->name, "form") || !strcmp(l->name, "choose") || !strcmp(l->name, "confirm"));
 }
 void tv_playlist_changed(int keep) {
+    if (preview_active) { preview_active = 0; chan_free(preview_hold); preview_hold = NULL; T.cur = NULL; }
     char key[160], grp[160];
     snprintf(key, sizeof key, "%s", T.cur && keep ? T.cur->key : P.last_channel);
     snprintf(grp, sizeof grp, "%s", T.group[0] ? T.group : P.last_group);
@@ -553,10 +756,18 @@ void tv_restart(void) {
     loaders_cancel();
     layer_pop_all();
     pl_close();
+    if (preview_active) { preview_active = 0; chan_free(preview_hold); preview_hold = NULL; }
     T.cur = NULL;
     T.group[0] = 0;
     T.arc = T.paused = T.seeking = 0;
+    T.stall_at = 0;
+    T.stall_pos = -1;
     T.pin_passed = 0;
+    T.audio_pref_done = 0;
+    pin_session = 0;                   /* «один раз до выхода» не переживает смену базы настроек */
+    T.info_pinned = T.info_expanded = 0;
+    T.dig[0] = 0;
+    T.failed = 0;
     prefs_load();
     lang_set(P.lang);
     u_init();
@@ -581,10 +792,14 @@ static void begin(void) {
 
 /* ---------- такт ---------- */
 void tv_tick(double now) {
+    static double mq_next;
     keys_tick(now);
     pl_tick();
     loaders_tick();
     layer_tick_all(now);
+    if (d_marquee_active() && now >= mq_next) { mq_next = now + 0.1; app_dirty(); }   /* бегущая строка: 10 к/с — кадр на ТВ дорогой */
+    static double logo_trim_at;
+    if (now >= logo_trim_at) { logo_trim_at = now + 5; logo_trim(); }
     if (T.open_at && now >= T.open_at) { T.open_at = 0; start_stream(); }
     if (T.dig[0] && now - T.dig_at > DIGIT_SECONDS) digits_apply();
     subs_apply();
@@ -598,9 +813,36 @@ void tv_tick(double now) {
         if (st == PL_PLAYING) {
             if (!T.playing_since) {
                 T.playing_since = now;
+                if (T.switch_at) {
+                    /* нажатие → открытие потока → первый кадр: по этим числам видно, что тормозит на ТВ */
+                    fprintf(stderr, "switch_ms=%.0f open_ms=%.0f\n", (now - T.switch_at) * 1000, (now - T.opening_since) * 1000);
+                    T.switch_at = 0;
+                }
                 if (T.direct_pending && !T.relayed && T.cur) { set_direct(T.cur); fprintf(stderr, "relay_direct_saved\n"); }
                 T.direct_pending = 0;
                 app_dirty();
+            }
+            if (!T.audio_pref_done) {
+                int na = pl_audio_count();
+                if (!P.audio_pref[0]) T.audio_pref_done = 1;
+                else if (na > 0) {
+                    T.audio_pref_done = 1;
+                    for (int i = 0; i < na; i++)
+                        if (!strcmp(pl_audio_label(i), P.audio_pref)) { pl_audio_select(i); break; }
+                }
+            }
+            /* сторож: эфир/архив «идёт», но позиция не растёт 20 с — не бесконечная буферизация */
+            if (!T.paused && !T.seeking && !pl_software() && !pl_rebuffering() && pl_has_picture()) {
+                double pos = pl_position();
+                if (T.stall_pos < 0 || pos > T.stall_pos + 0.05) { T.stall_pos = pos; T.stall_at = now; }
+                else if (T.stall_at && now - T.stall_at > 20) {
+                    fprintf(stderr, "player_stalled pos=%.2f\n", pos);
+                    T.stall_at = 0;
+                    T.failed = 1;
+                    snprintf(T.why, sizeof T.why, "stream_stalled");
+                    pl_close();
+                    app_dirty();
+                }
             }
             if (now - T.playing_since > 30) T.attempts = 0;
             if (!T.scored && now - T.playing_since > 300) { T.scored = 1; repo_add_score(T.cur); }
@@ -699,10 +941,13 @@ static void draw_toast(gfx_t *g) {
 static const char *reason(const char *why) {
     if (!strncmp(why, "audio_codec=", 12)) return trf(S_ERR_ACODEC, why + 12);
     if (!strncmp(why, "video_codec=", 12)) return trf(S_ERR_VCODEC, why + 12);
-    if (!strncmp(why, "open_input", 10) || !strncmp(why, "stream_info", 11)) return tr(S_ERR_CONNECT);
+    if (!strncmp(why, "open_input", 10) || !strncmp(why, "stream_info", 11) || !strncmp(why, "player_read_", 12)) return tr(S_ERR_CONNECT);
     if (!strcmp(why, "no_video")) return tr(S_ERR_NO_VIDEO);
-    if (!strcmp(why, "dlopen") || !strcmp(why, "symbols") || !strncmp(why, "manager", 7) || !strcmp(why, "create_player")) return tr(S_ERR_PLAYER);
+    if (!strcmp(why, "dlopen") || !strcmp(why, "symbols") || !strncmp(why, "manager", 7) || !strcmp(why, "create_player") ||
+        !strncmp(why, "player_native_", 14) || !strncmp(why, "player_feed_", 12)) return tr(S_ERR_PLAYER);
     if (!strcmp(why, "stream_ended")) return tr(S_ERR_ENDED);
+    if (!strcmp(why, "stream_stalled")) return tr(S_ERR_STALLED);
+    if (!strcmp(why, "archive_software")) return tr(S_ERR_ARCHIVE_SOFTWARE);
     return tr(S_ERR_GENERIC);
 }
 

@@ -28,6 +28,8 @@
 #define PTV_VERSION "dev"
 #endif
 
+#define HTTP_HEADERS_MAX (64u << 10)
+
 static SSL_CTX *ctx_verify, *ctx_any;
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 static const char *ca_mem;
@@ -63,7 +65,7 @@ struct hs {
     long long length, received, chunk_left;
     char etag[160], last_modified[64], location[2048], error[120];
     char final_url[4096];         /* после редиректов (база для относительных адресов HLS) */
-    char resp[8192]; size_t resp_n;   /* заголовки последнего ответа «Имя: значение\r\n» */
+    sbuf resp;                    /* заголовки последнего ответа «Имя: значение\r\n» — растут по мере чтения */
     /* keep-alive */
     int keepalive, reused, server_close, done;
     char pkey[300];
@@ -144,12 +146,15 @@ static int getbyte(hs *h) {
 }
 static int getline_(hs *h, char *out, size_t cap) {
     size_t n = 0;
+    int over = 0;
     for (;;) {
         int c = getbyte(h);
         if (c < 0) { if (!n) return -1; break; }
         if (c == '\n') break;
         if (n + 1 < cap) out[n++] = (char)c;
+        else over = 1;
     }
+    if (over) return -2;   /* остаток строки дочитан, но не влез: ошибка, а не тихая обрезка */
     while (n && (out[n - 1] == '\r' || out[n - 1] == ' ')) n--;
     out[n] = 0;
     return (int)n;
@@ -430,17 +435,17 @@ static int request1(hs *h, const char *url, const hs_req *rq, const url_t *uu) {
     h->status = atoi(strchr(line, ' ') + 1);
     h->server_close = !strncmp(line, "HTTP/1.0", 8);
     h->done = 0;
-    h->resp_n = 0;
-    h->resp[0] = 0;
+    sb_clear(&h->resp);
     h->length = -1;
     h->chunked = 0;
     h->location[0] = 0;
     for (;;) {
         int n = getline_(h, line, sizeof line);
-        if (n < 0) { snprintf(h->error, sizeof h->error, "headers cut"); return -1; }
+        if (n < 0) { snprintf(h->error, sizeof h->error, n == -2 ? "header too long" : "headers cut"); return -1; }
         if (n == 0) break;
         size_t ll = strlen(line);
-        if (h->resp_n + ll + 3 < sizeof h->resp) { memcpy(h->resp + h->resp_n, line, ll); memcpy(h->resp + h->resp_n + ll, "\r\n", 3); h->resp_n += ll + 2; }
+        if (h->resp.n + ll + 2 > HTTP_HEADERS_MAX) { snprintf(h->error, sizeof h->error, "headers too large"); return -1; }
+        if (sb_addn(&h->resp, line, ll) || sb_add(&h->resp, "\r\n")) { snprintf(h->error, sizeof h->error, "no memory"); return -1; }
         const char *v;
         if (header_is(line, "Content-Length", &v)) h->length = atoll(v);
         else if (header_is(line, "Transfer-Encoding", &v)) h->chunked = strcasestr(v, "chunked") != NULL;
@@ -452,7 +457,7 @@ static int request1(hs *h, const char *url, const hs_req *rq, const url_t *uu) {
     }
     if (h->chunked) h->length = -1;
     h->chunk_left = h->chunked ? -1 : 0;
-    if (rq->cookies) cookies_from_headers(url, h->resp);
+    if (rq->cookies) cookies_from_headers(url, h->resp.s);
     return 0;
 }
 
@@ -510,7 +515,7 @@ int http_split_url(const char *url, http_url *out) {
     return 0;
 }
 void *http_ssl_ctx(int any) { http_init(NULL, 0); return any ? ctx_any : ctx_verify; }
-const char *hs_headers(const hs *h) { return h->resp; }
+const char *hs_headers(const hs *h) { return h->resp.s ? h->resp.s : ""; }
 void http_resolve(const char *base, const char *ref, char *out, size_t cap) { resolve(base, ref, out, cap); }
 long long hs_length(const hs *h) { return h->length; }
 long long hs_received(const hs *h) { return h->received; }
@@ -577,6 +582,7 @@ long hs_read(hs *h, void *buf, size_t n) {
 
 void hs_close(hs *h) {
     if (!h) return;
+    sb_free(&h->resp);
     if (h->file) fclose(h->file);
     if (reusable(h)) pool_put(h);
     conn_close(h);

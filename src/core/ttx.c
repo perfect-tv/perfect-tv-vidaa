@@ -78,6 +78,41 @@ uint32_t ttx_glyph(int c, int charset) {
     return (uint32_t)c;
 }
 
+/* G2 (латиница, дополнительные знаки) 0x20…0x7F — как в Ttx.kt */
+static const char G2[] = " ¡¢£$¥#§¤‘“«←↑→↓" "°±²³×µ¶·÷’”»¼½¾¿" " `´ˆ˜¯˘˙¨ ˚¸_˝˛ˇ" "―¹®©™♪₠‰α   ⅛⅜⅝⅞"
+                         "ΩÆĐªĦ ĲĿŁØŒºÞŦŊŉ" "ĸæđðħıĳŀłøœßþŧŋ■";
+uint32_t ttx_g2(int c) {
+    if (c < 0x20 || c > 0x7F) return 0x20;
+    uint32_t out = nth_cp(G2, c - 0x20);
+    return out ? out : 0x20;
+}
+/* Знак G0 с диакритикой X/26 (режим 0x10…0x1F): без ICU — таблица частых сочетаний. */
+static const struct { uint32_t base, mark, out; } ACC[] = {
+    {0x0435, 8, 0x0451}, {0x0415, 8, 0x0401},   /* е + ¨ = ё */
+    {0x0438, 6, 0x0439}, {0x0418, 6, 0x0419},   /* и + breve = й */
+    {0x0443, 6, 0x045E}, {0x0423, 6, 0x040E},   /* у + breve = ў */
+    {0x0456, 8, 0x0457}, {0x0406, 8, 0x0407},   /* і + ¨ = ї */
+    {0x0061, 0, 0x00E0}, {0x0061, 1, 0x00E1}, {0x0061, 2, 0x00E2}, {0x0061, 3, 0x00E3}, {0x0061, 4, 0x0101}, {0x0061, 8, 0x00E4}, {0x0061, 10, 0x00E5},
+    {0x0041, 0, 0x00C0}, {0x0041, 1, 0x00C1}, {0x0041, 2, 0x00C2}, {0x0041, 3, 0x00C3}, {0x0041, 4, 0x0100}, {0x0041, 8, 0x00C4}, {0x0041, 10, 0x00C5},
+    {0x0063, 11, 0x00E7}, {0x0043, 11, 0x00C7},
+    {0x0065, 0, 0x00E8}, {0x0065, 1, 0x00E9}, {0x0065, 2, 0x00EA}, {0x0065, 8, 0x00EB},
+    {0x0045, 0, 0x00C8}, {0x0045, 1, 0x00C9}, {0x0045, 2, 0x00CA}, {0x0045, 8, 0x00CB},
+    {0x0069, 0, 0x00EC}, {0x0069, 1, 0x00ED}, {0x0069, 2, 0x00EE}, {0x0069, 8, 0x00EF},
+    {0x0049, 0, 0x00CC}, {0x0049, 1, 0x00CD}, {0x0049, 2, 0x00CE}, {0x0049, 8, 0x00CF},
+    {0x006E, 3, 0x00F1}, {0x004E, 3, 0x00D1},
+    {0x006F, 0, 0x00F2}, {0x006F, 1, 0x00F3}, {0x006F, 2, 0x00F4}, {0x006F, 3, 0x00F5}, {0x006F, 8, 0x00F6},
+    {0x004F, 0, 0x00D2}, {0x004F, 1, 0x00D3}, {0x004F, 2, 0x00D4}, {0x004F, 3, 0x00D5}, {0x004F, 8, 0x00D6},
+    {0x0075, 0, 0x00F9}, {0x0075, 1, 0x00FA}, {0x0075, 2, 0x00FB}, {0x0075, 8, 0x00FC},
+    {0x0055, 0, 0x00D9}, {0x0055, 1, 0x00DA}, {0x0055, 2, 0x00DB}, {0x0055, 8, 0x00DC},
+    {0x0079, 1, 0x00FD}, {0x0079, 8, 0x00FF}, {0x0059, 1, 0x00DD},
+    {0x0073, 15, 0x0161}, {0x0053, 15, 0x0160}, {0x007A, 15, 0x017E}, {0x005A, 15, 0x017D},
+    {0x0072, 15, 0x0159}, {0x0052, 15, 0x0158}, {0x0063, 15, 0x010D}, {0x0043, 15, 0x010C},
+};
+static uint32_t accented(uint32_t base, int mark) {
+    for (size_t i = 0; i < sizeof ACC / sizeof ACC[0]; i++) if (ACC[i].base == base && ACC[i].mark == (uint32_t)mark) return ACC[i].out;
+    return base;
+}
+
 /* ---------- декодер ---------- */
 typedef struct { int mag, active, charset, subset; ttx_page p; } builder;
 typedef struct { int64_t pts; ttx_page p; } subrec;
@@ -202,6 +237,8 @@ static void header(ttx *t, int mag, const uint8_t *d, int64_t pts) {
             memcpy(b->p.rows, old->rows, sizeof old->rows);
             memcpy(b->p.has, old->has, sizeof old->has);
             memcpy(b->p.links, old->links, sizeof old->links);
+            memcpy(b->p.enh, old->enh, sizeof old->enh);
+            b->p.enh_has = old->enh_has;
             b->charset = old->charset;
         }
     }
@@ -229,6 +266,15 @@ static void unit(ttx *t, const uint8_t *p, int64_t pts) {
     builder *b = &t->b[mag];
     if (row == 0) header(t, mag, d, pts);
     else if (row <= 24) { if (b->active) { for (int i = 0; i < 40; i++) b->p.rows[row][i] = d[i] & 0x7F; b->p.has[row] = 1; } }
+    else if (row == 26) {   /* X/26: обозначение 0…15 и 13 слов по 18 бит */
+        if (b->active) {
+            int des = ttx_ham84(d[0]);
+            if (des >= 0 && des <= 15) {
+                for (int k = 0; k < 13; k++) b->p.enh[des][k] = ham2418(d, 1 + k * 3);
+                b->p.enh_has |= (uint8_t)(1u << des);
+            }
+        }
+    }
     else if (row == 27) { if (b->active && ttx_ham84(d[0]) == 0) fastext(b, d); }
     else if (row == 28 || row == 29) {
         int des = ttx_ham84(d[0]);
@@ -382,6 +428,33 @@ void ttx_layout(const ttx_page *p, const uint8_t *row0, ttx_grid *g) {
         }
         if (any_dh && r < TTX_ROWS - 1) skip = r + 1;
     }
+    /* X/26 уровня 1.5: знаки G2 и диакритика поверх готовой сетки (как enhance() в Ttx.kt) */
+    if (p->enh_has) {
+        int row = 0;
+        for (int dsn = 0; dsn < 16; dsn++) {
+            if (!(p->enh_has & (1u << dsn))) continue;
+            for (int k = 0; k < 13; k++) {
+                int32_t w = p->enh[dsn][k];
+                int addr = (int)(w & 0x3F), mode = (int)((w >> 6) & 0x1F), data = (int)((w >> 11) & 0x7F);
+                if (addr >= 40) {
+                    if (mode == 0x04) row = addr == 40 ? 24 : addr - 40;
+                    else if (mode == 0x1F) goto enh_done;
+                } else if (row >= 1 && row <= 24 && data >= 0x20) {
+                    uint32_t ch;
+                    if (mode == 0x09) ch = ttx_glyph(data, p->charset);
+                    else if (mode == 0x0F) ch = ttx_g2(data);
+                    else if (mode >= 0x10) ch = accented(ttx_glyph(data, p->charset), mode - 0x10);
+                    else continue;
+                    int i = row * TTX_COLS + addr;
+                    if (!(g->attr[i] & TA_MOSAIC) && !(g->attr[i] & TA_DW_RIGHT)) g->ch[i] = ch;
+                }
+            }
+        }
+    enh_done:;
+    }
+    /* нижние половины двойной высоты — после X/26 (верхний знак мог смениться) */
+    for (int i = TTX_COLS; i < TTX_COLS * TTX_ROWS; i++)
+        if (g->attr[i] & TA_DH_BOTTOM) g->ch[i] = g->ch[i - TTX_COLS];
 }
 
 void ttx_header_row(int number, const ttx_page *p, const char *typed, uint8_t out[TTX_COLS]) {

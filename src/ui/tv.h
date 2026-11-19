@@ -33,6 +33,8 @@ typedef struct {
     double open_at;                  /* открыть поток в этот момент (задержка переключения) */
     int attempts;
     double retry_at, playing_since, opening_since;
+    double switch_at;                /* когда попросили канал: в журнал — switch_ms (нажатие → первый кадр) */
+    double stall_at, stall_pos;      /* сторож: позиция не растёт */
     int failed;
     char why[96];
     int scored;
@@ -41,6 +43,7 @@ typedef struct {
     int sleep_warned;
     /* телетекст и субтитры: поток через ретранслятор (core/relay.c) */
     int tap, subs;                   /* tap — поток через ретранслятор по просьбе (телетекст, субтитры); subs — субтитры вкл. */
+    int audio_pref_done;             /* предпочитаемая звуковая дорожка уже применена к каналу */
     char sub_key[48];                /* выбранные субтитры: «ttx», «dvb:rus:0», «vtt:eng» (subs.c) */
     int relayed;                     /* текущий поток идёт через ретранслятор */
     int direct;                      /* у канала — прямое подключение (через ретранслятор не открылся) */
@@ -71,6 +74,11 @@ void tv_set_sleep(int minutes);      /* 0 — выкл. */
 int tv_sleep_minutes(void);
 /* После загрузки плейлиста / смены плейлиста. */
 void tv_playlist_changed(int keep_channel);
+/* Предпросмотр плейлиста без остановки текущего канала: гид показывает новый список,
+ * видео играет до выбора канала; «Назад» возвращает прежний плейлист. */
+int tv_preview_playlist(int index);
+void tv_preview_back(void);
+int tv_is_preview(void);
 void tv_restart(void);               /* после восстановления копии */
 void tv_teletext(void);              /* открыть телетекст (поток — через ретранслятор) */
 void tv_set_subtitles(int on);       /* вкл. — запомненные или первые доступные субтитры, выкл. */

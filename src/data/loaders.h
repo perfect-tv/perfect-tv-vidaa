@@ -12,6 +12,7 @@ void load_epg(int force);
 void loaders_tick(void);
 void loaders_cancel(void);
 int loaders_playlist_busy(void);
+int loaders_epg_busy(void);
 /* Прогресс для строки состояния: 0..100 или -1 (размер неизвестен); каналов разобрано. */
 int loaders_playlist_progress(int *channels);
 int loaders_epg_progress(long *programmes);

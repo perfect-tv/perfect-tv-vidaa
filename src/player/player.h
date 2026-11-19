@@ -9,7 +9,7 @@
 enum { PL_IDLE = 0, PL_OPENING, PL_PLAYING, PL_FAILED, PL_ENDED };
 
 /* Открыть поток (заменяет текущий); start — позиция в секундах внутри ссылки (VOD), 0 — с начала/края. */
-void pl_open(const char *url, const char *headers, double start);
+void pl_open(const char *url, const char *headers, double start, int archive);
 void pl_close(void);
 int pl_state(void);
 const char *pl_why(void);            /* код отказа (open_input=…, video_codec=h264…) */
@@ -23,6 +23,7 @@ int pl_software(void);
 int pl_rebuffering(void);
 int pl_video_size(int *w, int *h);   /* 0 — известно */
 const char *pl_codecs(void);         /* «h264 · AAC» */
+int pl_video_bitrate(void);          /* бит/с видео из потока, 0 — неизвестно */
 int pl_set_aspect(int aspect);       /* ASPECT_* из prefs.h */
 int pl_audio_count(void);
 const char *pl_audio_label(int i);

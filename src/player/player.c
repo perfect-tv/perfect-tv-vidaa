@@ -15,12 +15,13 @@
 #include <string.h>
 #include <time.h>
 
-typedef struct { struct hmc_player *old, *h; struct swp *old_sw, *sw; char url[4096], headers[1024], why[96]; double start; } pjob;
+typedef struct { struct hmc_player *old, *h; struct swp *old_sw, *sw; char url[4096], headers[1024], why[96]; double start; int arc; } pjob;
 
 static struct {
     int busy, want;
     char url[4096], headers[1024];
     double start;
+    int arc;
     struct hmc_player *h;
     struct swp *sw;
     int state;
@@ -61,10 +62,16 @@ static void job_work(void *p) {
     if (!j->url[0]) return;
     j->h = hmc_player_open(j->url, j->headers[0] ? j->headers : NULL, j->start, SCREEN_W, SCREEN_H, j->why, sizeof j->why);
     if (!j->h && software_reason(j->why)) {
-        char why2[96];
-        fprintf(stderr, "player=software reason=%s\n", j->why);
-        j->sw = swp_open(j->url, why2, sizeof why2);
-        if (!j->sw) fprintf(stderr, "player=software_failed reason=%s\n", why2);
+        if (j->arc) {
+            /* swp_open не принимает start и не умеет seek: архив с начала ссылки — неверный участок */
+            snprintf(j->why, sizeof j->why, "archive_software");
+            fprintf(stderr, "player=software_archive_skip\n");
+        } else {
+            char why2[96];
+            fprintf(stderr, "player=software reason=%s\n", j->why);
+            j->sw = swp_open(j->url, why2, sizeof why2);
+            if (!j->sw) fprintf(stderr, "player=software_failed reason=%s\n", why2);
+        }
     }
 }
 
@@ -97,6 +104,7 @@ static void launch(void) {
         str_copy(j->url, sizeof j->url, S.url);
         str_copy(j->headers, sizeof j->headers, S.headers);
         j->start = S.start;
+        j->arc = S.arc;
         S.want = 0;
         S.state = S.url[0] ? PL_OPENING : PL_IDLE;
     } else return;
@@ -106,7 +114,7 @@ static void launch(void) {
     pool_submit(job_work, job_done, j);
 }
 
-void pl_open(const char *url, const char *headers, double start) {
+void pl_open(const char *url, const char *headers, double start, int archive) {
 #ifndef PTV_HOST
     static int log_set;
     if (!log_set) { av_log_set_callback(ff_log); av_log_set_level(AV_LOG_WARNING); log_set = 1; }
@@ -114,6 +122,7 @@ void pl_open(const char *url, const char *headers, double start) {
     str_copy(S.url, sizeof S.url, url);
     str_copy(S.headers, sizeof S.headers, headers ? headers : "");
     S.start = start;
+    S.arc = archive;
     S.want = 1;
     S.state = PL_OPENING;
     S.why[0] = 0;
@@ -148,7 +157,7 @@ void pl_tick(void) {
         }
         if (now >= S.snap_at) {
             S.snap_at = now + 1.0;
-            if (S.h) hmc_player_snapshot(S.h, &S.snap, "", 0);
+            if (S.h) hmc_player_snapshot(S.h, &S.snap, "", 1);   /* кодек, пиксели, fps и битрейт — раз в секунду */
             else {
                 int snd = 0;
                 swp_info(S.sw, &S.snap.width, &S.snap.height, S.snap.video_codec, sizeof S.snap.video_codec, S.snap.audio_codec, sizeof S.snap.audio_codec, &snd);
@@ -157,9 +166,11 @@ void pl_tick(void) {
         }
     } else if (st == HMC_FAILED) {
         if (S.state != PL_FAILED) {
-            fprintf(stderr, "player_state=failed error=%d stage=%s\n", hmc_player_error(S.h), hmc_player_error_stage(S.h));
+            int err = hmc_player_error(S.h);
+            const char *stage = hmc_player_error_stage(S.h);
+            fprintf(stderr, "player_state=failed error=%d stage=%s\n", err, stage);
             S.state = PL_FAILED;
-            snprintf(S.why, sizeof S.why, "stream_ended");
+            snprintf(S.why, sizeof S.why, "player_%s_%d", stage, err);
             app_dirty();
         }
     } else if (st == HMC_ENDED) {
@@ -199,6 +210,7 @@ int pl_video_size(int *w, int *h) {
     return 0;
 }
 const char *pl_codecs(void) { return S.codecs; }
+int pl_video_bitrate(void) { return S.snap.stats_valid & PL_STAT_VIDEO_RATE ? (int)(S.snap.video_bitrate + 0.5) : 0; }
 int pl_set_aspect(int a) {
     static const int map[] = {PL_ASPECT_FIT, PL_ASPECT_STRETCH, PL_ASPECT_16_9, PL_ASPECT_4_3};
     if (!S.h || S.busy || a < 0 || a > 3) return -1;

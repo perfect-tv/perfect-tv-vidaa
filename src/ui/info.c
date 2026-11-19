@@ -101,6 +101,14 @@ static void draw_badges(gfx_t *g, int x, int cy, int arch) {
         x += d_badge(g, x, cy, em, C_ARCHIVE, C_ON_ARCHIVE, -1, b) + gap;
     } else x += d_badge(g, x, cy, em, C_LIVE, C_WHITE, -1, tr(S_LIVE)) + gap;
     if (quality_badge(b, sizeof b)) x += d_badge(g, x, cy, em, C_FILL_ACTIVE, C_WHITE, -1, b) + gap;
+    int br = pl_video_bitrate();
+    if (br > 0) {   /* битрейт видео: у Android он в названии видеодорожки, здесь — бейджем */
+        char n[16];
+        if (br >= 1000000) snprintf(n, sizeof n, "%.1f", br / 1000000.0);
+        else snprintf(n, sizeof n, "%d", (br + 500) / 1000);
+        if (lang_is_ru()) for (char *c = n; *c; c++) if (*c == '.') *c = ',';
+        x += d_badge(g, x, cy, em, C_FILL_ACTIVE, C_WHITE, -1, trf(br >= 1000000 ? S_BITRATE_MBPS : S_BITRATE_KBPS, n)) + gap;
+    }
     if (pl_software() && pl_has_picture()) x += d_badge(g, x, cy, em, C_FILL_ACTIVE, C_WHITE, -1, "SW") + gap;
     if (pl_audio_count() > 1) { snprintf(b, sizeof b, tr(S_AUDIO_N), pl_audio_count()); x += d_badge(g, x, cy, em, C_FILL_ACTIVE, C_WHITE, -1, b) + gap; }
     /* субтитры: включённые — белым */
@@ -147,10 +155,20 @@ static void draw_more(gfx_t *g, int x, int y, int cw, int bh, channel *c, int ha
         size_t tl = strlen(tags);
         if (p->cat[0]) tl += (size_t)snprintf(tags + tl, sizeof tags - tl, " · %s", p->cat);
         if (p->sub[0] && tl < sizeof tags) tl += (size_t)snprintf(tags + tl, sizeof tags - tl, " · %s", p->sub);
-        if (tm && tm->year[0] && tl < sizeof tags) tl += (size_t)snprintf(tags + tl, sizeof tags - tl, " · %s", tm->year);
-        if (tm && tm->vote > 0 && tl < sizeof tags) snprintf(tags + tl, sizeof tags - tl, " · ★ %.1f", tm->vote);
+        if (tm && tm->year[0] && tl < sizeof tags) snprintf(tags + tl, sizeof tags - tl, " · %s", tm->year);
     } else snprintf(tags, sizeof tags, "%s", tr(S_NO_PROGRAMME));
     d_text(g, dx, y, 1.2, F_R, WA(0.65), tags, dw);
+    if (has && tm && tm->vote > 0) {
+        /* ★ в шрифтах нет — значок I_STAR, число рядом */
+        int tw = d_text_w(1.2, F_R, tags), sz = E(1.0), sx = dx + tw + E(0.7);
+        if (sx + sz + E(2.5) < dx + dw) {
+            d_icon(g, I_STAR, sx + sz / 2, y + d_line_h(1.2, F_R) / 2, sz, WA(0.65));
+            char v[16];
+            snprintf(v, sizeof v, "%.1f", tm->vote);
+            int rx = sx + sz + E(0.35);
+            d_text(g, rx, y, 1.2, F_R, WA(0.65), v, dw - (rx - dx));
+        }
+    }
     if (has) {
         const char *desc = tm && tm->overview[0] && (!p->desc[0] || tm->unique) ? tm->overview : p->desc[0] ? p->desc : tst == TMDB_LOADING ? "…" : "";
         double gap = 1.3 * 0.12;
@@ -219,7 +237,7 @@ void info_draw(gfx_t *g) {
     if (has) snprintf(title, sizeof title, "%s", p.title);
     else if (arch || T.seeking) { char hm[8]; fmt_hm(ref, hm); snprintf(title, sizeof title, "%s %s", tr(S_ARCHIVE), hm); }
     else snprintf(title, sizeof title, "%s", tr(S_NO_PROGRAMME));
-    d_text_mid(g, tx, ct + E(2.4) + E(1.45), 2.2, F_B, C_WHITE, title, tw);
+    d_marquee(g, tx, ct + E(2.4) + E(1.45), 2.2, F_B, C_WHITE, title, tw, 1, 4);
     /* шкала: передача, а без неё — получасовой слот вокруг позиции */
     int64_t from = has ? p.start : ref - ((ref % SLOT) + SLOT) % SLOT, to = has ? p.stop : from + SLOT;
     char a1[8], a2[8], remain[64] = "";

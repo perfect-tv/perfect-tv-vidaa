@@ -7,6 +7,10 @@
 #define MAX_CLUTS 8
 #define MAX_OBJS 32
 #define HIST 16
+/* Область DVB — не больше кадра HD: поток с 4096×4096 иначе даёт 16 МБ на область и 64 МБ на ARGB. */
+#define MAX_W 1920
+#define MAX_H 1080
+#define MAX_PIX (MAX_W * MAX_H)
 
 typedef struct { int obj, x, y; } objref;
 typedef struct {
@@ -159,7 +163,7 @@ static void region_composition(dvbsub *d, const uint8_t *s, int len) {
     region *r = region_get(d, s[0], 1);
     if (!r) return;
     int fill = (s[1] >> 3) & 1, w = be16(s + 2), h = be16(s + 4);
-    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return;
+    if (w <= 0 || h <= 0 || w > MAX_W || h > MAX_H || w * h > MAX_PIX) return;
     if (!r->pix || r->w != w || r->h != h) {
         free(r->pix);
         r->pix = calloc((size_t)w * (size_t)h, 1);
@@ -380,7 +384,7 @@ void dvbsub_feed(dvbsub *d, const uint8_t *s, size_t n, int64_t pts) {
             case 0x11: region_composition(d, seg, len); break;
             case 0x12: clut_definition(d, seg, len); break;
             case 0x13: object_data(d, seg, len); break;
-            case 0x14: if (len >= 5) { d->dw = be16(seg + 1) + 1; d->dh = be16(seg + 3) + 1; } break;
+            case 0x14: if (len >= 5) { int w = be16(seg + 1) + 1, h = be16(seg + 3) + 1; if (w <= MAX_W && h <= MAX_H && w * h <= MAX_PIX) { d->dw = w; d->dh = h; } } break;
             case 0x80: if (d->pending) emit(d); break;
             }
         p += 6 + (size_t)len;

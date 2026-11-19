@@ -94,7 +94,7 @@ static void build(void) {
     } else if (M.page == P_LIST) {
         M.ntiles = 0;
         add(E_HEAD, 0, -1, 0, tr(S_CHANNEL_LIST), NULL);
-        add(E_ITEM, A_VIEW, -1, 0, tr(S_VIEW), tr(P.guide_mode == GUIDE_LIST ? S_GUIDE_LIST : S_GUIDE_GRID));
+        add(E_ITEM, A_VIEW, -1, 0, tr(S_VIEW), guide_mode_name());
         add(E_ITEM, A_ADAPTIVE, -1, 0, tr(S_ADAPTIVE), tr(P.adaptive ? S_ON : S_OFF));
         char n[16];
         snprintf(n, sizeof n, "%d", repo_hidden_count());
@@ -143,12 +143,13 @@ static void choose_playlist(int i, void *ctx) {
     (void)ctx;
     if (i == R.cur || i < 0 || i >= R.npl) return;
     loaders_cancel();
-    R.cur = i;
     char path[700];
     repo_channels_path(R.pl[i].id, path, sizeof path);
-    if (!file_exists(path)) { layer_pop_all(); repo_select(i); load_playlist(i, 1); return; }
-    tv_playlist_changed(0);
-    load_epg(0);
+    if (!file_exists(path)) { layer_pop_all(); R.cur = i; tv_playlist_changed(0); load_playlist(i, 1); return; }
+    layer_pop_all();
+    /* как в Android: видео прежнего канала продолжает играть, гид открывается на новом */
+    if (tv_preview_playlist(i)) { tv_open_guide(); load_epg(0); }
+    else { tv_playlist_changed(0); load_epg(0); }
 }
 
 static void activate(ent *e, int dir) {
@@ -175,7 +176,13 @@ static void activate(ent *e, int dir) {
     }
     case A_AUDIO: {
         int n = pl_audio_count(), cur = pl_audio_selected();
-        if (n > 1) pl_audio_select(((cur + (dir ? dir : 1)) % n + n) % n);
+        if (n > 1) {
+            int ni = ((cur + (dir ? dir : 1)) % n + n) % n;
+            if (pl_audio_select(ni) == 0) {
+                snprintf(P.audio_pref, sizeof P.audio_pref, "%s", pl_audio_label(ni));
+                prefs_save();
+            }
+        }
         break;
     }
     case A_ASPECT:
@@ -206,7 +213,7 @@ static void activate(ent *e, int dir) {
     case A_SETTINGS: close_menu(); tv_open_settings(); break;
     case A_CAT_HIDE: tv_toast(trf(S_HIDDEN_DONE, c->group)); repo_hide_group(c->group); close_menu(); break;
     case A_CAT_LOCK: lock_toggle(1); return;
-    case A_VIEW: P.guide_mode = P.guide_mode == GUIDE_LIST ? GUIDE_GRID : GUIDE_LIST; prefs_save(); break;
+    case A_VIEW: P.guide_mode = (P.guide_mode + (dir ? dir : 1) + 4) % 4; prefs_save(); break;
     case A_ADAPTIVE: P.adaptive = !P.adaptive; prefs_save(); repo_apply_view(); break;
     case A_HIDDEN: close_menu(); hidden_open(); break;
     case A_PLAYLIST: {

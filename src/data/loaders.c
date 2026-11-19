@@ -350,10 +350,14 @@ void loaders_cancel(void) {
     cancel_all = 1;
     if (pl_busy) pl_busy->cancel = 1;
     if (epg_busy) epg_busy->cancel = 1;
+    int busy_src = epg_busy ? epg_busy->src : -1;
     epg_nqueue = 0;
-    for (int i = 0; i < R.nepg; i++) R.epg[i].loading = 0;
+    /* у идущей сборки loading не снимаем: по нему repo_gc_epg/epg_remove_files не трогают *.new */
+    for (int i = 0; i < R.nepg; i++) if (i != busy_src) R.epg[i].loading = 0;
     cancel_all = 0;
 }
+
+int loaders_epg_busy(void) { return epg_busy != NULL; }
 
 void loaders_tick(void) {
     static double next;

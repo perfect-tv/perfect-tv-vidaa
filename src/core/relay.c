@@ -662,7 +662,7 @@ static void rtsp_keepalive(up *u, double now);
 static void up_free(up *u) {
     if (u->dead) return;
     u->dead = 1;
-    if (u->dns) u->dns->cancelled = 1;   /* поток DNS ещё работает: итог выбросит цикл */
+    if (u->dns) { u->dns->cancelled = 1; u->dns = NULL; }   /* поток DNS ещё работает: итог выбросит цикл */
     if (u->rt) rtsp_teardown(u);
     if (u->fd >= 0) { epoll_ctl(ep, EPOLL_CTL_DEL, u->fd, NULL); }
     if (u->ssl) SSL_free(u->ssl);
@@ -696,6 +696,7 @@ static void up_to_pool(up *u) {
     u->c = NULL;
     u->st = U_IDLE;
     u->in_n = 0;
+    u->again = 0;   /* в пуле нечего дочитывать: иначе epoll_wait(..., 0) крутится до T_POOL */
     u->deadline = mono_now() + T_POOL;
     if (pool_count() > POOL_MAX) {   /* самое старое — закрыть */
         up *old = NULL;
@@ -733,7 +734,9 @@ static void *dns_thread(void *arg) {
         }
         freeaddrinfo(res);
     }
-    if (write(wake_w, &j, sizeof j) != sizeof j) free(j);
+    /* Труба не приняла задачу (переполнена/закрыта): не освобождаем j — на него ещё смотрит u->dns;
+     * цикл освободит его при отмене, иначе задача останется до завершения процесса. */
+    if (write(wake_w, &j, sizeof j) != sizeof j) j->cancelled = 1;
     return NULL;
 }
 
@@ -900,6 +903,7 @@ static void up_start_request(up *u) {
     u->length = -1;
     u->received = u->chunk_left = 0;
     u->in_n = 0;
+    u->again = 0;
     u->location[0] = 0;
     sb_clear(&u->headers);
     u->paused = 0;
@@ -1003,6 +1007,7 @@ static void client_reply_simple(cl *c, int code) {
     snprintf(b, sizeof b, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", code, reason(code));
     out_add(c, b, strlen(b));
     c->busy = 0;
+    c->head_sent = 1;   /* ответ начат: следующие ошибки только обрывают соединение */
     c->finishing = 1;
     c->keep = 0;
     client_flush(c);
@@ -1028,6 +1033,7 @@ static void client_send_head(cl *c, up *u, long long len) {
 
 /* кусок тела от провайдера */
 static void client_deliver(cl *c, up *u, const char *d, size_t n) {
+    if (c->dead || c->finishing) return;
     if (!c->decided) {
         int enc = u->headers.s && strcasestr(u->headers.s, "Content-Encoding:") && !strcasestr(u->headers.s, "Content-Encoding: identity");
         c->playlist = !enc && (c->content_mpegurl || is_playlist(d, n));
@@ -1082,6 +1088,7 @@ static void up_body(up *u, int eof) {
             size_t take = u->in_n - pos;
             if (u->length >= 0 && (long long)take > u->length - u->received) take = (size_t)(u->length - u->received);
             client_deliver(c, u, u->in + pos, take);
+            if (!c || c->dead) return;   /* ответ уже завершён/плеер закрыт — u->in мог быть освобождён */
             pos += take;
             u->received += (long long)take;
             if (u->length >= 0 && u->received >= u->length) break;
@@ -1100,6 +1107,7 @@ static void up_body(up *u, int eof) {
             size_t take = u->in_n - pos;
             if ((long long)take > u->chunk_left) take = (size_t)u->chunk_left;
             client_deliver(c, u, u->in + pos, take);
+            if (!c || c->dead) return;   /* ответ уже завершён/плеер закрыт — u->in мог быть освобождён */
             pos += take;
             u->chunk_left -= (long long)take;
             if (!u->chunk_left) u->phase = 2;
@@ -1109,9 +1117,9 @@ static void up_body(up *u, int eof) {
             u->phase = 0;
         }
     }
+    if (!c || c->dead) return;
     memmove(u->in, u->in + pos, u->in_n - pos);
     u->in_n -= pos;
-    if (!c || c->dead) return;
     int done = u->chunked ? u->phase == 4 : u->length >= 0 && u->received >= u->length;
     if (done) { client_upstream_done(c, 1); return; }
     if (eof) {
@@ -1518,6 +1526,20 @@ static void hdr_val(const char *head, const char *name, char *out, size_t cap) {
         if (p) p += 2;
     }
 }
+
+/* Content-Length ответа/запроса RTSP: 0 — заголовка нет, -1 — битый/слишком большой. */
+#define RTSP_BODY_MAX (4u << 20)
+static int rtsp_body_len(const char *head, size_t *out) {
+    char cl_[32];
+    hdr_val(head, "Content-Length", cl_, sizeof cl_);
+    if (!cl_[0]) { *out = 0; return 0; }
+    char *end;
+    long long v = strtoll(cl_, &end, 10);
+    while (*end == ' ' || *end == '\t') end++;
+    if (end == cl_ || *end || v < 0 || v > RTSP_BODY_MAX) return -1;
+    *out = (size_t)v;
+    return 1;
+}
 static void auth_param(const char *h, const char *name, char *out, size_t cap) {
     out[0] = 0;
     const char *p = strcasestr(h, name);
@@ -1636,11 +1658,12 @@ static void rtsp_parse(up *u) {
             if (!e) { if (n > 64 * 1024) { rtsp_fail(u, 502, "head"); return; } break; }
             size_t hl = (size_t)(e - (char *)p) + 4;
             char *head = xstrndup((char *)p, hl);
-            char cl_[32];
-            hdr_val(head, "Content-Length", cl_, sizeof cl_);
-            size_t bl = (size_t)atol(cl_);
-            if (n < hl + bl) { free(head); break; }
+            if (!head) { rtsp_fail(u, 502, "memory"); return; }
+            size_t bl;
+            if (rtsp_body_len(head, &bl) < 0) { free(head); rtsp_fail(u, 502, "content_length"); return; }
+            if (bl > n - hl) { free(head); break; }
             char *body = xstrndup((char *)p + hl, bl);
+            if (!body) { free(head); rtsp_fail(u, 502, "memory"); return; }
             const char *sp = strchr(head, ' ');
             int status = sp ? atoi(sp + 1) : 0;
             pos += hl + bl;
@@ -1654,16 +1677,19 @@ static void rtsp_parse(up *u) {
             char *e = memmem(p, n, "\r\n\r\n", 4);
             if (!e) break;
             size_t hl = (size_t)(e - (char *)p) + 4;
-            char *head = xstrndup((char *)p, hl), cl_[32];
-            hdr_val(head, "Content-Length", cl_, sizeof cl_);
+            char *head = xstrndup((char *)p, hl);
+            if (!head) { rtsp_fail(u, 502, "memory"); return; }
+            size_t bl;
+            int bad = rtsp_body_len(head, &bl) < 0;
             free(head);
-            size_t bl = (size_t)atol(cl_);
-            if (n < hl + bl) break;
+            if (bad) { rtsp_fail(u, 502, "content_length"); return; }
+            if (bl > n - hl) break;
             pos += hl + bl;
             continue;
         }
         pos++;
     }
+    if (u->dead) return;   /* rtsp_fail/stream_data могли освободить u->in */
     memmove(u->in, u->in + pos, u->in_n - pos);
     u->in_n -= pos;
 }

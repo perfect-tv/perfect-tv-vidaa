@@ -9,6 +9,7 @@
 #include "core/clock.h"
 #include "core/lang.h"
 #include "core/prefs.h"
+#include "core/qr.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -16,6 +17,11 @@
 static void window(gfx_t *g, int x, int y, int w, int h) {
     d_fill(g, 0, 0, SW, SH, C_OVERLAY);
     d_round(g, x, y, w, h, E(1), C_POPUP);
+}
+/* то же, но панель плотная: окна «О программе» открываются поверх настроек, сквозь них не должно быть видно строк */
+static void window_solid(gfx_t *g, int x, int y, int w, int h) {
+    d_fill(g, 0, 0, SW, SH, C_OVERLAY);
+    d_round(g, x, y, w, h, E(1), C_POPUP | 0xff000000u);
 }
 static int button(gfx_t *g, int x, int y, const char *label, int focused) {
     int w = d_text_w(1.25, F_S, label) + E(3), h = E(3);
@@ -137,7 +143,7 @@ void card_open(channel *c, const prog *p) {
 }
 
 /* ================= недавние каналы ================= */
-static struct { channel *ch[HISTORY_SIZE]; int n, focus; } RC;
+static struct { channel *ch[HISTORY_SIZE]; int n, focus, top; } RC;
 static layer RL;
 static int recent_has_long(layer *l, int k) { (void)l; return k == KEY_OK; }
 static int recent_key(layer *l, int k, int ev) {
@@ -150,18 +156,33 @@ static int recent_key(layer *l, int k, int ev) {
     else if (k == KEY_MENU) { channel *c = RC.ch[RC.focus]; layer_pop(&RL); tv_open_menu(c, NULL, 1); }
     return 1;
 }
+/* Сколько строк влезает между верхним и нижним полем (окно не выше экрана). */
+static int recent_vis(void) {
+    int row = E(5.0), v = (SH - E(4.8) - E(6)) / row;
+    return v < 1 ? 1 : v;
+}
 static void recent_draw(layer *l, gfx_t *g) {
     (void)l;
-    int w = E(44), row = E(5.0), h = E(6) + (RC.n ? RC.n : 1) * row, x = E(4), y = SH - E(2.4) - h;
+    int vis = recent_vis();
+    if (RC.n > vis) {
+        if (RC.focus < RC.top) RC.top = RC.focus;
+        if (RC.focus >= RC.top + vis) RC.top = RC.focus - vis + 1;
+        if (RC.top > RC.n - vis) RC.top = RC.n - vis;
+        if (RC.top < 0) RC.top = 0;
+    } else RC.top = 0;
+    int rows = RC.n ? RC.n : 1;
+    if (rows > vis) rows = vis;
+    int w = E(44), row = E(5.0), h = E(6) + rows * row, x = E(4), y = SH - E(2.4) - h;
     d_hgrad(g, 0, 0, SW / 2, SH, BA(0.6), 0);
     d_round(g, x, y, w, h, E(1), C_POPUP);
     d_text(g, x + E(1.5), y + E(1.2), 1.5, F_B, C_WHITE, tr(S_RECENT_CHANNELS), w - E(3));
     int ly = y + E(4.4);
     if (!RC.n) d_text(g, x + E(1.5), ly, 1.25, F_R, C_TEXT3, tr(S_NO_RECENT), w - E(3));
     int64_t now = clock_now();
-    for (int i = 0; i < RC.n; i++) {
+    for (int k = 0; k < rows && RC.top + k < RC.n; k++) {
+        int i = RC.top + k;
         channel *c = RC.ch[i];
-        int ry = ly + i * row, foc = i == RC.focus;
+        int ry = ly + k * row, foc = i == RC.focus;
         if (foc) d_round(g, x + E(0.8), ry, w - E(1.6), row - E(0.4), E(0.5), C_WHITE);
         uint32_t fg = foc ? 0xff101010u : C_WHITE, fg2 = foc ? 0xff404040u : C_TEXT3;
         int lh = row - E(1.2), lw = lh * 96 / 66;
@@ -185,7 +206,7 @@ void recent_open(void) {
     RL.has_long = recent_has_long;
     RL.draw = recent_draw;
     RC.n = repo_recent(T.cur, RC.ch, HISTORY_SIZE - 1);
-    RC.focus = 0;
+    RC.focus = RC.top = 0;
     layer_push(&RL);
 }
 
@@ -323,11 +344,14 @@ static layer RML;
 static int rem_missed(const reminder *r) { return r->start <= clock_now() - 60 && r->stop <= clock_now(); }
 static channel *rem_channel(const reminder *r) {
     playlist *p = repo_cur();
-    return p && p->id == r->playlist ? repo_by_key(r->key) : repo_by_key(r->key);
+    /* чужой плейлист: канал ищется только в нём, а не по одноимённому в текущем */
+    return p && p->id == r->playlist ? repo_by_key(r->key) : NULL;
 }
 static int rem_archive(const reminder *r) {
-    channel *c = rem_channel(r);
-    return c && repo_has_archive(c) && r->start >= clock_now() - (int64_t)c->archive_days * 86400;
+    /* глубина архива записана при создании: у чужого плейлиста канала здесь нет */
+    int days = r->archive_days;
+    if (days <= 0) { channel *c = rem_channel(r); days = c && repo_has_archive(c) ? c->archive_days : 0; }
+    return days > 0 && r->start >= clock_now() - (int64_t)days * 86400;
 }
 static void rem_rebuild(void) {
     int64_t now = clock_now();
@@ -366,6 +390,22 @@ static int rem_key(layer *l, int k, int ev) {
         int64_t start = r->start;
         switch (RM.focus) {
         case 0:
+            if (!c && r->playlist != (repo_cur() ? repo_cur()->id : 0)) {
+                /* напоминание другого плейлиста: перейти в него, затем включить канал */
+                int idx = -1;
+                for (int i2 = 0; i2 < R.npl; i2++) if (R.pl[i2].id == r->playlist) { idx = i2; break; }
+                char key[160], path[700];
+                snprintf(key, sizeof key, "%s", r->key);
+                if (idx >= 0) repo_channels_path(R.pl[idx].id, path, sizeof path);
+                if (idx >= 0 && file_exists(path)) {
+                    rem_done(1);
+                    layer_pop_all();
+                    tv_preview_playlist(idx);
+                    channel *nc = repo_by_key(key);
+                    if (nc) { if (missed) tv_play_archive(nc, start, NULL); else tv_play(nc, NULL); }
+                } else tv_toast(tr(S_LOADING_PLAYLIST));
+                break;
+            }
             rem_done(!missed);
             layer_pop_all();
             if (c) { if (missed) tv_play_archive(c, start, NULL); else tv_play(c, NULL); }
@@ -389,7 +429,7 @@ static void rem_draw(layer *l, gfx_t *g) {
     if (!RM.n) return;
     reminder *r = &R.rem[RM.idx[RM.cur]];
     int missed = rem_missed(r);
-    int w = E(50), h = E(19), x = SW - E(4) - w, y = E(2.4);
+    int w = E(50), h = E(r->desc[0] ? 22 : 19), x = SW - E(4) - w, y = E(2.4);
     d_round(g, x, y, w, h, E(1), C_POPUP);
     int ix = x + E(1.8), iw = w - E(3.6), iy = y + E(1.4);
     int64_t now = clock_now();
@@ -403,18 +443,22 @@ static void rem_draw(layer *l, gfx_t *g) {
     fmt_hm(r->start, hm);
     snprintf(line, sizeof line, "%s  ·  %s", r->name, hm);
     d_text(g, ix, iy + E(2.4), 1.2, F_R, C_TEXT2, line, iw);
-    d_lines(g, ix, iy + E(4.6), iw, 1.6, F_B, C_WHITE, r->title, 2, 0);
+    int tl = d_lines(g, ix, iy + E(4.6), iw, 1.6, F_B, C_WHITE, r->title, 2, 0);
+    if (r->desc[0]) d_lines(g, ix, iy + E(4.6) + tl * (d_line_h(1.6, F_B) + E(0.15)) + E(0.5), iw, 1.15, F_R, WA(0.65), r->desc, 2, 0.1);
     const char *b[4] = {missed ? tr(S_WATCH_ARCHIVE) : tr(S_WATCH), missed ? tr(S_LATER) : tr(S_SNOOZE), missed ? tr(S_DELETE) : tr(S_CLOSE), tr(S_CLOSE_ALL)};
     int bx = ix, nb = 3 + (RM.n > 1);
     for (int i = 0; i < nb; i++) bx += button(g, bx, y + h - E(4.4), b[i], i == RM.focus) + E(0.8);
 }
 void reminders_check(void) {
     if (layer_has(&RML)) { int cur = RM.idx[RM.cur]; rem_rebuild(); if (!RM.user_moved) for (int i = 0; i < RM.n; i++) if (RM.idx[i] == cur) RM.cur = i; if (!RM.n) layer_pop(&RML); return; }
-    /* пропущенные без архива — убрать */
+    /* пропущенные без архива — убрать; напоминания другого плейлиста не трогаем:
+     * их канал здесь не загружен, а при переходе в тот плейлист они ещё нужны */
     int64_t now = clock_now();
+    playlist *cp = repo_cur();
+    int curid = cp ? cp->id : 0;
     for (int i = R.nrem - 1; i >= 0; i--) {
         reminder *r = &R.rem[i];
-        if (r->stop <= now && (!rem_archive(r) || r->start < now - 30 * 86400)) repo_reminder_remove(i);
+        if (r->playlist == curid && r->stop <= now && (!rem_archive(r) || r->start < now - 30 * 86400)) repo_reminder_remove(i);
     }
     rem_rebuild();
     if (!RM.n) return;
@@ -510,4 +554,74 @@ void choose_open(const char *title, const char *const *items, int n, int sel, ch
     CH.fn = fn;
     CH.ctx = ctx;
     layer_push(&CHL);
+}
+
+/* ================= ссылка QR-кодом ================= */
+/* На ТВ ссылку не нажать: показываем её QR-кодом, телефон наводят на экран (как в «Ввод с телефона»). */
+static struct { char title[160], url[400]; uint8_t m[QR_SIZE][QR_SIZE]; int ok; } QR;
+static layer QRL;
+
+static int qr_key(layer *l, int k, int ev) {
+    (void)l;
+    if (ev == EV_SHORT && (k == KEY_BACK || k == KEY_OK)) layer_pop(&QRL);
+    return 1;
+}
+static void qr_draw(layer *l, gfx_t *g) {
+    (void)l;
+    /* белая подложка с полем в 4 модуля: без него телефоны читают хуже; модуль — целое число пикселей */
+    int mod = E(24) / (QR_SIZE + 8), plate = mod * (QR_SIZE + 8);
+    int w = E(62), h = E(5.4) + plate + E(4), x = (SW - w) / 2, y = (SH - h) / 2;
+    window_solid(g, x, y, w, h);
+    d_text(g, x + E(2), y + E(1.6), 1.6, F_B, C_WHITE, QR.title, w - E(4));
+    int qx = x + E(2), qy = y + E(5.4);
+    int tx = qx + plate + E(2.4), tw = x + w - E(2) - tx;
+    if (QR.ok) {
+        d_round(g, qx, qy, plate, plate, E(0.6), 0xffffffffu);
+        for (int r = 0; r < QR_SIZE; r++)
+            for (int c = 0; c < QR_SIZE; c++)
+                if (QR.m[r][c]) d_fill(g, qx + (c + 4) * mod, qy + (r + 4) * mod, mod, mod, 0xff000000u);
+    } else d_round(g, qx, qy, plate, plate, E(0.6), C_FILL);
+    const char *shown = strstr(QR.url, "://");
+    shown = shown ? shown + 3 : QR.url;
+    int ty = qy;
+    ty += d_lines(g, tx, ty, tw - E(1), 1.3, F_S, C_WHITE, shown, 3, 0.1) * d_line_h(1.3, F_S) + E(1.2);
+    d_lines(g, tx, ty, tw - E(1), 1.2, F_R, C_TEXT3, tr(S_ABOUT_SCAN_HINT), 3, 0.2);
+    hint hs = {0, tr(S_K_OK), tr(S_H_CLOSE)};
+    d_hints(g, x + E(2), y + h - E(2), &hs, 1);
+}
+void qr_open(const char *title, const char *url) {
+    QRL.name = "qr";
+    QRL.key = qr_key;
+    QRL.draw = qr_draw;
+    snprintf(QR.title, sizeof QR.title, "%s", title ? title : "");
+    snprintf(QR.url, sizeof QR.url, "%s", url ? url : "");
+    QR.ok = !qr_encode(QR.url, QR.m);
+    layer_push(&QRL);
+}
+
+/* ================= текст с переносом (лицензии) ================= */
+static struct { char title[120], text[1600]; } TX;
+static layer TXL;
+
+static int tx_key(layer *l, int k, int ev) {
+    (void)l;
+    if (ev == EV_SHORT && (k == KEY_BACK || k == KEY_OK)) layer_pop(&TXL);
+    return 1;
+}
+static void tx_draw(layer *l, gfx_t *g) {
+    (void)l;
+    int w = E(64), h = E(30), x = (SW - w) / 2, y = (SH - h) / 2;
+    window_solid(g, x, y, w, h);
+    d_text(g, x + E(2), y + E(1.6), 1.5, F_B, C_WHITE, TX.title, w - E(4));
+    d_lines(g, x + E(2), y + E(5), w - E(4), 1.2, F_R, C_TEXT2, TX.text, 16, 0.35);
+    hint hs = {0, tr(S_K_OK), tr(S_H_CLOSE)};
+    d_hints(g, x + E(2), y + h - E(2), &hs, 1);
+}
+void text_open(const char *title, const char *text) {
+    TXL.name = "text";
+    TXL.key = tx_key;
+    TXL.draw = tx_draw;
+    snprintf(TX.title, sizeof TX.title, "%s", title ? title : "");
+    snprintf(TX.text, sizeof TX.text, "%s", text ? text : "");
+    layer_push(&TXL);
 }

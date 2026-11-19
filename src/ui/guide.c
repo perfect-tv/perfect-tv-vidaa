@@ -29,10 +29,12 @@ static struct {
     int cat, cat_top, saved_gi, saved_ci, cat_search;
     int pl, saved_pl;
     int rows, row_h, list_y;
-    int rev;
+    int rev, mode_seen;    /* смена вида гида: зона сбрасывается, как в Android setView */
 } G;
 
 static layer L;
+static char num_buf[6];      /* набор номера канала в гиде — сбрасывается при открытии */
+static double num_at;
 
 int guide_is_open(void) { return layer_has(&L); }
 static group *cur_group(void) { return G.gi >= 0 && G.gi < R.ngroups ? &R.groups[G.gi] : NULL; }
@@ -44,7 +46,21 @@ static const char *group_title(const group *g) {
     return g->title ? g->title : tr(S_NO_GROUP);
 }
 static int64_t align(int64_t t) { return t - ((t % SLOT) + SLOT) % SLOT; }
-static int list_mode(void) { return P.guide_mode == GUIDE_LIST; }
+static int list_mode(void) { return P.guide_mode != GUIDE_GRID; }
+/* «Категории + каналы»: колонка категорий на экране и в зоне каналов */
+static int cats_fixed(void) { return P.guide_mode == GUIDE_CATS; }
+/* «Категории + каналы» и «Каналы»: программа справа — только после → */
+static int prog_hidden(void) { return P.guide_mode >= GUIDE_CATS; }
+/* панель передачи справа: настройка «Описание в ТВ-гиде» и фокус в программе/датах */
+static int desc_panel(void) { return P.guide_desc && list_mode() && (G.zone == Z_PROGS || G.zone == Z_DATES); }
+const char *guide_mode_name(void) {
+    switch (P.guide_mode) {
+    case GUIDE_LIST: return tr(S_GUIDE_LIST);
+    case GUIDE_CATS: return tr(S_GUIDE_CATS);
+    case GUIDE_CHANNELS: return tr(S_GUIDE_CHANNELS);
+    default: return tr(S_GUIDE_GRID);
+    }
+}
 
 static void fit(void) {
     group *g = cur_group();
@@ -72,6 +88,7 @@ static void progs_to_now(void) {
 static void sync_from_tv(void) {
     G.gi = 0;
     G.ci = 0;
+    if (tv_is_preview()) { G.top = 0; fit(); return; }   /* играет канал прежнего плейлиста */
     group *g = repo_group(T.group);
     if (g) G.gi = repo_group_index(g);
     if (T.cur) {
@@ -191,14 +208,13 @@ static void cats_preview(void) {
 static void switch_playlist(int i) {
     if (i == R.cur || i < 0 || i >= R.npl) { G.zone = Z_CATS; return; }
     loaders_cancel();
-    R.cur = i;
-    layer_pop(&L);
     char path[700];
     repo_channels_path(R.pl[i].id, path, sizeof path);
-    if (!file_exists(path)) { repo_select(i); load_playlist(i, 1); return; }
-    tv_playlist_changed(0);
-    if (!guide_is_open()) guide_open(0);
-    load_epg(0);
+    if (!file_exists(path)) { R.cur = i; tv_playlist_changed(0); load_playlist(i, 1); return; }
+    layer_pop(&L);
+    /* видео не останавливаем: гид показывает новый плейлист, канал выбирается по OK */
+    if (tv_preview_playlist(i)) { guide_open(0); load_epg(0); }
+    else { tv_playlist_changed(0); if (!guide_is_open()) guide_open(0); load_epg(0); }
 }
 
 static int has_long(layer *l, int k) {
@@ -212,6 +228,12 @@ static int key(layer *l, int k, int ev) {
     (void)l;
     group *g = cur_group();
     int n = g ? g->n : 0;
+    if (k == KEY_BACK && ev == EV_SHORT && tv_is_preview()) {
+        layer_pop(&L);
+        tv_preview_back();
+        return 1;
+    }
+    if (k == KEY_SEARCH && ev == EV_SHORT) { search_open(); return 1; }   /* поиск из любой зоны гида */
     if (k == KEY_MENU || (k == KEY_OK && ev == EV_LONG && G.zone != Z_PROGS)) {
         channel *c = cur_channel();
         if (c) tv_open_menu(c, g ? g->key : NULL, 1);
@@ -226,14 +248,12 @@ static int key(layer *l, int k, int ev) {
         else if (k == KEY_RIGHT) { if (list_mode()) { progs_to_now(); G.zone = Z_PROGS; } else grid_enter(); }
         else if (k == KEY_OK && ev == EV_SHORT) play_focused();
         else if (IS_DIGIT(k) && ev == EV_SHORT) {
-            static char buf[6];
-            static double at;
             double t = app_now();
-            if (t - at > 1.5) buf[0] = 0;
-            at = t;
-            size_t bl = strlen(buf);
-            if (bl < 4) { buf[bl] = (char)('0' + k - KEY_D0); buf[bl + 1] = 0; }
-            int num = atoi(buf);
+            if (t - num_at > 1.5) num_buf[0] = 0;
+            num_at = t;
+            size_t bl = strlen(num_buf);
+            if (bl < 4) { num_buf[bl] = (char)('0' + k - KEY_D0); num_buf[bl + 1] = 0; }
+            int num = atoi(num_buf);
             for (int i = 0; i < n; i++) if (g->ch[i]->num == num) { G.ci = i; fit(); break; }
         } else if (k == KEY_BACK && ev == EV_SHORT) layer_pop(&L);
         else if (k == KEY_GREEN || k == KEY_GUIDE) layer_pop(&L);
@@ -300,6 +320,11 @@ static int key(layer *l, int k, int ev) {
 static void tick(layer *l, double now) {
     (void)l;
     (void)now;
+    if (G.mode_seen != P.guide_mode) {   /* вид сменили в настройках или меню канала */
+        G.mode_seen = P.guide_mode;
+        if (G.zone == Z_GRID || G.zone == Z_PROGS || G.zone == Z_DATES) G.zone = Z_CH;
+        G.live_window = 1;
+    }
     if (G.rev != R.rev) {   /* каналы или категории изменились (скрыли, избранное) */
         G.rev = R.rev;
         if (G.gi >= R.ngroups) G.gi = R.ngroups - 1;
@@ -325,7 +350,11 @@ static void tick(layer *l, double now) {
 #define CAT_ROW_H F(3.2)
 #define DATES_W F(5.4)
 
-static double top_block(void) { return P.guide_header == 2 ? 0 : P.guide_header == 1 ? F(4.8) + F(1) : F(7.6) + F(1); }
+static double top_block(void) {
+    int h = P.guide_header;
+    if (h == 0 && desc_panel()) h = 1;   /* с панелью передачи шапка — «только канал», как в Android */
+    return h == 2 ? 0 : h == 1 ? F(4.8) + F(1) : F(7.6) + F(1);
+}
 static double body_top(void) { return PADT + top_block() + HEAD_H; }
 static double hints_h(void) { return P.hints ? F(1.9) : 0; }
 static double list_bottom(void) { return SH - PADB - hints_h(); }
@@ -394,7 +423,7 @@ static void draw_top_full(gfx_t *g, channel *c) {
     if (P.number_mode == NUM_NEAR_NAME) snprintf(name, sizeof name, "%d. %s", c->num, c->name);
     else snprintf(name, sizeof name, "%s", c->name);
     d_text_mid(g, x, t + E(0.6), 1.2, F_R, WA(0.7), name, w);
-    d_text_mid(g, x, t + E(2.35), 1.8, F_B, C_WHITE, has ? p.title : tr(S_NO_PROGRAMME), w);
+    d_marquee(g, x, t + E(2.35), 1.8, F_B, C_WHITE, has ? p.title : tr(S_NO_PROGRAMME), w, 1, 3);
     day_range(s, e, range, sizeof range);
     d_text_mid(g, x, t + E(4.05), 1.2, F_R, WA(0.8), range, w);
     if (has && p.desc[0]) d_lines(g, x, t + E(4.9), w, 1.15, F_R, WA(0.65), p.desc, 2, 0);
@@ -408,7 +437,7 @@ static void draw_top_channel(gfx_t *g, channel *c) {
     char name[300], sub[300];
     if (P.number_mode == NUM_NEAR_NAME) snprintf(name, sizeof name, "%d. %s", c->num, c->name);
     else snprintf(name, sizeof name, "%s", c->name);
-    d_text_mid(g, x, t + E(1.5), 1.8, F_B, C_WHITE, name, w);
+    d_marquee(g, x, t + E(1.5), 1.8, F_B, C_WHITE, name, w, 1, 3);
     group *gr = repo_group_of(c, NULL);
     if (repo_has_archive(c)) snprintf(sub, sizeof sub, "%s · %s %s", group_title(gr), tr(S_ARCHIVE), trp(S_DAYS_SHORT, c->archive_days));
     else snprintf(sub, sizeof sub, "%s", group_title(gr));
@@ -417,10 +446,11 @@ static void draw_top_channel(gfx_t *g, channel *c) {
 
 /* заголовок категории «‹ Эфирные 20» и, в сетке, шкала времени с подписью дня */
 static void draw_head(gfx_t *g, int64_t ws, int dx) {
+    if (desc_panel()) return;   /* каналы сжаты до логотипов — заголовка категории нет */
     double y = PADT + top_block();
     int cy = (int)(y + HEAD_H / 2), l = (int)PADX + dx, r = (int)(PADX + ch_w() - F(1)) + dx;
     group *gr = cur_group();
-    if (R.ngroups > 1) d_text_mid(g, l, cy, 1.4, F_R, WA(0.5), "‹", 0);
+    if (R.ngroups > 1 && !cats_fixed()) d_text_mid(g, l, cy, 1.4, F_R, WA(0.5), "‹", 0);
     char cnt[16];
     snprintf(cnt, sizeof cnt, "%d", gr ? gr->n : 0);
     int cw = d_text_w(1.4, F_R, cnt), tx = l + E(1.6);
@@ -452,7 +482,7 @@ static void draw_head(gfx_t *g, int64_t ws, int dx) {
 }
 
 /* строка канала: логотип, номер (режим «рядом с названием»), название; справа — архив, избранное, замок */
-static void draw_row(gfx_t *g, channel *c, int l, int y, int r, int h, int focus) {
+static void draw_row(gfx_t *g, channel *c, int l, int y, int r, int h, int focus, int logo_only) {
     int ch_focus = focus && G.zone == Z_CH;
     uint32_t bg = ch_focus ? C_WHITE : focus ? C_FILL_ACTIVE : C_FILL;
     d_round(g, l, y, r - l, h, E(0.6), bg);
@@ -460,6 +490,7 @@ static void draw_row(gfx_t *g, channel *c, int l, int y, int r, int h, int focus
     uint32_t fg = ch_focus ? 0xff101010u : C_WHITE;
     int cy = y + h / 2, x = l + E(0.35);
     d_logo(g, c, x, y + E(0.25), E(4.3), h - E(0.5), E(0.35), 1, ch_focus);
+    if (logo_only) return;   /* каналы сжаты до логотипов — справа панель передачи */
     x += E(4.3) + E(0.7);
     if (P.number_mode == NUM_NEAR_NAME) {
         char n[16];
@@ -469,7 +500,7 @@ static void draw_row(gfx_t *g, channel *c, int l, int y, int r, int h, int focus
     } else x += E(0.5);
     int fav = repo_is_fav(c), locked = repo_is_locked(c), arc = repo_has_archive(c);
     int isz = E(1.5), iw = (fav + locked + arc) * (isz + E(0.35));
-    d_text_mid(g, x, cy, 1.35, c == T.cur ? F_B : F_R, fg, c->name, r - x - E(0.8) - iw);
+    d_marquee(g, x, cy, 1.35, c == T.cur ? F_B : F_R, fg, c->name, r - x - E(0.8) - iw, ch_focus, 0);
     uint32_t ic = ch_focus ? 0xff101010u : WA(0.7);
     int ix = r - E(0.8);
     if (arc) { ix -= isz; d_icon(g, I_ARCHIVE, ix + isz / 2, cy, isz, ic); ix -= E(0.35); }
@@ -508,7 +539,7 @@ static void draw_cells(gfx_t *g, channel *c, int y, int h, int gl, int gr, int64
         }
         if (tw > E(1)) {
             uint32_t fg = foc ? 0xff101010u : past ? WA(0.45) : C_WHITE;
-            if (is_prog) d_text_mid(g, tl, cy, 1.25, F_R, fg, p.title, tw);
+            if (is_prog) d_marquee(g, tl, cy, 1.25, F_R, fg, p.title, tw, foc, 2);
             else if (foc) {
                 char a[8], b[8], t[24];
                 fmt_hm(s, a);
@@ -608,7 +639,7 @@ static void draw_progs(gfx_t *g, int l, int r) {
             }
             if (p.start > now && repo_reminder_find(c->key, p.start) >= 0) { ix -= isz; d_icon(g, I_CLOCK, ix + isz / 2, cy, isz, ic); ix -= E(0.5); }
             int tx = l + E(5.4);
-            d_text_mid(g, tx, cy, 1.35, tall ? F_B : F_R, fg, p.title, ix - tx - E(0.3));
+            d_marquee(g, tx, cy, 1.35, tall ? F_B : F_R, fg, p.title, ix - tx - E(0.3), pf, 1);
             if (tall) {
                 int by = yi + h - E(0.95), bw = r - E(0.8) - tx, bh = E(0.25) > 2 ? E(0.25) : 2;
                 d_round(g, tx, by, bw, bh, bh / 2, pf ? 0x33000000u : WA(0.22));
@@ -751,25 +782,74 @@ static void draw_hints(gfx_t *g) {
     d_hints(g, (int)PADX, SH - (int)(PADB + F(0.8)), h, n);
 }
 
+static double panel_w(void) { return (SW - 2 * PADX) * 0.30; }
+
+/* панель передачи справа (настройка «Описание в ТВ-гиде»): картинка, время, название, описание и что сделает OK */
+static void draw_panel(gfx_t *g, int l, int r) {
+    channel *c = cur_channel();
+    int pn = c ? repo_prog_count(c) : 0;
+    if (!c || G.pi < 0 || G.pi >= pn) return;
+    prog p = repo_prog(c, G.pi);
+    double top = body_top(), bottom = list_bottom();
+    int w = r - l;
+    if (w < E(6)) return;
+    int ih = (int)(w * 9 / 16), cap = (int)((bottom - top) * 0.4);
+    if (ih > cap) ih = cap;
+    if (!d_image(g, p.icon, l, (int)top, w, ih, E(0.4), 1)) d_logo(g, c, l, (int)top, w, ih, E(0.4), 0, 0);
+    double y = top + ih + F(1.2);
+    char range[96];
+    day_range(p.start, p.stop, range, sizeof range);
+    d_text_mid(g, l, (int)(y + E(0.6)), 1.15, F_R, WA(0.7), range, w);
+    y += F(1.9);
+    d_lines(g, l, (int)(y + E(0.6)), w, 1.5, F_B, C_WHITE, p.title, 2, 0.1);
+    y += 2 * d_line_h(1.5, F_B) + F(0.7);
+    int64_t now = clock_now();
+    int live = p.start <= now && now < p.stop;
+    int arc = p.stop <= now && repo_has_archive(c) && p.start >= now - (int64_t)c->archive_days * 86400 - SLOT;
+    hint h = {-1, tr(S_K_OK), live ? tr(S_WATCH_LIVE) : arc ? tr(S_WATCH_ARCHIVE) : tr(S_H_ABOUT)};
+    d_hints(g, l, (int)(bottom - E(0.9)), &h, 1);
+    int dl = (int)(bottom - E(2.6));
+    int lh = d_line_h(1.15, F_R) + E(0.15);
+    int maxl = lh > 0 ? (int)((dl - y) / lh) : 0;
+    if (maxl > 0) d_lines(g, l, (int)y, w, 1.15, F_R, WA(0.65), p.desc, maxl, 0.15);
+}
+
+/* фон: в видах «Категории + каналы» и «Каналы» затемнена левая часть, справа видно видео */
+static void draw_bg(gfx_t *g) {
+    int mid = SH * 2 / 5;
+    int right_part = prog_hidden() && G.zone != Z_PROGS && G.zone != Z_DATES && G.zone != Z_GRID;
+    if (!right_part) {
+        d_vgrad(g, 0, 0, SW, mid, C_GUIDE_TOP, 0xdc0c0d0eu);
+        d_vgrad(g, 0, mid, SW, SH - mid, 0xdc0c0d0eu, C_GUIDE_BOTTOM);
+        return;
+    }
+    int xa = (int)(PADX + (cats_fixed() ? CAT_W + F(1) : 0) + ch_w() + F(1.5));
+    if (xa > SW * 7 / 10) xa = SW * 7 / 10;
+    d_vgrad(g, 0, 0, xa, mid, C_GUIDE_TOP, 0xdc0c0d0eu);
+    d_vgrad(g, 0, mid, xa, SH - mid, 0xdc0c0d0eu, C_GUIDE_BOTTOM);
+    d_hgrad(g, xa, 0, SW * 22 / 100, SH, 0xdc0c0d0eu, 0x000c0d0eu);
+    int th = (int)(PADT + top_block() + HEAD_H);
+    d_vgrad(g, 0, 0, SW, th + (int)F(2), 0xbe08090bu, 0x0008090bu);
+}
+
 static void draw(layer *l, gfx_t *g) {
     (void)l;
-    /* фон: сверху плотнее, к 40 % — 220/255, внизу — прозрачнее (видно видео) */
-    int mid = SH * 2 / 5;
-    d_vgrad(g, 0, 0, SW, mid, C_GUIDE_TOP, 0xdc0c0d0eu);
-    d_vgrad(g, 0, mid, SW, SH - mid, 0xdc0c0d0eu, C_GUIDE_BOTTOM);
+    draw_bg(g);
     group *gr = cur_group();
     channel *c = cur_channel();
     int n = gr ? gr->n : 0;
     G.rows = visible_rows();
     fit();
     G.top = first_row(G.ci, G.rows, n);
+    int panel = desc_panel();
     if (P.guide_header != 2) {
-        if (c) { if (P.guide_header == 1) draw_top_channel(g, c); else draw_top_full(g, c); }
+        if (c) { if (P.guide_header == 1 || (panel && P.guide_header == 0)) draw_top_channel(g, c); else draw_top_full(g, c); }
         draw_clock(g);
     }
     draw_hints(g);
     /* колонки категорий и плейлистов слева, список и сетка сдвигаются вправо */
-    int pls = G.zone == Z_PLS, cats = G.zone == Z_CATS || pls;
+    int pls = G.zone == Z_PLS, cats = G.zone == Z_CATS || pls || (cats_fixed() && G.zone == Z_CH);
+    if (cats_fixed() && G.zone == Z_CH) G.cat = G.gi;
     int dx = (int)((cats + pls) * (CAT_W + F(1)));
     if (pls) draw_pls(g, (int)PADX);
     if (cats) draw_cats(g, (int)PADX + (pls ? (int)(CAT_W + F(1)) : 0));
@@ -781,21 +861,24 @@ static void draw(layer *l, gfx_t *g) {
     }
     draw_head(g, G.ws, dx);
     double bt = body_top();
-    int lx = (int)PADX + dx, r = (int)(PADX + ch_w()) + dx;
+    int chw = panel ? (int)F(5.6) : (int)ch_w();
+    int lx = (int)PADX + dx, r = (int)PADX + chw + dx;
     if (!n) d_text_mid(g, lx + E(1), (int)(bt + F(2)), 1.35, F_R, WA(0.6), tr(S_EMPTY_CATEGORY), SW - 2 * (int)PADX);
-    int gl = (int)(PADX + ch_w() + GAP) + dx, grr = SW - (int)PADX + dx;
+    int gl = (int)(PADX + chw + GAP) + dx, grr = SW - (int)PADX + dx;
     int shown = 0;
     for (int k = 0; k < G.rows && G.top + k < n; k++, shown++) {
         int i = G.top + k;
         int y = (int)(bt + k * (ROW_H + GAP)), h = (int)(bt + k * (ROW_H + GAP) + ROW_H) - y;
-        draw_row(g, gr->ch[i], lx, y, r, h, i == G.ci);
+        draw_row(g, gr->ch[i], lx, y, r, h, i == G.ci, panel);
         if (!list_mode()) draw_cells(g, gr->ch[i], y, h, gl, grr, G.ws, i == G.ci && G.zone == Z_GRID);
     }
     if (n && !list_mode()) draw_now_line(g, gl, grr, G.ws, shown);
-    if (n && list_mode()) {
-        int dr = SW - (int)PADX + dx, dl = dr - (int)DATES_W;
-        draw_progs(g, (int)(PADX + ch_w() + F(1.2)) + dx, dl - E(1));
+    int show_progs = list_mode() && (!prog_hidden() || G.zone == Z_PROGS || G.zone == Z_DATES);
+    if (n && show_progs) {
+        int dr = SW - (int)PADX + dx - (panel ? (int)panel_w() + (int)E(1) : 0), dl = dr - (int)DATES_W;
+        draw_progs(g, (int)PADX + chw + (int)F(1.2) + dx, dl - E(1));
         draw_dates(g, dl, dr);
+        if (panel) draw_panel(g, dr + E(0.6), SW - (int)PADX + dx);
     }
     if (dx) gfx_pop_clip(g);
 }
@@ -812,6 +895,9 @@ void guide_open(int to_programmes) {
     L.covers = 0;   /* под гидом видно видео (затемнение сверху плотнее) */
     G.rows = 10;
     G.rev = R.rev;
+    G.mode_seen = P.guide_mode;
+    num_buf[0] = 0;
+    num_at = 0;
     sync_from_tv();
     G.zone = Z_CH;
     G.live_window = 1;

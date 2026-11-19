@@ -10,12 +10,17 @@
 #include "core/clock.h"
 #include "core/lang.h"
 #include "core/prefs.h"
+#include "core/logocache.h"
+#include "core/relay.h"
 #include "data/epg.h"
+#include "player/player.h"
 #include "data/loaders.h"
 #include "data/backup.h"
 #include "data/tmdb.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #ifndef PTV_VERSION
@@ -29,14 +34,20 @@ enum {
     I_PL = 1000,   /* I_PL + индекс плейлиста */
     I_PL_ADD = 1, I_EPG_SRC, I_EPG_REFRESH,
     I_ARCHIVE_DAYS, I_INFO_HIDE, I_UPKEY, I_START_LAST, I_REMIND, I_ANYCERT, I_ASPECT_P, I_EPG_HOURS, I_PL_HOURS,
-    I_LANG, I_TZ, I_SCALE, I_NUMBER, I_GUIDE_VIEW, I_GUIDE_HEADER, I_HINTS_P, I_LOGO_PRIO,
+    I_LANG, I_TZ, I_SCALE, I_NUMBER, I_GUIDE_VIEW, I_GUIDE_HEADER, I_GUIDE_DESC, I_HINTS_P, I_MARQUEE, I_KB_LAYOUT, I_LOGO_PRIO,
+    I_SUB_SIZE, I_SUB_COLOR, I_SUB_BG, I_SUB_EDGE, I_SUB_BOTTOM,
     I_ADAPTIVE_P, I_RESET_SCORES, I_HIDDEN_P,
     I_PIN_SET, I_PIN_CLEAR, I_PIN_ASK, I_PIN_INPUT,
     I_RELAY_ALL, I_RELAY_DIRECT,
     I_TMDB_KEY, I_TMDB_PHONE, I_TMDB_API, I_TMDB_IMG, I_TMDB_TEST, I_TMDB_REMOVE,
-    I_BACKUP_SAVE, I_BACKUP_RESTORE, I_CLEAR_LOGOS, I_CLEAR_EPG, I_DATA_DIR,
-    I_VERSION, I_SOURCE, I_LICENSE,
+    I_BACKUP_SAVE, I_BACKUP_RESTORE, I_CLEAR_LOGOS, I_CLEAR_EPG, I_DATA_DIR, I_DIAG,
+    I_VERSION, I_TELEGRAM, I_DONATE, I_SOURCE, I_LICENSE,
 };
+
+/* ссылки «О программе» — как у Android-версии (core/About.kt) плюс репозиторий этого приложения */
+#define ABOUT_TELEGRAM "https://t.me/perfect_tv_app"
+#define ABOUT_DONATE "https://boosty.to/rootu/donate"
+#define ABOUT_SOURCE "https://github.com/perfect-tv/perfect-tv-vidaa"
 typedef struct { int id; char label[200], sub[300], value[200]; int choice; } item;
 
 static struct { int sec, zone, focus, top; item it[64]; int n; } ST;
@@ -48,6 +59,15 @@ static const int HIDE[] = {3, 5, 7, 10};
 static const int REM[] = {0, 1, 2, 3, 4, 5, 10};
 static const int EPGH[] = {6, 12, 24};
 static const int PLH[] = {12, 24, 48};
+static const int SUBSIZE[] = {75, 100, 125, 150, 200};
+static const int SUBBOTTOM[] = {0, 4, 8, 12, 18};
+static const int SUBCOL[] = {-1, 0xffffff, 0xffff00, 0x00ff00, 0x00ffff};
+static const int SUBCOLS[] = {S_SUB_STREAM, S_SUB_WHITE, S_SUB_YELLOW, S_SUB_GREEN, S_SUB_CYAN};
+static const int SUBBG[] = {0, 1, 2};
+static const int SUBBGS[] = {S_SUB_BG_NONE, S_SUB_BG_SEMI, S_SUB_BG_BLACK};
+static const int SUBEDGE[] = {0, 1, 2};
+static const int SUBEDGES[] = {S_SUB_EDGE_NONE, S_SUB_EDGE_OUTLINE, S_SUB_EDGE_SHADOW};
+static const char *pick(const int *vals, const int *names, int n, int cur) { return tr(names[sel_of(vals, n, cur)]); }
 
 static void add(int id, const char *label, const char *sub, const char *value, int choice) {
     if (ST.n >= 64) return;
@@ -89,7 +109,12 @@ static void build(void) {
             if (s->loaded_at) { fmt_day(s->loaded_at, d, sizeof d); fmt_hm(s->loaded_at, hm); }
             char when[48];
             snprintf(when, sizeof when, "%s %s", d, hm);
-            if (s->loading) snprintf(sub, sizeof sub, "%s", tr(S_EPG_STATUS_LOADING));
+            if (s->loading) {
+                long progs = 0;
+                int pr = loaders_epg_progress(&progs);   /* общий прогресс загрузки программы */
+                if (pr >= 0) snprintf(sub, sizeof sub, tr(S_EPG_LOADING), pr);
+                else snprintf(sub, sizeof sub, "%s", tr(S_EPG_STATUS_LOADING));
+            }
             else if (s->error[0]) snprintf(sub, sizeof sub, "%s", loaders_error_text(s->error));
             else if (epg_has_data(s)) snprintf(sub, sizeof sub, tr(S_EPG_STATUS_OK), trp(S_PROGRAMMES_N, s->programmes), when);
             else snprintf(sub, sizeof sub, "%s", tr(S_EPG_STATUS_NONE));
@@ -113,10 +138,20 @@ static void build(void) {
         add(I_TZ, tr(S_TIMEZONE), NULL, tz_label(), 1);
         add(I_SCALE, tr(S_UI_SIZE), NULL, tr(P.ui_scale == 1 ? S_SIZE_SMALL : P.ui_scale == 2 ? S_SIZE_LARGE : S_SIZE_NORMAL), 1);
         add(I_NUMBER, tr(S_NUMBER_MODE), NULL, tr(P.number_mode == NUM_NONE ? S_NUM_NONE : P.number_mode == NUM_NEAR_NAME ? S_NUM_NEAR : S_NUM_BADGE), 1);
-        add(I_GUIDE_VIEW, tr(S_GUIDE_VIEW), NULL, tr(P.guide_mode == GUIDE_LIST ? S_GUIDE_LIST : S_GUIDE_GRID), 1);
+        add(I_GUIDE_VIEW, tr(S_GUIDE_VIEW), NULL, guide_mode_name(), 1);
         add(I_GUIDE_HEADER, tr(S_GUIDE_HEADER), NULL, tr(P.guide_header == 1 ? S_HEADER_CHANNEL : P.guide_header == 2 ? S_HEADER_HIDE : S_HEADER_FULL), 1);
+        add(I_GUIDE_DESC, tr(S_GUIDE_DESC), tr(S_GUIDE_DESC_SUB), tr(P.guide_desc ? S_ON : S_OFF), 1);
         add(I_HINTS_P, tr(S_HINTS), NULL, tr(P.hints ? S_ON : S_OFF), 1);
+        add(I_MARQUEE, tr(S_MARQUEE), tr(S_MARQUEE_SUB), tr(P.marquee ? S_ON : S_OFF), 1);
+        add(I_KB_LAYOUT, tr(S_KB_LAYOUT), NULL, tr(P.kbd_abc ? S_LAYOUT_ABC : S_LAYOUT_STD), 1);
         add(I_LOGO_PRIO, tr(S_LOGO_PRIORITY), NULL, tr(P.logo_priority ? S_LOGO_EPG : S_LOGO_PLAYLIST), 1);
+        snprintf(v, sizeof v, "%d%%", P.sub_size);
+        add(I_SUB_SIZE, tr(S_SUB_SIZE), NULL, v, 1);
+        add(I_SUB_COLOR, tr(S_SUB_COLOR), NULL, pick(SUBCOL, SUBCOLS, (int)(sizeof SUBCOL / sizeof SUBCOL[0]), P.sub_color), 1);
+        add(I_SUB_BG, tr(S_SUB_BG), NULL, pick(SUBBG, SUBBGS, (int)(sizeof SUBBG / sizeof SUBBG[0]), P.sub_bg), 1);
+        add(I_SUB_EDGE, tr(S_SUB_EDGE), NULL, pick(SUBEDGE, SUBEDGES, (int)(sizeof SUBEDGE / sizeof SUBEDGE[0]), P.sub_edge), 1);
+        snprintf(v, sizeof v, "%d%%", P.sub_bottom);
+        add(I_SUB_BOTTOM, tr(S_SUB_BOTTOM), NULL, v, 1);
         break;
     case SEC_LIST:
         add(I_ADAPTIVE_P, tr(S_ADAPTIVE), NULL, tr(P.adaptive ? S_ON : S_OFF), 1);
@@ -151,11 +186,14 @@ static void build(void) {
         add(I_CLEAR_LOGOS, tr(S_CLEAR_LOGOS), NULL, NULL, 0);
         add(I_CLEAR_EPG, tr(S_CLEAR_EPG), NULL, NULL, 0);
         add(I_DATA_DIR, tr(S_DATA_DIR), app_platform_get()->data_dir, NULL, 0);
+        add(I_DIAG, tr(S_DIAGNOSTICS), tr(S_DIAGNOSTICS_SUB), NULL, 0);
         break;
     case SEC_ABOUT:
-        add(I_VERSION, tr(S_VERSION), NULL, PTV_VERSION, 0);
-        add(I_SOURCE, tr(S_SOURCE_CODE), "https://github.com/perfect-tv", NULL, 0);
-        add(I_LICENSE, tr(S_LICENSE), tr(S_LICENSE_TEXT), NULL, 0);
+        add(I_VERSION, "Perfect TV", tr(S_ABOUT_SUB), PTV_VERSION, 0);
+        add(I_TELEGRAM, tr(S_ABOUT_TELEGRAM), tr(S_ABOUT_TELEGRAM_SUB), "t.me/perfect_tv_app", 0);
+        add(I_DONATE, tr(S_ABOUT_DONATE), tr(S_ABOUT_DONATE_SUB), "boosty.to/rootu/donate", 0);
+        add(I_SOURCE, tr(S_SOURCE_CODE), tr(S_ABOUT_GITHUB_SUB), "github.com/perfect-tv/perfect-tv-vidaa", 0);
+        add(I_LICENSE, tr(S_LICENSE), tr(S_LICENSE_SHORT), NULL, 0);
         break;
     }
     if (ST.focus >= ST.n) ST.focus = ST.n - 1;
@@ -166,6 +204,7 @@ static void after_pin_clear(void *c) { (void)c; P.pin[0] = 0; prefs_save(); tv_t
 static void after_pin_ok(void *c) { (void)c; pin_create(NULL, NULL); }
 static void clear_epg_yes(void *c) {
     (void)c;
+    if (loaders_epg_busy()) { tv_toast(tr(S_EPG_STATUS_LOADING)); return; }   /* сборка пишет *.new — не удалять */
     loaders_cancel();
     for (int i = 0; i < R.nepg; i++) epg_remove_files(R.epg[i].hash);
     repo_open_epg();
@@ -245,6 +284,38 @@ static void tmdb_from_phone(const phone_result *r, void *c) {
 static void tmdb_tested(const char *err) { tv_toast(err ? err : tr(S_TMDB_OK)); }
 static void tmdb_remove_yes(void *c) { (void)c; P.tmdb_key[0] = 0; tmdb_changed(); }
 
+/* Сводка для ТВ: то, что нельзя посмотреть в настройках, и хвост журнала запуска. */
+static void diag_open(void) {
+    static char b[24][220];
+    static const char *it[24];
+    int n = 0;
+#define DL(...) do { if (n < 24) { snprintf(b[n], sizeof b[n], __VA_ARGS__); it[n] = b[n]; n++; } } while (0)
+    DL("%s: %s", tr(S_VERSION), PTV_VERSION);
+    const app_platform *pl = app_platform_get();
+    DL("%s: %s", tr(S_DATA_DIR), pl && pl->data_dir ? pl->data_dir : "?");
+    DL("%s: %d", tr(S_PLAYLISTS), R.npl);
+    DL("%s: %s", tr(S_CHANNEL_LIST), trp(S_CHANNELS_N, R.nch));
+    if (repo_cur()) DL("%s: %s", tr(S_CURRENT), repo_cur()->name);
+    DL("%s: %d", tr(S_DIAG_EPG), R.nepg);
+    long progs = 0;
+    int ep = loaders_epg_progress(&progs);
+    if (ep >= 0) DL("%s: %d%% / %ld", tr(S_DIAG_EPG_PROGRESS), ep, progs);
+    else DL("%s: -", tr(S_DIAG_EPG_PROGRESS));
+    DL("%s: %s", tr(S_DIAG_PLAYER), pl_software() ? "software" : pl_state() == PL_IDLE ? "idle" : "hmc");
+    DL("%s: %d", tr(S_DIAG_STATE), pl_state());
+    DL("%s: %s", tr(S_DIAG_CODECS), pl_codecs());
+    DL("%s: %.1f s", tr(S_DIAG_POSITION), pl_position());
+    if (pl_state() == PL_FAILED) DL("%s: %s", tr(S_ERR_CODE), pl_why());
+    DL("%s: %s, %lld", tr(S_DIAG_RELAY), T.relayed ? tr(S_ON) : tr(S_OFF), relay_ts_bytes());
+    struct statvfs sv;
+    if (pl && pl->data_dir && !statvfs(pl->data_dir, &sv))
+        DL("%s: %.0f MB", tr(S_DIAG_FREE), (double)sv.f_bavail * (double)sv.f_frsize / 1048576.0);
+    const char *log = getenv("PTV_LOG");
+    DL("%s: %s", tr(S_DIAG_LOG), log && *log ? log : "-");
+#undef DL
+    choose_open(tr(S_DIAGNOSTICS), (const char *const *)it, n, 0, NULL, NULL);
+}
+
 static void change(item *it, int dir) {
     int d = dir ? dir : 1;
 #define CYCLE(arr, field) do { int n_ = (int)(sizeof arr / sizeof arr[0]); P.field = arr[((sel_of(arr, n_, P.field) + d) % n_ + n_) % n_]; } while (0)
@@ -268,10 +339,18 @@ static void change(item *it, int dir) {
     }
     case I_SCALE: P.ui_scale = ((P.ui_scale + (d > 0 ? 2 : 1)) % 3); u_init(); break;
     case I_NUMBER: P.number_mode = ((P.number_mode + d) % 3 + 3) % 3; break;
-    case I_GUIDE_VIEW: P.guide_mode = !P.guide_mode; break;
+    case I_GUIDE_VIEW: P.guide_mode = (P.guide_mode + (d ? d : 1) + 4) % 4; break;
+    case I_GUIDE_DESC: P.guide_desc = !P.guide_desc; break;
     case I_GUIDE_HEADER: P.guide_header = ((P.guide_header + d) % 3 + 3) % 3; break;
     case I_HINTS_P: P.hints = !P.hints; break;
+    case I_MARQUEE: P.marquee = !P.marquee; break;
+    case I_KB_LAYOUT: P.kbd_abc = !P.kbd_abc; break;
     case I_LOGO_PRIO: P.logo_priority = !P.logo_priority; break;
+    case I_SUB_SIZE: CYCLE(SUBSIZE, sub_size); break;
+    case I_SUB_COLOR: { int i = sel_of(SUBCOL, (int)(sizeof SUBCOL / sizeof SUBCOL[0]), P.sub_color); int n_ = (int)(sizeof SUBCOL / sizeof SUBCOL[0]); i = (i + d + n_) % n_; P.sub_color = SUBCOL[i]; } break;
+    case I_SUB_BG: { int i = sel_of(SUBBG, (int)(sizeof SUBBG / sizeof SUBBG[0]), P.sub_bg); int n_ = (int)(sizeof SUBBG / sizeof SUBBG[0]); i = (i + d + n_) % n_; P.sub_bg = SUBBG[i]; } break;
+    case I_SUB_EDGE: { int i = sel_of(SUBEDGE, (int)(sizeof SUBEDGE / sizeof SUBEDGE[0]), P.sub_edge); int n_ = (int)(sizeof SUBEDGE / sizeof SUBEDGE[0]); i = (i + d + n_) % n_; P.sub_edge = SUBEDGE[i]; } break;
+    case I_SUB_BOTTOM: CYCLE(SUBBOTTOM, sub_bottom); break;
     case I_ADAPTIVE_P: P.adaptive = !P.adaptive; repo_apply_view(); break;
     case I_PIN_ASK: P.pin_ask = !P.pin_ask; break;
     case I_PIN_INPUT: P.pin_input = ((P.pin_input + d) % 3 + 3) % 3; break;
@@ -301,8 +380,13 @@ static void action(item *it) {
     case I_TMDB_REMOVE: confirm_open(tr(S_TMDB_REMOVE), tr(S_DELETE), tmdb_remove_yes, NULL); break;
     case I_BACKUP_SAVE: save_backup(); break;
     case I_BACKUP_RESTORE: restore_open(); break;
-    case I_CLEAR_LOGOS: img_cache_clear(); tv_toast(tr(S_LOGOS_CLEARED)); break;
+    case I_CLEAR_LOGOS: img_cache_clear(); logo_clear(); tv_toast(tr(S_LOGOS_CLEARED)); break;
     case I_CLEAR_EPG: confirm_open(tr(S_CLEAR_EPG), tr(S_DELETE), clear_epg_yes, NULL); break;
+    case I_DIAG: diag_open(); break;
+    case I_TELEGRAM: qr_open(tr(S_ABOUT_TELEGRAM), ABOUT_TELEGRAM); break;
+    case I_DONATE: qr_open(tr(S_ABOUT_DONATE), ABOUT_DONATE); break;
+    case I_SOURCE: qr_open(tr(S_SOURCE_CODE), ABOUT_SOURCE); break;
+    case I_LICENSE: text_open(tr(S_LICENSE), tr(S_LICENSE_TEXT)); break;
     default: break;
     }
 }
@@ -320,6 +404,17 @@ static int key(layer *l, int k, int ev) {
     if (k == KEY_BACK && ev == EV_SHORT) { ST.zone = 0; return 1; }
     item *it = ST.n ? &ST.it[ST.focus] : NULL;
     if (!it) return 1;
+    /* порядок плейлистов — ←/→ на строке плейлиста (repo_move_playlist уже есть) */
+    if (it->id >= I_PL && it->id < I_PL + R.npl && (k == KEY_LEFT || k == KEY_RIGHT)) {
+        int i = it->id - I_PL, dir = k == KEY_RIGHT ? 1 : -1, j = i + dir;
+        if (j >= 0 && j < R.npl) {
+            repo_move_playlist(i, dir);
+            ST.focus = j;
+            build();
+            app_dirty();
+        }
+        return 1;
+    }
     if (k == KEY_LEFT) { if (it->choice) change(it, -1); else ST.zone = 0; return 1; }
     if (k == KEY_RIGHT) { if (it->choice) change(it, 1); return 1; }
     if (k == KEY_OK && ev == EV_SHORT) action(it);

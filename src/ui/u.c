@@ -2,9 +2,11 @@
 #include "app.h"
 #include "img.h"
 #include "core/prefs.h"
+#include "core/logocache.h"
 #include "data/repo.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 double EM = 22.5;
@@ -16,6 +18,9 @@ static inline uint32_t over(uint32_t d, uint32_t c, unsigned a) {
     if (a >= 255) return c | 0xff000000u;
     if (!a) return d;
     unsigned da = d >> 24;
+    /* под холстом пусто («дыра» к видео / только что стёртый кадр) — цвет и прозрачность как есть:
+     * без делений на пиксель; фон гида и текст поверх видео — самый частый случай */
+    if (!da) return (c & 0xffffffu) | (a << 24);
     if (da == 255) {
         unsigned ia = 255 - a;
         unsigned rb = ((c & 0xff00ffu) * a + (d & 0xff00ffu) * ia + 0x800080u);
@@ -49,10 +54,24 @@ void d_fill(gfx_t *g, int x, int y, int w, int h, uint32_t c) {
     int x0 = clipx0(g, x), x1 = clipx1(g, x + w), y0 = clipy0(g, y), y1 = clipy1(g, y + h);
     unsigned a = c >> 24;
     if (x0 >= x1 || y0 >= y1 || !a) return;
+    uint32_t hole = (c & 0xffffffu) | (a << 24);   /* результат на прозрачном холсте («дыра» к видео) */
     for (int j = y0; j < y1; j++) {
         uint32_t *r = g->px + (size_t)j * g->stride;
         if (a == 255) for (int i = x0; i < x1; i++) r[i] = c;
-        else for (int i = x0; i < x1; i++) r[i] = over(r[i], c, a);
+        else {
+            int i = x0;
+            /* по четыре пикселя: если под всеми пусто (обычный случай — видео под окном), без blend на пиксель */
+            for (; i + 3 < x1; i += 4) {
+                uint32_t d0 = r[i], d1 = r[i + 1], d2 = r[i + 2], d3 = r[i + 3];
+                if (((d0 | d1 | d2 | d3) & 0xff000000u) == 0) {
+                    r[i] = hole; r[i + 1] = hole; r[i + 2] = hole; r[i + 3] = hole;
+                } else {
+                    r[i] = over(d0, c, a); r[i + 1] = over(d1, c, a);
+                    r[i + 2] = over(d2, c, a); r[i + 3] = over(d3, c, a);
+                }
+            }
+            for (; i < x1; i++) r[i] = over(r[i], c, a);
+        }
     }
 }
 
@@ -77,11 +96,18 @@ void d_round(gfx_t *g, int x, int y, int w, int h, int r, uint32_t c) {
     if (r <= 0) { d_fill(g, x, y, w, h, c); return; }
     d_fill(g, x, y + r, w, h - 2 * r, c);
     unsigned a = c >> 24;
+    /* верхняя и нижняя полосы: середина (дальше r от краёв) — полное покрытие, считаем углы только в
+     * двух квадратах r×r по краям; иначе rr_cov с float на каждый пиксель полосы */
+    int mid0 = x + r, mid1 = x + w - r;
     for (int pass = 0; pass < 2; pass++) {
         int ys = pass ? y + h - r : y, ye = ys + r;
-        for (int j = clipy0(g, ys); j < clipy1(g, ye); j++) {
+        int j0 = clipy0(g, ys), j1 = clipy1(g, ye);
+        if (j0 >= j1) continue;
+        if (mid1 > mid0) d_fill(g, mid0, j0, mid1 - mid0, j1 - j0, c);
+        for (int j = j0; j < j1; j++) {
             uint32_t *row = g->px + (size_t)j * g->stride;
             for (int i = clipx0(g, x); i < clipx1(g, x + w); i++) {
+                if (i >= mid0 && i < mid1) { i = mid1 - 1; continue; }
                 unsigned cv = rr_cov(i + 0.5f, j + 0.5f, x, y, w, h, r);
                 if (cv) row[i] = over(row[i], c, a * cv / 255);
             }
@@ -145,8 +171,21 @@ void d_vgrad(gfx_t *g, int x, int y, int w, int h, uint32_t top, uint32_t bottom
     for (int j = 0; j < h; j++) d_fill(g, x, y + j, w, 1, mix(top, bottom, (unsigned)(j * 256 / h)));
 }
 void d_hgrad(gfx_t *g, int x, int y, int w, int h, uint32_t left, uint32_t right) {
-    if (w <= 0) return;
-    for (int i = 0; i < w; i++) d_fill(g, x + i, y, 1, h, mix(left, right, (unsigned)(i * 256 / w)));
+    if (w <= 0 || h <= 0) return;
+    int x0 = clipx0(g, x), x1 = clipx1(g, x + w), y0 = clipy0(g, y), y1 = clipy1(g, y + h);
+    int n = x1 - x0;
+    if (n <= 0 || y0 >= y1) return;
+    /* цвет зависит только от x: считаем полосу цветов один раз, дальше — построчно (столбец за столбцом —
+     * каждый пиксель в новой строке кэша, на ТВ это в разы дороже); так же, как d_vgrad, но по x */
+    static uint32_t cc[4096];
+    for (int i = 0; i < n && i < 4096; i++) cc[i] = mix(left, right, (unsigned)((x0 + i - x) * 256 / w));
+    for (int j = y0; j < y1; j++) {
+        uint32_t *r = g->px + (size_t)j * g->stride + x0;
+        for (int i = 0; i < n && i < 4096; i++) {
+            unsigned a = cc[i] >> 24;
+            if (a) r[i] = over(r[i], cc[i], a);
+        }
+    }
 }
 
 /* сглаживание многоугольника: 4×4 выборки на пиксель, правило чётности */
@@ -316,7 +355,73 @@ int d_lines(gfx_t *g, int x, int y, int w, double em, int f, uint32_t c, const c
 }
 
 /* ---------- значки ---------- */
+/* Значок — векторный путь (дуги, линии, многоугольники с 4×4 выборками): на кадр их десятки (строка гида —
+ * архив, сердце, замок), и каждый раз считать это заново дорого на ТВ. Кэш покрытия: путь рисуется один раз
+ * на пару «вид + размер», дальше — только наложение маски (как глифы шрифта). Цвет — при наложении. */
+#define IC_MAX 64
+typedef struct { int kind, size, w, h, ox, oy; uint8_t *cov; unsigned used; } icon_mask;
+static icon_mask IC[IC_MAX];
+static int nIC;
+static unsigned ic_used;
+
+static void icon_vec(gfx_t *g, int k, int cx, int cy, int size, uint32_t c);
+static icon_mask *icon_mask_get(int k, int size) {
+    for (int i = 0; i < nIC; i++) if (IC[i].kind == k && IC[i].size == size) { IC[i].used = ++ic_used; return &IC[i]; }
+    int at;
+    if (nIC < IC_MAX) at = nIC++;
+    else {
+        at = 0;
+        for (int i = 1; i < nIC; i++) if (IC[i].used < IC[at].used) at = i;
+        free(IC[at].cov);
+    }
+    int m = size / 2 + 4, w = size + 2 * m;
+    uint32_t *px = calloc((size_t)w * w, 4);
+    if (!px) { if (at < nIC) { memset(&IC[at], 0, sizeof IC[at]); nIC--; } return NULL; }
+    gfx_t t;
+    gfx_init(&t, px, w, w, w);
+    icon_vec(&t, k, m + size / 2, m + size / 2, size, 0xffffffffu);
+    /* обрезаем до реальных границ: значок занимает size×size, а маска — квадрат с запасом под обводку */
+    int bx0 = w, by0 = w, bx1 = -1, by1 = -1;
+    for (int j = 0; j < w; j++)
+        for (int i = 0; i < w; i++)
+            if (px[(size_t)j * w + i] >> 24) {
+                if (i < bx0) bx0 = i;
+                if (i > bx1) bx1 = i;
+                if (j < by0) by0 = j;
+                if (j > by1) by1 = j;
+            }
+    if (bx1 < 0) { bx0 = by0 = 0; bx1 = by1 = 0; }
+    int mw = bx1 - bx0 + 1, mh = by1 - by0 + 1;
+    uint8_t *cov = calloc((size_t)mw * mh, 1);
+    if (!cov) { free(px); if (at < nIC) { memset(&IC[at], 0, sizeof IC[at]); nIC--; } return NULL; }
+    for (int j = 0; j < mh; j++)
+        for (int i = 0; i < mw; i++) cov[(size_t)j * mw + i] = (uint8_t)(px[(size_t)(by0 + j) * w + bx0 + i] >> 24);
+    free(px);
+    IC[at] = (icon_mask){k, size, mw, mh, m + size / 2 - bx0, m + size / 2 - by0, cov, ++ic_used};
+    return &IC[at];
+}
+/* маска с честной прозрачностью: пиксели холста, где видео видно, остаются прозрачными */
+static void mask_blit(gfx_t *g, const icon_mask *m, int x, int y, uint32_t c) {
+    unsigned ca = c >> 24;
+    if (!ca) return;
+    int x0 = clipx0(g, x), x1 = clipx1(g, x + m->w), y0 = clipy0(g, y), y1 = clipy1(g, y + m->h);
+    for (int j = y0; j < y1; j++) {
+        uint32_t *row = g->px + (size_t)j * g->stride;
+        const uint8_t *s = m->cov + (size_t)(j - y) * m->w;
+        for (int i = x0; i < x1; i++) {
+            unsigned a = s[i - x];
+            if (a) row[i] = over(row[i], c & 0xffffffu, a * ca / 255);
+        }
+    }
+}
 void d_icon(gfx_t *g, int k, int cx, int cy, int size, uint32_t c) {
+    if (size <= 0 || !(c >> 24)) return;
+    icon_mask *m = icon_mask_get(k, size);
+    if (!m) return;
+    mask_blit(g, m, cx - m->ox, cy - m->oy, c);
+}
+
+static void icon_vec(gfx_t *g, int k, int cx, int cy, int size, uint32_t c) {
     float s = (float)size, x = (float)cx, y = (float)cy, h = s / 2, lw = fmaxf(1.5f, s * 0.12f);
     switch (k) {
     case I_PLAY: { float p[6] = {x - h * 0.6f, y - h * 0.8f, x + h * 0.8f, y, x - h * 0.6f, y + h * 0.8f}; d_poly(g, p, 3, c); break; }
@@ -457,6 +562,38 @@ void d_fade_edges(gfx_t *g, int x, int y, int w, int h, int top, int bottom, uin
     if (bottom) d_vgrad(g, x, y + h - f, w, f, bg & 0xffffffu, bg);
 }
 
+/* ---------- бегущая строка (как MarqueeMath у Android) ---------- */
+#define MQ_PAUSE 1.5
+#define MQ_SPEED 7.0
+typedef struct { unsigned long long h; double t0; } mslot;
+static mslot mq[8];
+static double mq_last;
+static unsigned long long mq_hash(const char *s) {
+    unsigned long long h = 1469598103934665603ull;
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ull; }
+    return h;
+}
+int d_marquee(gfx_t *g, int x, int cy, double em, int face, uint32_t c, const char *s, int width, int active, int slot) {
+    if (!s || !*s || width <= 0) return 0;
+    int tw = d_text_w(em, face, s);
+    if (!active || !P.marquee || tw <= width) { d_text_mid(g, x, cy, em, face, c, s, width); return 0; }
+    double now = app_now(), speed = MQ_SPEED * EM, overflow = tw - width;
+    double scroll = overflow / speed, cycle = 2 * MQ_PAUSE + scroll;
+    mslot *m = &mq[slot & 7];
+    unsigned long long h = mq_hash(s) ^ ((unsigned long long)width << 32);
+    if (m->h != h) { m->h = h; m->t0 = now; }
+    double t = fmod(now - m->t0, cycle);
+    if (t < 0) t += cycle;
+    double off = t <= MQ_PAUSE ? 0 : t >= MQ_PAUSE + scroll ? overflow : (t - MQ_PAUSE) * speed;
+    int lh = d_line_h(em, face);
+    gfx_push_clip(g, x, cy - lh, width, 2 * lh);
+    d_text_mid(g, x - (int)off, cy, em, face, c, s, 0);
+    gfx_pop_clip(g);
+    mq_last = now;
+    return 1;
+}
+int d_marquee_active(void) { return mq_last > 0 && app_now() - mq_last < 0.08; }
+
 /* ---------- картинки и логотипы ---------- */
 /* Картинка ARGB (src: sw×sh) в прямоугольник x, y, w, h — масштаб ближайшим пикселем, честная прозрачность. */
 void d_bitmap(gfx_t *g, const uint32_t *src, int sw, int sh, int x, int y, int w, int h) {
@@ -481,13 +618,24 @@ int d_image(gfx_t *g, const char *url, int x, int y, int w, int h, int r, int co
     return 1;
 }
 
+static int logo_draw(gfx_t *g, const char *url, int x, int y, int w, int h) {
+    const gfx_image *im = logo_img(url, w, h, IMG_FIT);
+    if (!im) return 0;
+    gfx_image_draw(g, im, x, y, 0, 255);
+    return 1;
+}
+
 void d_logo(gfx_t *g, const channel *c, int x, int y, int w, int h, int r, int badge, int on_white) {
     const char *url = repo_logo(c);
     int pad = (int)(h * 0.14);
     int have = 0;
     if (url && *url) {
         d_round(g, x, y, w, h, r, on_white ? C_LOGO_PLATE : C_FILL_SOFT);
-        have = d_image(g, url, x + pad, y + pad, w - 2 * pad, h - 2 * pad, 0, 0);
+        have = logo_draw(g, url, x + pad, y + pad, w - 2 * pad, h - 2 * pad);
+        if (!have) {   /* плейлист не отдал картинку — пробуем второй источник (программа/плейлист) */
+            const char *alt = repo_logo_alt(c, url);
+            if (alt && *alt && strcmp(alt, url)) have = logo_draw(g, alt, x + pad, y + pad, w - 2 * pad, h - 2 * pad);
+        }
     }
     if (!have) {
         uint32_t col = c->color;

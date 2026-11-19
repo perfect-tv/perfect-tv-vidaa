@@ -1,6 +1,6 @@
 /* Телетекст DVB (EN 300 472 — упаковка в PES, EN 300 706 — страницы), уровень 1.0: наборы G0 (латиница с
  * национальными вариантами, кириллица), мозаика, двойная высота, Fastext, страницы субтитров. Перенос
- * teletext/Ttx.kt Android-версии (без расширений X/26). Подаёт данные поток ретранслятора (core/relay.c),
+ * teletext/Ttx.kt Android-версии, включая расширения X/26 (G2 и диакритика). Подаёт данные поток ретранслятора (core/relay.c),
  * читает интерфейс — под замком. */
 #ifndef PTV_TTX_H
 #define PTV_TTX_H
@@ -16,6 +16,8 @@ typedef struct {
     uint8_t charset;
     uint8_t has[TTX_ROWS];
     uint8_t rows[TTX_ROWS][TTX_COLS];           /* 7 бит, как пришли */
+    uint8_t enh_has;                             /* какие обозначения X/26 пришли (бит 0…15) */
+    int32_t enh[16][13];                         /* X/26: слова «адрес, режим, данные» (18 бит) */
 } ttx_page;
 
 typedef struct ttx ttx;
@@ -52,6 +54,7 @@ void ttx_header_row(int number, const ttx_page *p, const char *typed, uint8_t ou
 /* Текст субтитра: строки (только «окна», если есть) через \n, без пустых. Длина. */
 size_t ttx_subtitle_text(const ttx_grid *g, char *out, size_t cap);
 uint32_t ttx_glyph(int c, int charset);
+uint32_t ttx_g2(int c);                        /* знак G2 (X/26), код 0x20…0x7F */
 uint8_t ttx_rev(uint8_t b);
 int ttx_ham84(uint8_t b);
 #endif

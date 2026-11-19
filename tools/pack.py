@@ -132,7 +132,11 @@ exec "$HERE/{cfg['binary']}" {cfg.get('startArgs', '--ui')} >>"$LOG" 2>&1
             ca += b'\n' + open(x, 'rb').read()
         files.append(('cacert.pem', ca, 0o644))
     files.append(('SOURCE.txt', (cfg.get('credits', '') + '\n').encode(), 0o644))
-    files.append(('LICENSE-fonts.txt', open(os.path.join(sdk, 'fonts', 'LICENSE'), 'rb').read(), 0o644))
+    font_lic = open(os.path.join(sdk, 'fonts', 'LICENSE'), 'rb').read()
+    onest = os.path.join(sdk, 'fonts', 'OFL-Onest.txt')
+    if os.path.isfile(onest):
+        font_lic += b'\n\n' + open(onest, 'rb').read()
+    files.append(('LICENSE-fonts.txt', font_lic, 0o644))
     files.append(('LICENSE.txt', open(os.path.join(ROOT, 'LICENSE'), 'rb').read(), 0o644))
 
     root = 'APPS/pkgs/' + package

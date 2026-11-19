@@ -19,6 +19,4 @@ int keys_map(int evdev_code);
 void keys_raw(int code, int value);
 /* таймеры долгого нажатия и удержания; вызывать каждый кадр */
 void keys_tick(double now);
-/* пульт присылал цветные кнопки: подсказки с ними можно показывать */
-int keys_has_colors(void);
 #endif
