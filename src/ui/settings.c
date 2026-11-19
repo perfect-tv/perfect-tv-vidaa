@@ -10,12 +10,16 @@
 #include "core/clock.h"
 #include "core/lang.h"
 #include "core/prefs.h"
+#include "core/relay.h"
 #include "data/epg.h"
+#include "player/player.h"
 #include "data/loaders.h"
 #include "data/backup.h"
 #include "data/tmdb.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #ifndef PTV_VERSION
@@ -35,7 +39,7 @@ enum {
     I_PIN_SET, I_PIN_CLEAR, I_PIN_ASK, I_PIN_INPUT,
     I_RELAY_ALL, I_RELAY_DIRECT,
     I_TMDB_KEY, I_TMDB_PHONE, I_TMDB_API, I_TMDB_IMG, I_TMDB_TEST, I_TMDB_REMOVE,
-    I_BACKUP_SAVE, I_BACKUP_RESTORE, I_CLEAR_LOGOS, I_CLEAR_EPG, I_DATA_DIR,
+    I_BACKUP_SAVE, I_BACKUP_RESTORE, I_CLEAR_LOGOS, I_CLEAR_EPG, I_DATA_DIR, I_DIAG,
     I_VERSION, I_SOURCE, I_LICENSE,
 };
 typedef struct { int id; char label[200], sub[300], value[200]; int choice; } item;
@@ -168,6 +172,7 @@ static void build(void) {
         add(I_CLEAR_LOGOS, tr(S_CLEAR_LOGOS), NULL, NULL, 0);
         add(I_CLEAR_EPG, tr(S_CLEAR_EPG), NULL, NULL, 0);
         add(I_DATA_DIR, tr(S_DATA_DIR), app_platform_get()->data_dir, NULL, 0);
+        add(I_DIAG, tr(S_DIAGNOSTICS), tr(S_DIAGNOSTICS_SUB), NULL, 0);
         break;
     case SEC_ABOUT:
         add(I_VERSION, tr(S_VERSION), NULL, PTV_VERSION, 0);
@@ -263,6 +268,38 @@ static void tmdb_from_phone(const phone_result *r, void *c) {
 static void tmdb_tested(const char *err) { tv_toast(err ? err : tr(S_TMDB_OK)); }
 static void tmdb_remove_yes(void *c) { (void)c; P.tmdb_key[0] = 0; tmdb_changed(); }
 
+/* Сводка для ТВ: то, что нельзя посмотреть в настройках, и хвост журнала запуска. */
+static void diag_open(void) {
+    static char b[24][220];
+    static const char *it[24];
+    int n = 0;
+#define DL(...) do { if (n < 24) { snprintf(b[n], sizeof b[n], __VA_ARGS__); it[n] = b[n]; n++; } } while (0)
+    DL("%s: %s", tr(S_VERSION), PTV_VERSION);
+    const app_platform *pl = app_platform_get();
+    DL("%s: %s", tr(S_DATA_DIR), pl && pl->data_dir ? pl->data_dir : "?");
+    DL("%s: %d", tr(S_PLAYLISTS), R.npl);
+    DL("%s: %s", tr(S_CHANNEL_LIST), trp(S_CHANNELS_N, R.nch));
+    if (repo_cur()) DL("%s: %s", tr(S_CURRENT), repo_cur()->name);
+    DL("%s: %d", tr(S_DIAG_EPG), R.nepg);
+    long progs = 0;
+    int ep = loaders_epg_progress(&progs);
+    if (ep >= 0) DL("%s: %d%% / %ld", tr(S_DIAG_EPG_PROGRESS), ep, progs);
+    else DL("%s: -", tr(S_DIAG_EPG_PROGRESS));
+    DL("%s: %s", tr(S_DIAG_PLAYER), pl_software() ? "software" : pl_state() == PL_IDLE ? "idle" : "hmc");
+    DL("%s: %d", tr(S_DIAG_STATE), pl_state());
+    DL("%s: %s", tr(S_DIAG_CODECS), pl_codecs());
+    DL("%s: %.1f s", tr(S_DIAG_POSITION), pl_position());
+    if (pl_state() == PL_FAILED) DL("%s: %s", tr(S_ERR_CODE), pl_why());
+    DL("%s: %s, %lld", tr(S_DIAG_RELAY), T.relayed ? tr(S_ON) : tr(S_OFF), relay_ts_bytes());
+    struct statvfs sv;
+    if (pl && pl->data_dir && !statvfs(pl->data_dir, &sv))
+        DL("%s: %.0f MB", tr(S_DIAG_FREE), (double)sv.f_bavail * (double)sv.f_frsize / 1048576.0);
+    const char *log = getenv("PTV_LOG");
+    DL("%s: %s", tr(S_DIAG_LOG), log && *log ? log : "-");
+#undef DL
+    choose_open(tr(S_DIAGNOSTICS), (const char *const *)it, n, 0, NULL, NULL);
+}
+
 static void change(item *it, int dir) {
     int d = dir ? dir : 1;
 #define CYCLE(arr, field) do { int n_ = (int)(sizeof arr / sizeof arr[0]); P.field = arr[((sel_of(arr, n_, P.field) + d) % n_ + n_) % n_]; } while (0)
@@ -326,6 +363,7 @@ static void action(item *it) {
     case I_BACKUP_RESTORE: restore_open(); break;
     case I_CLEAR_LOGOS: img_cache_clear(); tv_toast(tr(S_LOGOS_CLEARED)); break;
     case I_CLEAR_EPG: confirm_open(tr(S_CLEAR_EPG), tr(S_DELETE), clear_epg_yes, NULL); break;
+    case I_DIAG: diag_open(); break;
     default: break;
     }
 }
