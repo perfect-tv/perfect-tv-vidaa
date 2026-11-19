@@ -125,18 +125,23 @@ void repo_move_playlist(int i, int dir) {
     repo_save_playlists();
 }
 
+static void epg_add_unique(strlist *out, const char *url) {
+    if (url && *url && sl_find(out, url) < 0) sl_add(out, url);
+}
+
 void repo_epg_urls(const playlist *p, strlist *out) {
     strlist u = {0}, h = {0};
     sl_from_lines(&u, p->user_epg);
     sl_from_lines(&h, p->header_epg);
     sl_clear(out);
-    if (p->epg_mode == EPG_MINE) for (int i = 0; i < u.n; i++) sl_add(out, u.v[i]);
-    else if (p->epg_mode == EPG_BOTH) {
-        for (int i = 0; i < u.n; i++) sl_add(out, u.v[i]);
-        for (int i = 0; i < h.n; i++) if (sl_find(out, h.v[i]) < 0) sl_add(out, h.v[i]);
+    if (p->epg_mode == EPG_MINE) {
+        for (int i = 0; i < u.n; i++) epg_add_unique(out, u.v[i]);
+    } else if (p->epg_mode == EPG_BOTH) {
+        for (int i = 0; i < u.n; i++) epg_add_unique(out, u.v[i]);
+        for (int i = 0; i < h.n; i++) epg_add_unique(out, h.v[i]);
     } else {
         strlist *s = h.n ? &h : &u;
-        for (int i = 0; i < s->n; i++) sl_add(out, s->v[i]);
+        for (int i = 0; i < s->n; i++) epg_add_unique(out, s->v[i]);
     }
     while (out->n > MAX_EPG) sl_remove(out, out->n - 1);
     sl_clear(&u);
