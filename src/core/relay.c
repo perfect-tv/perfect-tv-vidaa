@@ -696,6 +696,7 @@ static void up_to_pool(up *u) {
     u->c = NULL;
     u->st = U_IDLE;
     u->in_n = 0;
+    u->again = 0;   /* в пуле нечего дочитывать: иначе epoll_wait(..., 0) крутится до T_POOL */
     u->deadline = mono_now() + T_POOL;
     if (pool_count() > POOL_MAX) {   /* самое старое — закрыть */
         up *old = NULL;
@@ -900,6 +901,7 @@ static void up_start_request(up *u) {
     u->length = -1;
     u->received = u->chunk_left = 0;
     u->in_n = 0;
+    u->again = 0;
     u->location[0] = 0;
     sb_clear(&u->headers);
     u->paused = 0;
