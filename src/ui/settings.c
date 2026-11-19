@@ -166,6 +166,7 @@ static void after_pin_clear(void *c) { (void)c; P.pin[0] = 0; prefs_save(); tv_t
 static void after_pin_ok(void *c) { (void)c; pin_create(NULL, NULL); }
 static void clear_epg_yes(void *c) {
     (void)c;
+    if (loaders_epg_busy()) { tv_toast(tr(S_EPG_STATUS_LOADING)); return; }   /* сборка пишет *.new — не удалять */
     loaders_cancel();
     for (int i = 0; i < R.nepg; i++) epg_remove_files(R.epg[i].hash);
     repo_open_epg();
