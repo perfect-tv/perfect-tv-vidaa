@@ -98,12 +98,12 @@ static void open_url(const char *url, const char *hdr, double start) {
             subs_stream_changed();
             T.relayed = 1;
             fprintf(stderr, "stream via relay\n");
-            pl_open(r, NULL, start);
+            pl_open(r, NULL, start, T.arc);
             return;
         }
         if (T.tap) { T.tap = T.subs = 0; tv_toast(tr(S_TTX_NOT_HTTP)); }
     }
-    pl_open(url, hdr, start);
+    pl_open(url, hdr, start, T.arc);
 }
 
 static void start_stream(void);
@@ -712,6 +712,7 @@ static const char *reason(const char *why) {
     if (!strcmp(why, "dlopen") || !strcmp(why, "symbols") || !strncmp(why, "manager", 7) || !strcmp(why, "create_player") ||
         !strncmp(why, "player_native_", 14) || !strncmp(why, "player_feed_", 12)) return tr(S_ERR_PLAYER);
     if (!strcmp(why, "stream_ended")) return tr(S_ERR_ENDED);
+    if (!strcmp(why, "archive_software")) return tr(S_ERR_ARCHIVE_SOFTWARE);
     return tr(S_ERR_GENERIC);
 }
 

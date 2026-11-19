@@ -9,7 +9,7 @@
 enum { PL_IDLE = 0, PL_OPENING, PL_PLAYING, PL_FAILED, PL_ENDED };
 
 /* Открыть поток (заменяет текущий); start — позиция в секундах внутри ссылки (VOD), 0 — с начала/края. */
-void pl_open(const char *url, const char *headers, double start);
+void pl_open(const char *url, const char *headers, double start, int archive);
 void pl_close(void);
 int pl_state(void);
 const char *pl_why(void);            /* код отказа (open_input=…, video_codec=h264…) */

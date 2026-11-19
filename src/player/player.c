@@ -15,12 +15,13 @@
 #include <string.h>
 #include <time.h>
 
-typedef struct { struct hmc_player *old, *h; struct swp *old_sw, *sw; char url[4096], headers[1024], why[96]; double start; } pjob;
+typedef struct { struct hmc_player *old, *h; struct swp *old_sw, *sw; char url[4096], headers[1024], why[96]; double start; int arc; } pjob;
 
 static struct {
     int busy, want;
     char url[4096], headers[1024];
     double start;
+    int arc;
     struct hmc_player *h;
     struct swp *sw;
     int state;
@@ -61,10 +62,16 @@ static void job_work(void *p) {
     if (!j->url[0]) return;
     j->h = hmc_player_open(j->url, j->headers[0] ? j->headers : NULL, j->start, SCREEN_W, SCREEN_H, j->why, sizeof j->why);
     if (!j->h && software_reason(j->why)) {
-        char why2[96];
-        fprintf(stderr, "player=software reason=%s\n", j->why);
-        j->sw = swp_open(j->url, why2, sizeof why2);
-        if (!j->sw) fprintf(stderr, "player=software_failed reason=%s\n", why2);
+        if (j->arc) {
+            /* swp_open не принимает start и не умеет seek: архив с начала ссылки — неверный участок */
+            snprintf(j->why, sizeof j->why, "archive_software");
+            fprintf(stderr, "player=software_archive_skip\n");
+        } else {
+            char why2[96];
+            fprintf(stderr, "player=software reason=%s\n", j->why);
+            j->sw = swp_open(j->url, why2, sizeof why2);
+            if (!j->sw) fprintf(stderr, "player=software_failed reason=%s\n", why2);
+        }
     }
 }
 
@@ -97,6 +104,7 @@ static void launch(void) {
         str_copy(j->url, sizeof j->url, S.url);
         str_copy(j->headers, sizeof j->headers, S.headers);
         j->start = S.start;
+        j->arc = S.arc;
         S.want = 0;
         S.state = S.url[0] ? PL_OPENING : PL_IDLE;
     } else return;
@@ -106,7 +114,7 @@ static void launch(void) {
     pool_submit(job_work, job_done, j);
 }
 
-void pl_open(const char *url, const char *headers, double start) {
+void pl_open(const char *url, const char *headers, double start, int archive) {
 #ifndef PTV_HOST
     static int log_set;
     if (!log_set) { av_log_set_callback(ff_log); av_log_set_level(AV_LOG_WARNING); log_set = 1; }
@@ -114,6 +122,7 @@ void pl_open(const char *url, const char *headers, double start) {
     str_copy(S.url, sizeof S.url, url);
     str_copy(S.headers, sizeof S.headers, headers ? headers : "");
     S.start = start;
+    S.arc = archive;
     S.want = 1;
     S.state = PL_OPENING;
     S.why[0] = 0;
