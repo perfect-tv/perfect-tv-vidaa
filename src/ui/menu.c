@@ -143,12 +143,13 @@ static void choose_playlist(int i, void *ctx) {
     (void)ctx;
     if (i == R.cur || i < 0 || i >= R.npl) return;
     loaders_cancel();
-    R.cur = i;
     char path[700];
     repo_channels_path(R.pl[i].id, path, sizeof path);
-    if (!file_exists(path)) { layer_pop_all(); tv_playlist_changed(0); load_playlist(i, 1); return; }
-    tv_playlist_changed(0);
-    load_epg(0);
+    if (!file_exists(path)) { layer_pop_all(); R.cur = i; tv_playlist_changed(0); load_playlist(i, 1); return; }
+    layer_pop_all();
+    /* как в Android: видео прежнего канала продолжает играть, гид открывается на новом */
+    if (tv_preview_playlist(i)) { tv_open_guide(); load_epg(0); }
+    else { tv_playlist_changed(0); load_epg(0); }
 }
 
 static void activate(ent *e, int dir) {

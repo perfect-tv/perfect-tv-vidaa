@@ -72,6 +72,11 @@ void tv_set_sleep(int minutes);      /* 0 — выкл. */
 int tv_sleep_minutes(void);
 /* После загрузки плейлиста / смены плейлиста. */
 void tv_playlist_changed(int keep_channel);
+/* Предпросмотр плейлиста без остановки текущего канала: гид показывает новый список,
+ * видео играет до выбора канала; «Назад» возвращает прежний плейлист. */
+int tv_preview_playlist(int index);
+void tv_preview_back(void);
+int tv_is_preview(void);
 void tv_restart(void);               /* после восстановления копии */
 void tv_teletext(void);              /* открыть телетекст (поток — через ретранслятор) */
 void tv_set_subtitles(int on);       /* вкл. — запомненные или первые доступные субтитры, выкл. */

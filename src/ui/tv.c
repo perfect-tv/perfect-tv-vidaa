@@ -25,6 +25,10 @@ tv_t T;
 #define CAROUSEL_SECONDS 1.5
 #define DIGIT_SECONDS 2.0
 
+static void preview_commit(void);
+static int preview_active;
+static channel *preview_hold;
+
 static char toast_msg[300];
 static double toast_until;
 static int pin_session;          /* «один раз до выхода»: PIN уже вводили */
@@ -169,6 +173,7 @@ static void remember(void) {
 
 static void really_play(channel *c, const char *gkey, int arc, int64_t t, double delay) {
     if (!c) return;
+    if (preview_active && c != T.cur) preview_commit();
     if (c != T.cur) {
         T.scored = 0;
         T.audio_pref_done = 0;
@@ -496,10 +501,84 @@ int64_t tv_frame_pts(void) {
 }
 
 /* ---------- плейлист ---------- */
+/* ---------- предпросмотр плейлиста без остановки канала ---------- */
+static int preview_from = -1, preview_last;
+
+static channel *chan_copy(const channel *s) {
+    if (!s) return NULL;
+    channel *d = calloc(1, sizeof *d);
+    if (!d) return NULL;
+    *d = *s;
+#define CP(f) do { if (s->f) { d->f = strdup(s->f); if (!d->f) { free(d->key); free(d->name); free(d->url); free(d->group); free(d->logo); \
+    free(d->tvg_id); free(d->tvg_name); free(d->mkey); free(d->tkey); free(d->cu_type); free(d->cu_source); free(d->ua); free(d->ref); \
+    free(d->headers_json); free(d); return NULL; } } } while (0)
+    CP(key); CP(name); CP(url); CP(group); CP(logo); CP(tvg_id); CP(tvg_name); CP(mkey); CP(tkey);
+    CP(cu_type); CP(cu_source); CP(ua); CP(ref); CP(headers_json);
+#undef CP
+    d->epg_src = d->epg_ch = -1;   /* индексы старого плейлиста к новому не относятся */
+    return d;
+}
+static void chan_free(channel *c) {
+    if (!c) return;
+    free(c->key); free(c->name); free(c->url); free(c->group); free(c->logo); free(c->tvg_id); free(c->tvg_name);
+    free(c->mkey); free(c->tkey); free(c->cu_type); free(c->cu_source); free(c->ua); free(c->ref); free(c->headers_json);
+    free(c);
+}
+
+int tv_is_preview(void) { return preview_active; }
+
+int tv_preview_playlist(int index) {
+    if (index < 0 || index >= R.npl || index == R.cur) return 0;
+    if (!preview_active) {
+        preview_from = R.cur;
+        preview_last = P.last_playlist;
+        if (T.cur) {
+            preview_hold = chan_copy(T.cur);
+            T.cur = preview_hold;   /* NULL при нехватке памяти: видео продолжает играть, инфопанель скрыта */
+        }
+        preview_active = 1;
+    }
+    repo_select(index);
+    P.last_playlist = preview_last;   /* выбранный канал нового плейлиста запишет его сам */
+    app_dirty();
+    return 1;
+}
+
+void tv_preview_back(void) {
+    if (!preview_active) return;
+    int from = preview_from, last = preview_last;
+    char key[160] = "";
+    if (preview_hold) snprintf(key, sizeof key, "%s", preview_hold->key);
+    else if (T.cur) snprintf(key, sizeof key, "%s", T.cur->key);
+    preview_active = 0;
+    T.cur = NULL;
+    repo_select(from);
+    P.last_playlist = last;
+    channel *c = key[0] ? repo_by_key(key) : NULL;
+    chan_free(preview_hold);
+    preview_hold = NULL;
+    T.cur = c;
+    if (c) {
+        group *g = repo_group_of(c, NULL);
+        snprintf(T.group, sizeof T.group, "%s", g ? g->key : ALL_KEY);
+    } else T.group[0] = 0;
+    app_dirty();
+}
+
+static void preview_commit(void) {
+    if (!preview_active) return;
+    preview_active = 0;
+    chan_free(preview_hold);
+    preview_hold = NULL;
+    playlist *p = repo_cur();
+    P.last_playlist = p ? p->id : 0;
+}
+
 static int keep_layer(const layer *l) {
     return l->name && (!strcmp(l->name, "settings") || !strcmp(l->name, "form") || !strcmp(l->name, "choose") || !strcmp(l->name, "confirm"));
 }
 void tv_playlist_changed(int keep) {
+    if (preview_active) { preview_active = 0; chan_free(preview_hold); preview_hold = NULL; T.cur = NULL; }
     char key[160], grp[160];
     snprintf(key, sizeof key, "%s", T.cur && keep ? T.cur->key : P.last_channel);
     snprintf(grp, sizeof grp, "%s", T.group[0] ? T.group : P.last_group);
@@ -558,6 +637,7 @@ void tv_restart(void) {
     loaders_cancel();
     layer_pop_all();
     pl_close();
+    if (preview_active) { preview_active = 0; chan_free(preview_hold); preview_hold = NULL; }
     T.cur = NULL;
     T.group[0] = 0;
     T.arc = T.paused = T.seeking = 0;

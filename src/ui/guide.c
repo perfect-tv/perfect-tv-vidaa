@@ -74,6 +74,7 @@ static void progs_to_now(void) {
 static void sync_from_tv(void) {
     G.gi = 0;
     G.ci = 0;
+    if (tv_is_preview()) { G.top = 0; fit(); return; }   /* играет канал прежнего плейлиста */
     group *g = repo_group(T.group);
     if (g) G.gi = repo_group_index(g);
     if (T.cur) {
@@ -193,14 +194,13 @@ static void cats_preview(void) {
 static void switch_playlist(int i) {
     if (i == R.cur || i < 0 || i >= R.npl) { G.zone = Z_CATS; return; }
     loaders_cancel();
-    R.cur = i;
-    layer_pop(&L);
     char path[700];
     repo_channels_path(R.pl[i].id, path, sizeof path);
-    if (!file_exists(path)) { tv_playlist_changed(0); load_playlist(i, 1); return; }
-    tv_playlist_changed(0);
-    if (!guide_is_open()) guide_open(0);
-    load_epg(0);
+    if (!file_exists(path)) { R.cur = i; tv_playlist_changed(0); load_playlist(i, 1); return; }
+    layer_pop(&L);
+    /* видео не останавливаем: гид показывает новый плейлист, канал выбирается по OK */
+    if (tv_preview_playlist(i)) { guide_open(0); load_epg(0); }
+    else { tv_playlist_changed(0); if (!guide_is_open()) guide_open(0); load_epg(0); }
 }
 
 static int has_long(layer *l, int k) {
@@ -214,6 +214,11 @@ static int key(layer *l, int k, int ev) {
     (void)l;
     group *g = cur_group();
     int n = g ? g->n : 0;
+    if (k == KEY_BACK && ev == EV_SHORT && tv_is_preview()) {
+        layer_pop(&L);
+        tv_preview_back();
+        return 1;
+    }
     if (k == KEY_MENU || (k == KEY_OK && ev == EV_LONG && G.zone != Z_PROGS)) {
         channel *c = cur_channel();
         if (c) tv_open_menu(c, g ? g->key : NULL, 1);
