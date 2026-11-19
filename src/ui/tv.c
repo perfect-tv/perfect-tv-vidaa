@@ -561,6 +561,10 @@ void tv_restart(void) {
     T.group[0] = 0;
     T.arc = T.paused = T.seeking = 0;
     T.pin_passed = 0;
+    pin_session = 0;                   /* «один раз до выхода» не переживает смену базы настроек */
+    T.info_pinned = T.info_expanded = 0;
+    T.dig[0] = 0;
+    T.failed = 0;
     prefs_load();
     lang_set(P.lang);
     u_init();
