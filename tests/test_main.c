@@ -688,11 +688,11 @@ static void test_logocache(void) {
 
 /* ---------- напоминания: глубина архива хранится в самом напоминании ---------- */
 static void test_reminders(void) {
-    const char *rem = "[{\"key\":\"ch\",\"name\":\"Канал\",\"start\":100,\"stop\":200,\"playlist\":2,\"archive_days\":7}]";
+    const char *rem = "[{\"key\":\"ch\",\"name\":\"Канал\",\"start\":100,\"stop\":200,\"playlist\":2,\"archive_days\":7,\"desc\":\"Описание\"}]";
     file_write_atomic(data_path("reminders.json"), rem, strlen(rem));
     repo_init();
     EQI(R.nrem, 1);
-    if (R.nrem == 1) { EQI(R.rem[0].archive_days, 7); EQI(R.rem[0].playlist, 2); EQS(R.rem[0].key, "ch"); }
+    if (R.nrem == 1) { EQI(R.rem[0].archive_days, 7); EQI(R.rem[0].playlist, 2); EQS(R.rem[0].key, "ch"); EQS(R.rem[0].desc, "Описание"); }
     repo_reminders_save();
     size_t n;
     char *t = file_read(data_path("reminders.json"), &n);

@@ -55,7 +55,7 @@ typedef struct {
     int num, playlist;
     int archive_days;            /* глубина архива канала на момент напоминания: чужой плейлист не загружен */
     int64_t start, stop;
-    char title[200];
+    char title[200], desc[400];
     int64_t snooze;              /* показать не раньше */
     int shown;                   /* окно уже показывали (пропущенное — один раз) */
 } reminder;

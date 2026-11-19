@@ -423,7 +423,7 @@ static void rem_draw(layer *l, gfx_t *g) {
     if (!RM.n) return;
     reminder *r = &R.rem[RM.idx[RM.cur]];
     int missed = rem_missed(r);
-    int w = E(50), h = E(19), x = SW - E(4) - w, y = E(2.4);
+    int w = E(50), h = E(r->desc[0] ? 22 : 19), x = SW - E(4) - w, y = E(2.4);
     d_round(g, x, y, w, h, E(1), C_POPUP);
     int ix = x + E(1.8), iw = w - E(3.6), iy = y + E(1.4);
     int64_t now = clock_now();
@@ -437,7 +437,8 @@ static void rem_draw(layer *l, gfx_t *g) {
     fmt_hm(r->start, hm);
     snprintf(line, sizeof line, "%s  ·  %s", r->name, hm);
     d_text(g, ix, iy + E(2.4), 1.2, F_R, C_TEXT2, line, iw);
-    d_lines(g, ix, iy + E(4.6), iw, 1.6, F_B, C_WHITE, r->title, 2, 0);
+    int tl = d_lines(g, ix, iy + E(4.6), iw, 1.6, F_B, C_WHITE, r->title, 2, 0);
+    if (r->desc[0]) d_lines(g, ix, iy + E(4.6) + tl * (d_line_h(1.6, F_B) + E(0.15)) + E(0.5), iw, 1.15, F_R, WA(0.65), r->desc, 2, 0.1);
     const char *b[4] = {missed ? tr(S_WATCH_ARCHIVE) : tr(S_WATCH), missed ? tr(S_LATER) : tr(S_SNOOZE), missed ? tr(S_DELETE) : tr(S_CLOSE), tr(S_CLOSE_ALL)};
     int bx = ix, nb = 3 + (RM.n > 1);
     for (int i = 0; i < nb; i++) bx += button(g, bx, y + h - E(4.4), b[i], i == RM.focus) + E(0.8);
