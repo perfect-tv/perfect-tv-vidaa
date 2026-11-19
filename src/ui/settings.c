@@ -30,6 +30,7 @@ enum {
     I_PL_ADD = 1, I_EPG_SRC, I_EPG_REFRESH,
     I_ARCHIVE_DAYS, I_INFO_HIDE, I_UPKEY, I_START_LAST, I_REMIND, I_ANYCERT, I_ASPECT_P, I_EPG_HOURS, I_PL_HOURS,
     I_LANG, I_TZ, I_SCALE, I_NUMBER, I_GUIDE_VIEW, I_GUIDE_HEADER, I_HINTS_P, I_LOGO_PRIO,
+    I_SUB_SIZE, I_SUB_COLOR, I_SUB_BG, I_SUB_EDGE, I_SUB_BOTTOM,
     I_ADAPTIVE_P, I_RESET_SCORES, I_HIDDEN_P,
     I_PIN_SET, I_PIN_CLEAR, I_PIN_ASK, I_PIN_INPUT,
     I_RELAY_ALL, I_RELAY_DIRECT,
@@ -48,6 +49,15 @@ static const int HIDE[] = {3, 5, 7, 10};
 static const int REM[] = {0, 1, 2, 3, 4, 5, 10};
 static const int EPGH[] = {6, 12, 24};
 static const int PLH[] = {12, 24, 48};
+static const int SUBSIZE[] = {75, 100, 125, 150, 200};
+static const int SUBBOTTOM[] = {0, 4, 8, 12, 18};
+static const int SUBCOL[] = {-1, 0xffffff, 0xffff00, 0x00ff00, 0x00ffff};
+static const int SUBCOLS[] = {S_SUB_STREAM, S_SUB_WHITE, S_SUB_YELLOW, S_SUB_GREEN, S_SUB_CYAN};
+static const int SUBBG[] = {0, 1, 2};
+static const int SUBBGS[] = {S_SUB_BG_NONE, S_SUB_BG_SEMI, S_SUB_BG_BLACK};
+static const int SUBEDGE[] = {0, 1, 2};
+static const int SUBEDGES[] = {S_SUB_EDGE_NONE, S_SUB_EDGE_OUTLINE, S_SUB_EDGE_SHADOW};
+static const char *pick(const int *vals, const int *names, int n, int cur) { return tr(names[sel_of(vals, n, cur)]); }
 
 static void add(int id, const char *label, const char *sub, const char *value, int choice) {
     if (ST.n >= 64) return;
@@ -117,6 +127,13 @@ static void build(void) {
         add(I_GUIDE_HEADER, tr(S_GUIDE_HEADER), NULL, tr(P.guide_header == 1 ? S_HEADER_CHANNEL : P.guide_header == 2 ? S_HEADER_HIDE : S_HEADER_FULL), 1);
         add(I_HINTS_P, tr(S_HINTS), NULL, tr(P.hints ? S_ON : S_OFF), 1);
         add(I_LOGO_PRIO, tr(S_LOGO_PRIORITY), NULL, tr(P.logo_priority ? S_LOGO_EPG : S_LOGO_PLAYLIST), 1);
+        snprintf(v, sizeof v, "%d%%", P.sub_size);
+        add(I_SUB_SIZE, tr(S_SUB_SIZE), NULL, v, 1);
+        add(I_SUB_COLOR, tr(S_SUB_COLOR), NULL, pick(SUBCOL, SUBCOLS, (int)(sizeof SUBCOL / sizeof SUBCOL[0]), P.sub_color), 1);
+        add(I_SUB_BG, tr(S_SUB_BG), NULL, pick(SUBBG, SUBBGS, (int)(sizeof SUBBG / sizeof SUBBG[0]), P.sub_bg), 1);
+        add(I_SUB_EDGE, tr(S_SUB_EDGE), NULL, pick(SUBEDGE, SUBEDGES, (int)(sizeof SUBEDGE / sizeof SUBEDGE[0]), P.sub_edge), 1);
+        snprintf(v, sizeof v, "%d%%", P.sub_bottom);
+        add(I_SUB_BOTTOM, tr(S_SUB_BOTTOM), NULL, v, 1);
         break;
     case SEC_LIST:
         add(I_ADAPTIVE_P, tr(S_ADAPTIVE), NULL, tr(P.adaptive ? S_ON : S_OFF), 1);
@@ -273,6 +290,11 @@ static void change(item *it, int dir) {
     case I_GUIDE_HEADER: P.guide_header = ((P.guide_header + d) % 3 + 3) % 3; break;
     case I_HINTS_P: P.hints = !P.hints; break;
     case I_LOGO_PRIO: P.logo_priority = !P.logo_priority; break;
+    case I_SUB_SIZE: CYCLE(SUBSIZE, sub_size); break;
+    case I_SUB_COLOR: { int i = sel_of(SUBCOL, (int)(sizeof SUBCOL / sizeof SUBCOL[0]), P.sub_color); int n_ = (int)(sizeof SUBCOL / sizeof SUBCOL[0]); i = (i + d + n_) % n_; P.sub_color = SUBCOL[i]; } break;
+    case I_SUB_BG: { int i = sel_of(SUBBG, (int)(sizeof SUBBG / sizeof SUBBG[0]), P.sub_bg); int n_ = (int)(sizeof SUBBG / sizeof SUBBG[0]); i = (i + d + n_) % n_; P.sub_bg = SUBBG[i]; } break;
+    case I_SUB_EDGE: { int i = sel_of(SUBEDGE, (int)(sizeof SUBEDGE / sizeof SUBEDGE[0]), P.sub_edge); int n_ = (int)(sizeof SUBEDGE / sizeof SUBEDGE[0]); i = (i + d + n_) % n_; P.sub_edge = SUBEDGE[i]; } break;
+    case I_SUB_BOTTOM: CYCLE(SUBBOTTOM, sub_bottom); break;
     case I_ADAPTIVE_P: P.adaptive = !P.adaptive; repo_apply_view(); break;
     case I_PIN_ASK: P.pin_ask = !P.pin_ask; break;
     case I_PIN_INPUT: P.pin_input = ((P.pin_input + d) % 3 + 3) % 3; break;

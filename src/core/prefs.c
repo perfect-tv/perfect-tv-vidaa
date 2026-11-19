@@ -31,6 +31,11 @@ static int_pref *ints(int *n) {
         {"ttx_keypad", &P.ttx_keypad, 0},
         {"ttx_mix", &P.ttx_mix, 1},
         {"logo_priority", &P.logo_priority, 0},
+        {"sub_size", &P.sub_size, 100},
+        {"sub_color", &P.sub_color, -1},
+        {"sub_bg", &P.sub_bg, 1},
+        {"sub_edge", &P.sub_edge, 0},
+        {"sub_bottom", &P.sub_bottom, 0},
         {"aspect", &P.aspect, ASPECT_FIT},
         {"remind_before", &P.remind_before, 1},
         {"pin_ask", &P.pin_ask, PIN_EACH},
@@ -78,6 +83,11 @@ void prefs_load(void) {
     P.ttx_keypad = !!P.ttx_keypad;
     P.ttx_mix = !!P.ttx_mix;
     P.logo_priority = !!P.logo_priority;
+    if (P.sub_size < 75 || P.sub_size > 200) P.sub_size = 100;
+    if (P.sub_color != -1 && (P.sub_color < 0 || P.sub_color > 0xffffff)) P.sub_color = -1;
+    if (P.sub_bg < 0 || P.sub_bg > 2) P.sub_bg = 1;
+    if (P.sub_edge < 0 || P.sub_edge > 2) P.sub_edge = 0;
+    if (P.sub_bottom < 0 || P.sub_bottom > 18) P.sub_bottom = 0;
     if (P.aspect < ASPECT_FIT || P.aspect > ASPECT_4_3) P.aspect = ASPECT_FIT;
     if (P.remind_before < 0 || P.remind_before > 10) P.remind_before = 1;
     if (P.pin_ask < PIN_EACH || P.pin_ask > PIN_ONCE) P.pin_ask = PIN_EACH;

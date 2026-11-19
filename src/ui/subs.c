@@ -9,6 +9,7 @@
 #include "u.h"
 #include "app.h"
 #include "core/lang.h"
+#include "core/prefs.h"
 #include "core/relay.h"
 #include "core/ttx.h"
 #include "core/dvbsub.h"
@@ -221,6 +222,8 @@ void subs_stream_changed(void) {
 /* Оформленный текст (метки core/substyle.h): куски одного начертания подряд по общей базовой линии. Строка — [s, e);
  * g == NULL — только ширина; maxw > 0 — не шире (остаток обрезается многоточием). */
 static int sface(int f) { return f & SS_B ? (f & SS_I ? F_SUB_BI : F_SUB_B) : (f & SS_I ? F_SUB_I : F_SUB); }
+static int force_color;
+static uint32_t force_col;
 static int styled(gfx_t *g, int x, int base, double em, uint32_t defc, const char *s, const char *e, int maxw) {
     int flags = 0, w = 0;
     uint32_t col = SS_NOCOLOR;
@@ -238,8 +241,17 @@ static int styled(gfx_t *g, int x, int base, double em, uint32_t defc, const cha
         if (g) {
             int lim = maxw > 0 ? maxw - w : 0;
             if (maxw > 0 && lim <= 0) break;
-            uint32_t c = col == SS_NOCOLOR ? defc : col;
-            sw = d_text_base(g, x + w, base, em, f, c, seg, maxw > 0 && sw > lim ? lim : 0);
+            uint32_t c = force_color ? force_col : col == SS_NOCOLOR ? defc : col;
+            int clip = maxw > 0 && sw > lim ? lim : 0;
+            if (P.sub_edge == 1) {
+                d_text_base(g, x + w - E(0.06), base, em, f, 0xff000000u, seg, clip);
+                d_text_base(g, x + w + E(0.06), base, em, f, 0xff000000u, seg, clip);
+                d_text_base(g, x + w, base - E(0.06), em, f, 0xff000000u, seg, clip);
+                d_text_base(g, x + w, base + E(0.06), em, f, 0xff000000u, seg, clip);
+            } else if (P.sub_edge == 2) {
+                d_text_base(g, x + w + E(0.09), base + E(0.09), em, f, 0xff000000u, seg, clip);
+            }
+            sw = d_text_base(g, x + w, base, em, f, c, seg, clip);
             if (flags & SS_U) { int t = E(em * 0.07); d_fill(g, x + w, base + E(em * 0.12), sw, t < 1 ? 1 : t, c); }
         }
         w += sw;
@@ -252,15 +264,19 @@ static void draw_text(gfx_t *g, const char *text, int bottom) {
     const char *ls[8], *le[8];
     int n = 0;
     for (const char *p = text; *p && n < 8;) { const char *e = strchr(p, '\n'); ls[n] = p; le[n] = e ? e : p + strlen(p); n++; if (!e) break; p = e + 1; }
-    double em = 1.9;
+    double em = 1.9 * (P.sub_size > 0 ? P.sub_size : 100) / 100.0;
     int lh = d_line_h(em, F_SUB) + E(0.6), y = bottom - n * lh;
+    uint32_t bg = P.sub_bg == 0 ? 0 : P.sub_bg == 2 ? 0xff000000u : 0xc0000000u;
+    force_color = P.sub_color >= 0;
+    force_col = 0xff000000u | (uint32_t)P.sub_color;
     for (int i = 0; i < n; i++, y += lh) {
         int tw = styled(NULL, 0, 0, em, 0, ls[i], le[i], 0), w = tw + E(1.6);
         if (w > SW - E(8)) w = SW - E(8);
         int x = (SW - w) / 2;
-        d_round(g, x, y, w, lh - E(0.3), E(0.4), 0xc0000000u);
+        if (bg) d_round(g, x, y, w, lh - E(0.3), E(0.4), bg);
         styled(g, x + E(0.8), y + E(0.3) + base_off(em), em, C_WHITE, ls[i], le[i], w - E(1.6));
     }
+    force_color = 0;
 }
 
 void subs_draw(gfx_t *g, int bottom) {
@@ -273,15 +289,18 @@ void subs_draw(gfx_t *g, int bottom) {
         static ttx_grid gr;
         if (ttx_subtitle_at(relay_ttx(), pts, &pg)) return;
         ttx_layout(&pg, NULL, &gr);
-        if (ttx_subtitle_text(&gr, text, sizeof text)) draw_text(g, text, bottom);
+        if (ttx_subtitle_text(&gr, text, sizeof text)) draw_text(g, text, bottom - SH * P.sub_bottom / 100);
     } else if (!strncmp(T.sub_key, "vtt:", 4)) {
-        if (webvtt_text_at(pts, text, sizeof text)) draw_text(g, text, bottom);
+        if (webvtt_text_at(pts, text, sizeof text)) draw_text(g, text, bottom - SH * P.sub_bottom / 100);
     } else if (!strncmp(T.sub_key, "cc:", 3)) {
         /* CEA-608 / 708: строки на своих местах — сетка 15 строк в безопасной зоне 80 % экрана */
         static cc_show s;
         if (!relay_cc_at(pts, &s)) return;
         int ax = SW / 10, aw = SW * 8 / 10, ay = SH / 10, ah = SH * 8 / 10, rh = ah / 15;
-        double em = rh * 0.62 / EM;
+        double em = rh * 0.62 / EM * (P.sub_size > 0 ? P.sub_size : 100) / 100.0;
+        force_color = P.sub_color >= 0;
+        force_col = 0xff000000u | (uint32_t)P.sub_color;
+        uint32_t cbg = P.sub_bg == 2 ? 0xff000000u : P.sub_bg == 1 ? 0xc0000000u : 0;
         for (int i = 0; i < s.n; i++) {
             cc_row *r = &s.row[i];
             const char *te = r->text + strlen(r->text);
@@ -292,9 +311,10 @@ void subs_draw(gfx_t *g, int bottom) {
             else if (r->align == 2) x -= w;
             if (x + w > ax + aw) x = ax + aw - w;
             if (x < ax) x = ax;
-            d_fill(g, x, y, w, rh, 0xc0000000u);
+            if (cbg) d_fill(g, x, y, w, rh, cbg);
             styled(g, x + E(0.5), y + (rh - d_line_h(em, F_SUB)) / 2 + base_off(em), em, 0xffebebebu, r->text, te, w - E(1.0));
         }
+        force_color = 0;
     } else if (!strncmp(T.sub_key, "dvb:", 4)) {
         /* картинки DVB: свой экран (обычно 720×576) растягивается на весь; копия — только при новом показе */
         static dvbsub_show cache;
