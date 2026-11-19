@@ -20,6 +20,7 @@ static int_pref *ints(int *n) {
         {"number_mode", &P.number_mode, NUM_BADGE},
         {"guide_mode", &P.guide_mode, GUIDE_GRID},
         {"guide_header", &P.guide_header, 0},
+        {"guide_desc", &P.guide_desc, 0},
         {"up_key", &P.up_key, UP_SCHEDULE},
         {"hints", &P.hints, 1},
         {"adaptive", &P.adaptive, 0},
@@ -76,7 +77,7 @@ void prefs_load(void) {
     if (P.archive_days < 1 || P.archive_days > 30) P.archive_days = 7;
     if (P.info_hide < 2 || P.info_hide > 60) P.info_hide = 5;
     if (P.number_mode < NUM_NONE || P.number_mode > NUM_BADGE) P.number_mode = NUM_BADGE;
-    if (P.guide_mode < GUIDE_GRID || P.guide_mode > GUIDE_LIST) P.guide_mode = GUIDE_GRID;
+    if (P.guide_mode < GUIDE_GRID || P.guide_mode > GUIDE_CHANNELS) P.guide_mode = GUIDE_GRID;
     if (P.guide_header < 0 || P.guide_header > 2) P.guide_header = 0;
     if (P.up_key < UP_SCHEDULE || P.up_key > UP_RECENT) P.up_key = UP_SCHEDULE;
     P.hints = !!P.hints;

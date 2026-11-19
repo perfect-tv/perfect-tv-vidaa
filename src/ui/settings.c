@@ -33,7 +33,7 @@ enum {
     I_PL = 1000,   /* I_PL + индекс плейлиста */
     I_PL_ADD = 1, I_EPG_SRC, I_EPG_REFRESH,
     I_ARCHIVE_DAYS, I_INFO_HIDE, I_UPKEY, I_START_LAST, I_REMIND, I_ANYCERT, I_ASPECT_P, I_EPG_HOURS, I_PL_HOURS,
-    I_LANG, I_TZ, I_SCALE, I_NUMBER, I_GUIDE_VIEW, I_GUIDE_HEADER, I_HINTS_P, I_LOGO_PRIO,
+    I_LANG, I_TZ, I_SCALE, I_NUMBER, I_GUIDE_VIEW, I_GUIDE_HEADER, I_GUIDE_DESC, I_HINTS_P, I_LOGO_PRIO,
     I_SUB_SIZE, I_SUB_COLOR, I_SUB_BG, I_SUB_EDGE, I_SUB_BOTTOM,
     I_ADAPTIVE_P, I_RESET_SCORES, I_HIDDEN_P,
     I_PIN_SET, I_PIN_CLEAR, I_PIN_ASK, I_PIN_INPUT,
@@ -127,8 +127,9 @@ static void build(void) {
         add(I_TZ, tr(S_TIMEZONE), NULL, tz_label(), 1);
         add(I_SCALE, tr(S_UI_SIZE), NULL, tr(P.ui_scale == 1 ? S_SIZE_SMALL : P.ui_scale == 2 ? S_SIZE_LARGE : S_SIZE_NORMAL), 1);
         add(I_NUMBER, tr(S_NUMBER_MODE), NULL, tr(P.number_mode == NUM_NONE ? S_NUM_NONE : P.number_mode == NUM_NEAR_NAME ? S_NUM_NEAR : S_NUM_BADGE), 1);
-        add(I_GUIDE_VIEW, tr(S_GUIDE_VIEW), NULL, tr(P.guide_mode == GUIDE_LIST ? S_GUIDE_LIST : S_GUIDE_GRID), 1);
+        add(I_GUIDE_VIEW, tr(S_GUIDE_VIEW), NULL, guide_mode_name(), 1);
         add(I_GUIDE_HEADER, tr(S_GUIDE_HEADER), NULL, tr(P.guide_header == 1 ? S_HEADER_CHANNEL : P.guide_header == 2 ? S_HEADER_HIDE : S_HEADER_FULL), 1);
+        add(I_GUIDE_DESC, tr(S_GUIDE_DESC), tr(S_GUIDE_DESC_SUB), tr(P.guide_desc ? S_ON : S_OFF), 1);
         add(I_HINTS_P, tr(S_HINTS), NULL, tr(P.hints ? S_ON : S_OFF), 1);
         add(I_LOGO_PRIO, tr(S_LOGO_PRIORITY), NULL, tr(P.logo_priority ? S_LOGO_EPG : S_LOGO_PLAYLIST), 1);
         snprintf(v, sizeof v, "%d%%", P.sub_size);
@@ -323,7 +324,8 @@ static void change(item *it, int dir) {
     }
     case I_SCALE: P.ui_scale = ((P.ui_scale + (d > 0 ? 2 : 1)) % 3); u_init(); break;
     case I_NUMBER: P.number_mode = ((P.number_mode + d) % 3 + 3) % 3; break;
-    case I_GUIDE_VIEW: P.guide_mode = !P.guide_mode; break;
+    case I_GUIDE_VIEW: P.guide_mode = (P.guide_mode + (d ? d : 1) + 4) % 4; break;
+    case I_GUIDE_DESC: P.guide_desc = !P.guide_desc; break;
     case I_GUIDE_HEADER: P.guide_header = ((P.guide_header + d) % 3 + 3) % 3; break;
     case I_HINTS_P: P.hints = !P.hints; break;
     case I_LOGO_PRIO: P.logo_priority = !P.logo_priority; break;

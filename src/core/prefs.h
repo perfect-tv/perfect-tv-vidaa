@@ -4,7 +4,7 @@
 
 #define TZ_AUTO (-99)
 enum { NUM_NONE = 0, NUM_NEAR_NAME = 1, NUM_BADGE = 2 };
-enum { GUIDE_GRID = 0, GUIDE_LIST = 1 };
+enum { GUIDE_GRID = 0, GUIDE_LIST = 1, GUIDE_CATS = 2, GUIDE_CHANNELS = 3 };
 enum { UP_SCHEDULE = 0, UP_RECENT = 1 };
 enum { PIN_EACH = 0, PIN_ONCE = 1 };
 enum { PIN_IN_RING = 0, PIN_IN_ROWS = 1, PIN_IN_KEYS = 2 };
@@ -17,7 +17,8 @@ typedef struct {
     int archive_days;   /* глубина архива по умолчанию */
     int info_hide;      /* секунды */
     int number_mode;
-    int guide_mode;
+    int guide_mode;     /* 0 ТВ-гид, 1 каналы + программа, 2 категории + каналы, 3 каналы */
+    int guide_desc;     /* в списке — панель передачи при переходе в программу */
     int guide_header;   /* 0 канал + передача, 1 канал, 2 скрыть */
     int up_key;
     int hints;
