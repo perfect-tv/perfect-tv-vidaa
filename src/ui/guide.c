@@ -195,7 +195,7 @@ static void switch_playlist(int i) {
     layer_pop(&L);
     char path[700];
     repo_channels_path(R.pl[i].id, path, sizeof path);
-    if (!file_exists(path)) { repo_select(i); load_playlist(i, 1); return; }
+    if (!file_exists(path)) { tv_playlist_changed(0); load_playlist(i, 1); return; }
     tv_playlist_changed(0);
     if (!guide_is_open()) guide_open(0);
     load_epg(0);

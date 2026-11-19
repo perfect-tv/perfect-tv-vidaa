@@ -146,7 +146,7 @@ static void choose_playlist(int i, void *ctx) {
     R.cur = i;
     char path[700];
     repo_channels_path(R.pl[i].id, path, sizeof path);
-    if (!file_exists(path)) { layer_pop_all(); repo_select(i); load_playlist(i, 1); return; }
+    if (!file_exists(path)) { layer_pop_all(); tv_playlist_changed(0); load_playlist(i, 1); return; }
     tv_playlist_changed(0);
     load_epg(0);
 }
