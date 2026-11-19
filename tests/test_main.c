@@ -1958,6 +1958,26 @@ static void test_ttml(void) {
     sb_free(&segb);
 }
 
+static int lang_forms(const char *s) {
+    int n = 1;
+    for (const char *p = s; (p = strchr(p, '|')); p++) n++;
+    return n;
+}
+/* подстановок в форме form (без «%%»); форма за пределами строки — последняя */
+static int lang_form_ph(const char *s, int form) {
+    const char *p = s;
+    for (int f = 0; f < form; f++) {
+        const char *q = strchr(p, '|');
+        if (!q) break;
+        p = q + 1;
+    }
+    const char *e = strchr(p, '|');
+    if (!e) e = p + strlen(p);
+    int n = 0;
+    for (const char *q = p; q < e; q++) if (*q == '%' && q[1] != '%') n++;
+    return n;
+}
+
 static void test_lang(void) {
     lang_set(LANG_RU);
     EQS(trp(S_CHANNELS_N, 1), "1 канал");
@@ -1974,14 +1994,13 @@ static void test_lang(void) {
         lang_set(LANG_RU);
         const char *r = tr(i);
         CHECK(*e && *r);
-        int pe = 0, pr = 0;
-        for (const char *p = e; (p = strchr(p, '%')); p++) pe++;
-        for (const char *p = r; (p = strchr(p, '%')); p++) pr++;
-        int fe = 1, fr = 1;
-        for (const char *p = e; (p = strchr(p, '|')); p++) fe++;
-        for (const char *p = r; (p = strchr(p, '|')); p++) fr++;
-        /* подстановок на одну форму — поровну */
-        if (pe / fe != pr / fr) { fails++; fprintf(stderr, "строка %d: подстановки en «%s» / ru «%s»\n", i, e, r); }
+        int fe = lang_forms(e), fr = lang_forms(r);
+        CHECK(fe == 2 || fe == 1);
+        CHECK(fr == 3 || fr == 1);
+        int pe = lang_form_ph(e, 0), pr = lang_form_ph(r, 0);
+        if (pe != pr) { fails++; fprintf(stderr, "строка %d: подстановки en «%s» / ru «%s»\n", i, e, r); }
+        for (int f = 1; f < fe; f++) if (lang_form_ph(e, f) != pe) { fails++; fprintf(stderr, "строка %d: форма %d en «%s»\n", i, f, e); }
+        for (int f = 1; f < fr; f++) if (lang_form_ph(r, f) != pr) { fails++; fprintf(stderr, "строка %d: форма %d ru «%s»\n", i, f, r); }
     }
 }
 
