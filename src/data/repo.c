@@ -99,11 +99,32 @@ playlist *repo_add_playlist(const char *name, const char *url) {
     return p;
 }
 
+/* Пользовательские ключи привязаны к id плейлиста: удаление плейлиста должно удалить и их,
+ * иначе новый плейлист с тем же id унаследует избранное, скрытое, замки и очки. */
+static void clear_playlist_data(int id) {
+    static const char *const keys[] = {"fav", "hist", "hidc", "hidg", "lockc", "lockg", "score"};
+    char k[48];
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        snprintf(k, sizeof k, "%s.%d", keys[i], id);
+        store_set(k, NULL);
+    }
+    int w = 0;
+    for (int i = 0; i < R.nrem; i++) if (R.rem[i].playlist != id) R.rem[w++] = R.rem[i];
+    if (w != R.nrem) { R.nrem = w; repo_reminders_save(); }
+    if (P.last_playlist == id) {
+        P.last_playlist = 0;
+        P.last_channel[0] = 0;
+        P.last_group[0] = 0;
+    }
+}
+
 void repo_delete_playlist(int i) {
     if (i < 0 || i >= R.npl) return;
+    int id = R.pl[i].id;
     char path[700];
-    repo_channels_path(R.pl[i].id, path, sizeof path);
+    repo_channels_path(id, path, sizeof path);
     unlink(path);
+    clear_playlist_data(id);
     free(R.pl[i].user_epg);
     free(R.pl[i].header_epg);
     memmove(R.pl + i, R.pl + i + 1, (size_t)(R.npl - i - 1) * sizeof *R.pl);
