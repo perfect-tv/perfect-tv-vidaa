@@ -683,7 +683,7 @@ void tv_tick(double now) {
     pl_tick();
     loaders_tick();
     layer_tick_all(now);
-    if (d_marquee_active() && now >= mq_next) { mq_next = now + 0.033; app_dirty(); }   /* бегущая строка */
+    if (d_marquee_active() && now >= mq_next) { mq_next = now + 0.1; app_dirty(); }   /* бегущая строка: 10 к/с — кадр на ТВ дорогой */
     static double logo_trim_at;
     if (now >= logo_trim_at) { logo_trim_at = now + 5; logo_trim(); }
     if (T.open_at && now >= T.open_at) { T.open_at = 0; start_stream(); }

@@ -122,7 +122,16 @@ static void run(double secs) {
     } while (app_now() < end && !app_quitting());
 }
 
-static void root_draw(screen *s, gfx_t *g) { (void)s; epg_frame(); tv_draw(g); }
+/* PTV_PROF=1 — время кадра: так видно, что тормозит листание (логотипы, программа, раскладка). */
+static void root_draw(screen *s, gfx_t *g) {
+    (void)s;
+    static int prof = -1;
+    if (prof < 0) prof = getenv("PTV_PROF") != NULL;
+    double t0 = app_now();
+    epg_frame();
+    tv_draw(g);
+    if (prof) fprintf(stderr, "prof draw %.1f ms\n", (app_now() - t0) * 1000);
+}
 static void root_tick(screen *s, double now) { (void)s; tv_tick(now); }
 static screen root = {.name = "tv", .draw = root_draw, .tick = root_tick};
 

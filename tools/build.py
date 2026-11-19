@@ -220,6 +220,7 @@ def build_host(cfg, sdk, verbose, tests):
     own = [s for s in own_sources(cfg) if not s.endswith('src/main.c')]
     if tests:   # тестам нужны только ядро и данные
         own = [s for s in own if ('/src/core/' in s or '/src/data/' in s) and os.path.isfile(s)]
+        own.append(os.path.join(ROOT, 'src', 'ui', 'u.c'))   # кэш значков и заливки — тоже проверяем
     host = sorted(glob.glob(os.path.join(ROOT, 'host', '*.c')))
     # окно X11 (--window) — если есть libX11; без него — только сценарии и снимки
     x11 = subprocess.run(['pkg-config', '--exists', 'x11'], capture_output=True).returncode == 0

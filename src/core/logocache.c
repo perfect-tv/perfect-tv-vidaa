@@ -69,6 +69,17 @@ static void add_fail(unsigned long long key) {
     if (nfail < MAX_FAIL) fail[nfail++] = key;
 }
 /* Освободить память сверх бюджета: сначала самые давние готовые. */
+static int evict_one(void) {
+    int v = -1;
+    double oldest = 1e300;
+    for (int i = 0; i < nent; i++)
+        if (ents[i].state != 0 && ents[i].used < oldest) { oldest = ents[i].used; v = i; }
+    if (v < 0) return 0;   /* все места заняты загрузками — подождём */
+    gfx_image_free(ents[v].im);
+    memmove(ents + v, ents + v + 1, (size_t)(nent - v - 1) * sizeof *ents);
+    nent--;
+    return 1;
+}
 static void trim_mem(void) {
     size_t bytes = 0;
     for (int i = 0; i < nent; i++) if (ents[i].state == 1 && ents[i].im) bytes += (size_t)ents[i].im->w * (size_t)ents[i].im->h * 4;
@@ -86,7 +97,9 @@ static void trim_mem(void) {
     }
 }
 static ent *add_ent(unsigned long long key, const char *url, int w, int h) {
-    if (nent >= MAX_E) { trim_mem(); if (nent >= MAX_E) return NULL; }
+    /* записей больше бюджета: выкидываем самые давние (иначе после ~96 разных логотипов новые перестанут появляться) */
+    if (nent >= MAX_E) { trim_mem(); while (nent >= MAX_E && evict_one()) {} }
+    if (nent >= MAX_E) return NULL;
     ent *e = &ents[nent++];
     memset(e, 0, sizeof *e);
     e->key = key;
@@ -145,15 +158,27 @@ static void init_dir(void) {
 }
 
 /* ---------- загрузка ---------- */
+/* Рабочий поток: сначала файл с диска (сеть не нужна), при промахе — сеть. В главном потоке не декодируем:
+ * декод картинки 1280×800 — десятки миллисекунд, а на ARM/ТВ — сотни, и при листании каналов это заметно. */
 static void lwork(void *vp) {
     ljob *j = vp;
-    char err[80] = "";
     size_t len = 0;
-    char *data = http_get_small(j->url, MAX_BYTES, &len, err, sizeof err);
-    if (!data || !len) { free(data); fprintf(stderr, "logo_load_failed %s\n", err); return; }
-    if (j->path[0]) file_write_atomic(j->path, data, len);
-    j->out = img_decode(data, len, j->w, j->h, j->mode);
-    free(data);
+    char *data = j->path[0] ? file_read(j->path, &len) : NULL;
+    if (data && len > MAX_BYTES) { free(data); data = NULL; }
+    if (data && len) {
+        j->out = img_decode(data, len, j->w, j->h, j->mode);
+        free(data);
+        if (!j->out && j->path[0]) unlink(j->path);   /* битый файл — качаем заново */
+    }
+    if (!j->out) {
+        char err[80] = "";
+        len = 0;
+        data = http_get_small(j->url, MAX_BYTES, &len, err, sizeof err);
+        if (!data || !len) { free(data); fprintf(stderr, "logo_load_failed %s\n", err); return; }
+        if (j->path[0]) file_write_atomic(j->path, data, len);
+        j->out = img_decode(data, len, j->w, j->h, j->mode);
+        free(data);
+    }
 }
 static void ldone(void *vp) {
     ljob *j = vp;
@@ -185,20 +210,6 @@ const gfx_image *logo_img(const char *url, int w, int h, int mode) {
     if (failed(ukey)) return NULL;
     char p[800];
     path_of(p, sizeof p, ukey);
-    struct stat st;
-    if (p[0] && !stat(p, &st) && st.st_size > 0 && (unsigned long long)st.st_size <= MAX_BYTES) {
-        size_t len = 0;
-        char *data = file_read(p, &len);
-        gfx_image *im = data && len ? img_decode(data, len, w, h, mode) : NULL;
-        free(data);
-        if (!im) { unlink(p); return NULL; }   /* битый файл — как будто его нет */
-        e = add_ent(key, url, w, h);
-        if (!e) { gfx_image_free(im); return NULL; }
-        e->im = im;
-        e->state = 1;
-        trim_mem();
-        return im;
-    }
     if (jobs >= MAX_JOBS) return NULL;
     e = add_ent(key, url, w, h);
     ljob *j = calloc(1, sizeof *j);

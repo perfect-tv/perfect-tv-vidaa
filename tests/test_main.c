@@ -24,6 +24,8 @@
 #include "data/m3u.h"
 #include "data/names.h"
 #include "data/xmltv.h"
+#include "ui/u.h"
+#include "img.h"
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,7 +41,6 @@
 #include <stdatomic.h>
 #include "core/http.h"
 #include "core/logocache.h"
-#include "img.h"
 
 extern const unsigned char ptv_font_regular[], ptv_font_regular_end[], ptv_font_bold[], ptv_font_bold_end[];
 
@@ -680,10 +681,41 @@ static void test_logocache(void) {
     CHECK(logo_cache_path("http://logo.invalid/a.png", path, sizeof path) == 1);
     if (!path[0]) return;
     CHECK(!file_write_atomic(path, png, sizeof png));
-    const gfx_image *im = logo_img("http://logo.invalid/a.png", 8, 8, IMG_FIT);
+    /* декод с диска — в рабочем потоке: в главном кадр не ждёт */
+    CHECK(logo_img("http://logo.invalid/a.png", 8, 8, IMG_FIT) == NULL);
+    const gfx_image *im = NULL;
+    for (int i = 0; i < 200 && !im; i++) {
+        struct timespec w = {0, 5000000};
+        nanosleep(&w, NULL);
+        app_frame();
+        im = logo_img("http://logo.invalid/a.png", 8, 8, IMG_FIT);
+    }
     CHECK(im && im->w == 8 && im->h == 8);
     logo_clear();
     CHECK(!file_exists(path));
+}
+
+/* ---------- значки: маска рисуется один раз на пару «вид + размер» ---------- */
+static void test_icons(void) {
+    static uint32_t px[64 * 64];
+    memset(px, 0, sizeof px);
+    gfx_t g;
+    gfx_init(&g, px, 64, 64, 64);
+    d_icon(&g, I_ARCHIVE, 32, 32, 24, WA(0.7));
+    int drawn = 0, outside = 0;
+    for (int j = 0; j < 64; j++)
+        for (int i = 0; i < 64; i++) {
+            uint32_t c = px[j * 64 + i];
+            if (c >> 24) drawn++;
+            if (c && (i < 32 - 24 || i > 32 + 24 || j < 32 - 24 || j > 32 + 24)) outside++;
+        }
+    CHECK(drawn > 20);
+    CHECK(!outside);                         /* маска обрезана по значку, холст вокруг не тронут */
+    uint32_t before = px[32 * 64 + 32];
+    d_icon(&g, I_ARCHIVE, 32, 32, 24, 0x00ffffffu);   /* прозрачный цвет — ничего не меняет */
+    CHECK(px[32 * 64 + 32] == before);
+    d_icon(&g, I_CLOCK, 10, 10, 12, C_WHITE);
+    CHECK(px[10 * 64 + 10] >> 24);
 }
 
 /* ---------- напоминания: глубина архива хранится в самом напоминании ---------- */
@@ -2153,6 +2185,7 @@ int main(void) {
     test_phone();
     test_usb(dir);
     test_logocache();
+    test_icons();
     test_reminders();
     test_backup();
     test_tmdb();
