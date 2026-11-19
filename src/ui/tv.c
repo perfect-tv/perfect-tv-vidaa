@@ -46,7 +46,11 @@ void tv_show_info(int pin) {
 int64_t tv_position(void) {
     int64_t now = clock_now();
     if (!T.arc) return T.paused ? T.pause_at : now;
-    int64_t p = pl_has_picture() ? T.arc_url_start + (int64_t)pl_position() : T.arc_target;
+    /* PL_ENDED: картинки уже нет, но плеер ещё жив — позиция в ссылке верна. Иначе конец
+     * shift-ссылки брал старый arc_target и открывал тот же участок заново. */
+    double pos = pl_position();
+    int at_end = pl_state() == PL_ENDED && pos > 0;
+    int64_t p = (pl_has_picture() || at_end) ? T.arc_url_start + (int64_t)pos : T.arc_target;
     return p > now ? now : p;
 }
 int64_t tv_behind(void) { return clock_now() - tv_position(); }
