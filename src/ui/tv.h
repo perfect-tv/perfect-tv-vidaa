@@ -33,6 +33,7 @@ typedef struct {
     double open_at;                  /* открыть поток в этот момент (задержка переключения) */
     int attempts;
     double retry_at, playing_since, opening_since;
+    double stall_at, stall_pos;      /* сторож: позиция не растёт */
     int failed;
     char why[96];
     int scored;

@@ -51,6 +51,7 @@ S(S_ERR_VCODEC, "Video codec is not supported (%s)", "Видео канала н
 S(S_ERR_ACODEC, "Audio codec is not supported (%s)", "Звук канала не поддерживается (%s)")
 S(S_ERR_PLAYER, "TV player is unavailable", "Системный плеер ТВ недоступен")
 S(S_ERR_ENDED, "Stream ended", "Поток прервался")
+S(S_ERR_STALLED, "Stream stopped responding", "Поток перестал отвечать")
 S(S_ERR_ARCHIVE_SOFTWARE, "Archive is not supported by the software player", "Архив на программном плеере не поддерживается")
 S(S_ERR_GENERIC, "Could not start the channel", "Не удалось запустить канал")
 S(S_ERR_CODE, "Code: %s", "Код: %s")

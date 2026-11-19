@@ -161,6 +161,8 @@ static void request_open(double delay) {
     T.attempts = 0;
     T.failed = 0;
     T.paused = 0;
+    T.stall_at = 0;
+    T.stall_pos = -1;
     app_dirty();
 }
 
@@ -190,6 +192,8 @@ static void really_play(channel *c, const char *gkey, int arc, int64_t t, double
     snprintf(T.group, sizeof T.group, "%s", g ? g->key : ALL_KEY);
     T.arc = arc;
     T.arc_target = t;
+    T.stall_at = 0;
+    T.stall_pos = -1;
     T.seeking = 0;
     T.dig[0] = 0;
     if (!repo_is_locked(c)) { T.pin_passed = 0; snprintf(T.last_unlocked, sizeof T.last_unlocked, "%s", c->key); }
@@ -641,6 +645,8 @@ void tv_restart(void) {
     T.cur = NULL;
     T.group[0] = 0;
     T.arc = T.paused = T.seeking = 0;
+    T.stall_at = 0;
+    T.stall_pos = -1;
     T.pin_passed = 0;
     T.audio_pref_done = 0;
     pin_session = 0;                   /* «один раз до выхода» не переживает смену базы настроек */
@@ -699,6 +705,19 @@ void tv_tick(double now) {
                     T.audio_pref_done = 1;
                     for (int i = 0; i < na; i++)
                         if (!strcmp(pl_audio_label(i), P.audio_pref)) { pl_audio_select(i); break; }
+                }
+            }
+            /* сторож: эфир/архив «идёт», но позиция не растёт 20 с — не бесконечная буферизация */
+            if (!T.paused && !T.seeking && !pl_software() && !pl_rebuffering() && pl_has_picture()) {
+                double pos = pl_position();
+                if (T.stall_pos < 0 || pos > T.stall_pos + 0.05) { T.stall_pos = pos; T.stall_at = now; }
+                else if (T.stall_at && now - T.stall_at > 20) {
+                    fprintf(stderr, "player_stalled pos=%.2f\n", pos);
+                    T.stall_at = 0;
+                    T.failed = 1;
+                    snprintf(T.why, sizeof T.why, "stream_stalled");
+                    pl_close();
+                    app_dirty();
                 }
             }
             if (now - T.playing_since > 30) T.attempts = 0;
@@ -803,6 +822,7 @@ static const char *reason(const char *why) {
     if (!strcmp(why, "dlopen") || !strcmp(why, "symbols") || !strncmp(why, "manager", 7) || !strcmp(why, "create_player") ||
         !strncmp(why, "player_native_", 14) || !strncmp(why, "player_feed_", 12)) return tr(S_ERR_PLAYER);
     if (!strcmp(why, "stream_ended")) return tr(S_ERR_ENDED);
+    if (!strcmp(why, "stream_stalled")) return tr(S_ERR_STALLED);
     if (!strcmp(why, "archive_software")) return tr(S_ERR_ARCHIVE_SOFTWARE);
     return tr(S_ERR_GENERIC);
 }
