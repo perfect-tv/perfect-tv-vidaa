@@ -703,9 +703,10 @@ static void draw_toast(gfx_t *g) {
 static const char *reason(const char *why) {
     if (!strncmp(why, "audio_codec=", 12)) return trf(S_ERR_ACODEC, why + 12);
     if (!strncmp(why, "video_codec=", 12)) return trf(S_ERR_VCODEC, why + 12);
-    if (!strncmp(why, "open_input", 10) || !strncmp(why, "stream_info", 11)) return tr(S_ERR_CONNECT);
+    if (!strncmp(why, "open_input", 10) || !strncmp(why, "stream_info", 11) || !strncmp(why, "player_read_", 12)) return tr(S_ERR_CONNECT);
     if (!strcmp(why, "no_video")) return tr(S_ERR_NO_VIDEO);
-    if (!strcmp(why, "dlopen") || !strcmp(why, "symbols") || !strncmp(why, "manager", 7) || !strcmp(why, "create_player")) return tr(S_ERR_PLAYER);
+    if (!strcmp(why, "dlopen") || !strcmp(why, "symbols") || !strncmp(why, "manager", 7) || !strcmp(why, "create_player") ||
+        !strncmp(why, "player_native_", 14) || !strncmp(why, "player_feed_", 12)) return tr(S_ERR_PLAYER);
     if (!strcmp(why, "stream_ended")) return tr(S_ERR_ENDED);
     return tr(S_ERR_GENERIC);
 }

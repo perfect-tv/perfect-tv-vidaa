@@ -157,9 +157,11 @@ void pl_tick(void) {
         }
     } else if (st == HMC_FAILED) {
         if (S.state != PL_FAILED) {
-            fprintf(stderr, "player_state=failed error=%d stage=%s\n", hmc_player_error(S.h), hmc_player_error_stage(S.h));
+            int err = hmc_player_error(S.h);
+            const char *stage = hmc_player_error_stage(S.h);
+            fprintf(stderr, "player_state=failed error=%d stage=%s\n", err, stage);
             S.state = PL_FAILED;
-            snprintf(S.why, sizeof S.why, "stream_ended");
+            snprintf(S.why, sizeof S.why, "player_%s_%d", stage, err);
             app_dirty();
         }
     } else if (st == HMC_ENDED) {
