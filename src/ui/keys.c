@@ -120,5 +120,3 @@ void keys_tick(double now) {
         K.next = app_now() + iv;
     }
 }
-
-
