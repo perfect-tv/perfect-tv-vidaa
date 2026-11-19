@@ -23,6 +23,7 @@ int pl_software(void);
 int pl_rebuffering(void);
 int pl_video_size(int *w, int *h);   /* 0 — известно */
 const char *pl_codecs(void);         /* «h264 · AAC» */
+int pl_video_bitrate(void);          /* бит/с видео из потока, 0 — неизвестно */
 int pl_set_aspect(int aspect);       /* ASPECT_* из prefs.h */
 int pl_audio_count(void);
 const char *pl_audio_label(int i);

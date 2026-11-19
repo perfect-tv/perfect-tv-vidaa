@@ -101,6 +101,14 @@ static void draw_badges(gfx_t *g, int x, int cy, int arch) {
         x += d_badge(g, x, cy, em, C_ARCHIVE, C_ON_ARCHIVE, -1, b) + gap;
     } else x += d_badge(g, x, cy, em, C_LIVE, C_WHITE, -1, tr(S_LIVE)) + gap;
     if (quality_badge(b, sizeof b)) x += d_badge(g, x, cy, em, C_FILL_ACTIVE, C_WHITE, -1, b) + gap;
+    int br = pl_video_bitrate();
+    if (br > 0) {   /* битрейт видео: у Android он в названии видеодорожки, здесь — бейджем */
+        char n[16];
+        if (br >= 1000000) snprintf(n, sizeof n, "%.1f", br / 1000000.0);
+        else snprintf(n, sizeof n, "%d", (br + 500) / 1000);
+        if (lang_is_ru()) for (char *c = n; *c; c++) if (*c == '.') *c = ',';
+        x += d_badge(g, x, cy, em, C_FILL_ACTIVE, C_WHITE, -1, trf(br >= 1000000 ? S_BITRATE_MBPS : S_BITRATE_KBPS, n)) + gap;
+    }
     if (pl_software() && pl_has_picture()) x += d_badge(g, x, cy, em, C_FILL_ACTIVE, C_WHITE, -1, "SW") + gap;
     if (pl_audio_count() > 1) { snprintf(b, sizeof b, tr(S_AUDIO_N), pl_audio_count()); x += d_badge(g, x, cy, em, C_FILL_ACTIVE, C_WHITE, -1, b) + gap; }
     /* субтитры: включённые — белым */

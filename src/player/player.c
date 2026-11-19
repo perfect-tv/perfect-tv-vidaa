@@ -157,7 +157,7 @@ void pl_tick(void) {
         }
         if (now >= S.snap_at) {
             S.snap_at = now + 1.0;
-            if (S.h) hmc_player_snapshot(S.h, &S.snap, "", 0);
+            if (S.h) hmc_player_snapshot(S.h, &S.snap, "", 1);   /* кодек, пиксели, fps и битрейт — раз в секунду */
             else {
                 int snd = 0;
                 swp_info(S.sw, &S.snap.width, &S.snap.height, S.snap.video_codec, sizeof S.snap.video_codec, S.snap.audio_codec, sizeof S.snap.audio_codec, &snd);
@@ -210,6 +210,7 @@ int pl_video_size(int *w, int *h) {
     return 0;
 }
 const char *pl_codecs(void) { return S.codecs; }
+int pl_video_bitrate(void) { return S.snap.stats_valid & PL_STAT_VIDEO_RATE ? (int)(S.snap.video_bitrate + 0.5) : 0; }
 int pl_set_aspect(int a) {
     static const int map[] = {PL_ASPECT_FIT, PL_ASPECT_STRETCH, PL_ASPECT_16_9, PL_ASPECT_4_3};
     if (!S.h || S.busy || a < 0 || a > 3) return -1;

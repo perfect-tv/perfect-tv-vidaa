@@ -87,6 +87,8 @@ S(S_NO_REMINDERS, "No reminders", "Напоминаний нет")
 /* карточка */
 S(S_WATCH, "Watch", "Смотреть")
 S(S_WATCH_LIVE, "Watch live", "Смотреть эфир")
+S(S_BITRATE_MBPS, "%s Mbit/s", "%s Мбит/с")
+S(S_BITRATE_KBPS, "%s kbit/s", "%s кбит/с")
 S(S_WATCH_FROM_START, "Watch from start", "Смотреть с начала")
 S(S_REMIND, "Remind", "Напомнить")
 S(S_REMIND_REMOVE, "Remove reminder", "Удалить напоминание")
