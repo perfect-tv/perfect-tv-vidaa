@@ -20,6 +20,7 @@
 #include "data/backup.h"
 #include "data/tmdb.h"
 #include "data/epg.h"
+#include "data/repo.h"
 #include "data/m3u.h"
 #include "data/names.h"
 #include "data/xmltv.h"
@@ -1943,6 +1944,30 @@ static void test_ttml(void) {
     EQI(vt_s[0], 7 * 90000);
     EQI(vt_e[0], 10 * 90000);
     EQS(vt_t[0], "Реплика {b}MP4");
+    /* битый fMP4: base_data_offset у края uint64 и trun без полей не читают память и не зацикливаются */
+    {
+        sbuf seg2 = {0}, traf2 = {0}, moof2 = {0};
+        uint8_t tf[12] = {0}, tr[20] = {0};
+        put32(tf, 1);                       /* base_data_offset */
+        uint64_t base = ~(uint64_t)0 - 4;
+        for (int i = 0; i < 8; i++) tf[4 + i] = (uint8_t)(base >> (56 - 8 * i));
+        put32(tr, 0x301); put32(tr + 4, 1); put32(tr + 8, 0); put32(tr + 12, 1000); put32(tr + 16, 10);
+        box(&traf2, "tfhd", tf, sizeof tf);
+        box(&traf2, "trun", tr, sizeof tr);
+        box(&moof2, "traf", traf2.s, traf2.n);
+        box(&seg2, "moof", moof2.s, moof2.n);
+        mp4sub_init bad = {.kind = MP4SUB_STPP, .timescale = 1000};
+        EQI(mp4sub_parse((const uint8_t *)seg2.s, seg2.n, &bad, vt_cb, NULL), 0);
+        sb_clear(&traf2); sb_clear(&moof2); sb_clear(&seg2);
+        uint8_t tf2[8] = {0, 2, 0, 0, 0, 0, 0, 1}, tr2[8] = {0};
+        put32(tr2 + 4, 0xffffffffu);        /* sample_count, полей нет и size по умолчанию 0 */
+        box(&traf2, "tfhd", tf2, sizeof tf2);
+        box(&traf2, "trun", tr2, sizeof tr2);
+        box(&moof2, "traf", traf2.s, traf2.n);
+        box(&seg2, "moof", moof2.s, moof2.n);
+        EQI(mp4sub_parse((const uint8_t *)seg2.s, seg2.n, &bad, vt_cb, NULL), 0);
+        sb_free(&seg2); sb_free(&traf2); sb_free(&moof2);
+    }
     /* голый TTML-сегмент и WebVTT — тем же входом */
     vt_n = 0;
     EQI(webvtt_segment("\n<tt><body><p begin=\"1s\" end=\"2s\">XML</p></body></tt>", 52, NULL, vt_cb, NULL), 1);
@@ -2004,6 +2029,33 @@ static void test_lang(void) {
     }
 }
 
+static void test_epg_urls(void) {
+    playlist p = {0};
+    strlist o = {0};
+    p.epg_mode = EPG_MINE;
+    p.user_epg = "http://a/epg\nhttp://a/epg\nhttp://b/epg";
+    repo_epg_urls(&p, &o);
+    EQI(o.n, 2);
+    EQS(o.v[0], "http://a/epg");
+    EQS(o.v[1], "http://b/epg");
+    sl_clear(&o);
+    p.epg_mode = EPG_BOTH;
+    p.user_epg = "http://a/epg";
+    p.header_epg = "http://a/epg\nhttp://b/epg";
+    repo_epg_urls(&p, &o);
+    EQI(o.n, 2);
+    EQS(o.v[0], "http://a/epg");
+    EQS(o.v[1], "http://b/epg");
+    sl_clear(&o);
+    p.epg_mode = EPG_PLAYLIST;
+    p.user_epg = NULL;
+    p.header_epg = "http://c/epg\nhttp://c/epg";
+    repo_epg_urls(&p, &o);
+    EQI(o.n, 1);
+    EQS(o.v[0], "http://c/epg");
+    sl_clear(&o);
+}
+
 static void test_clock(void) {
     P.tz = 12;   /* +3 ч в четвертях */
     int64_t t = 1700000000;   /* 2023-11-14 22:13:20 UTC = 01:13 15.11 МСК */
@@ -2062,6 +2114,7 @@ int main(void) {
     dvbsub_sample();
     cc_sample();
     test_lang();
+    test_epg_urls();
     test_clock();
     char cmd[300];
     snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
