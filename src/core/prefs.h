@@ -40,6 +40,8 @@ typedef struct {
     int pin_ask;
     int pin_input;
     char pin[8];
+    /* выбранные дорожки — предпочитаются на других каналах (как Prefs.audioLang/subtitleLang) */
+    char audio_pref[96], sub_pref[48];
     /* TMDB: ключ v3 или токен v4, адреса API и картинок (пусто — стандартные) */
     char tmdb_key[300], tmdb_api[300], tmdb_img[300];
     /* где остановились */

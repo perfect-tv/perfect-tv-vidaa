@@ -55,6 +55,10 @@ void prefs_load(void) {
     }
     const char *s = store_get("pin");
     snprintf(P.pin, sizeof P.pin, "%s", s ? s : "");
+    s = store_get("audio_pref");
+    snprintf(P.audio_pref, sizeof P.audio_pref, "%s", s ? s : "");
+    s = store_get("sub_pref");
+    snprintf(P.sub_pref, sizeof P.sub_pref, "%s", s ? s : "");
     s = store_get("tmdb_key");
     snprintf(P.tmdb_key, sizeof P.tmdb_key, "%s", s ? s : "");
     s = store_get("tmdb_api");
@@ -109,6 +113,8 @@ void prefs_save(void) {
         store_set(t[i].key, b);
     }
     store_set("pin", P.pin[0] ? P.pin : NULL);
+    store_set("audio_pref", P.audio_pref[0] ? P.audio_pref : NULL);
+    store_set("sub_pref", P.sub_pref[0] ? P.sub_pref : NULL);
     store_set("tmdb_key", P.tmdb_key[0] ? P.tmdb_key : NULL);
     store_set("tmdb_api", P.tmdb_api[0] ? P.tmdb_api : NULL);
     store_set("tmdb_img", P.tmdb_img[0] ? P.tmdb_img : NULL);

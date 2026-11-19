@@ -175,7 +175,13 @@ static void activate(ent *e, int dir) {
     }
     case A_AUDIO: {
         int n = pl_audio_count(), cur = pl_audio_selected();
-        if (n > 1) pl_audio_select(((cur + (dir ? dir : 1)) % n + n) % n);
+        if (n > 1) {
+            int ni = ((cur + (dir ? dir : 1)) % n + n) % n;
+            if (pl_audio_select(ni) == 0) {
+                snprintf(P.audio_pref, sizeof P.audio_pref, "%s", pl_audio_label(ni));
+                prefs_save();
+            }
+        }
         break;
     }
     case A_ASPECT:

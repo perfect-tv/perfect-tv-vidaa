@@ -171,6 +171,7 @@ static void really_play(channel *c, const char *gkey, int arc, int64_t t, double
     if (!c) return;
     if (c != T.cur) {
         T.scored = 0;
+        T.audio_pref_done = 0;
         repo_add_history(c);
         /* субтитры включали на этом канале — поток сразу через ретранслятор */
         T.cur = c;
@@ -561,6 +562,7 @@ void tv_restart(void) {
     T.group[0] = 0;
     T.arc = T.paused = T.seeking = 0;
     T.pin_passed = 0;
+    T.audio_pref_done = 0;
     pin_session = 0;                   /* «один раз до выхода» не переживает смену базы настроек */
     T.info_pinned = T.info_expanded = 0;
     T.dig[0] = 0;
@@ -609,6 +611,15 @@ void tv_tick(double now) {
                 if (T.direct_pending && !T.relayed && T.cur) { set_direct(T.cur); fprintf(stderr, "relay_direct_saved\n"); }
                 T.direct_pending = 0;
                 app_dirty();
+            }
+            if (!T.audio_pref_done) {
+                int na = pl_audio_count();
+                if (!P.audio_pref[0]) T.audio_pref_done = 1;
+                else if (na > 0) {
+                    T.audio_pref_done = 1;
+                    for (int i = 0; i < na; i++)
+                        if (!strcmp(pl_audio_label(i), P.audio_pref)) { pl_audio_select(i); break; }
+                }
             }
             if (now - T.playing_since > 30) T.attempts = 0;
             if (!T.scored && now - T.playing_since > 300) { T.scored = 1; repo_add_score(T.cur); }

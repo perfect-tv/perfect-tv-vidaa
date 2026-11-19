@@ -147,6 +147,7 @@ static const char *store_key(void) {
 /* сохранённый выбор канала (прежнее «1» — телетекст) */
 void subs_load(void) {
     const char *v = T.cur ? store_get(store_key()) : NULL;
+    if (!v || !*v) v = P.sub_pref[0] ? P.sub_pref : NULL;   /* язык/дорожка — на других каналах */
     snprintf(T.sub_key, sizeof T.sub_key, "%s", !v ? "" : !strcmp(v, "1") ? "ttx" : v);
     T.subs = T.sub_key[0] != 0;
 }
@@ -155,6 +156,8 @@ void subs_select(const char *key) {
     snprintf(T.sub_key, sizeof T.sub_key, "%s", key ? key : "");
     T.subs = T.sub_key[0] != 0;
     if (T.cur) store_set(store_key(), T.subs ? T.sub_key : NULL);
+    snprintf(P.sub_pref, sizeof P.sub_pref, "%s", T.subs ? T.sub_key : "");
+    prefs_save();
     if (!T.subs) { relay_dvb_select(-1); relay_cc_select(0, 0); webvtt_stop(); }
     app_dirty();
 }
