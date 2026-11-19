@@ -843,6 +843,7 @@ static void load_reminders(void) {
         snprintf(r->title, sizeof r->title, "%s", json_str(json_get(o, "title"), ""));
         r->num = (int)json_int(json_get(o, "num"), 0);
         r->playlist = (int)json_int(json_get(o, "playlist"), 0);
+        r->archive_days = (int)json_int(json_get(o, "archive_days"), 0);
         r->start = json_int(json_get(o, "start"), 0);
         r->stop = json_int(json_get(o, "stop"), 0);
         r->snooze = json_int(json_get(o, "snooze"), 0);
@@ -855,8 +856,8 @@ void repo_reminders_save(void) {
     sb_add(&b, "[");
     for (int i = 0; i < R.nrem; i++) {
         reminder *r = &R.rem[i];
-        sb_printf(&b, "%s\n{\"num\":%d,\"playlist\":%d,\"start\":%lld,\"stop\":%lld,\"snooze\":%lld,\"shown\":%d", i ? "," : "", r->num, r->playlist,
-                  (long long)r->start, (long long)r->stop, (long long)r->snooze, r->shown);
+        sb_printf(&b, "%s\n{\"num\":%d,\"playlist\":%d,\"archive_days\":%d,\"start\":%lld,\"stop\":%lld,\"snooze\":%lld,\"shown\":%d", i ? "," : "", r->num, r->playlist,
+                  r->archive_days, (long long)r->start, (long long)r->stop, (long long)r->snooze, r->shown);
         jput(&b, "key", r->key, 1);
         jput(&b, "name", r->name, 1);
         jput(&b, "logo", r->logo, 1);
@@ -884,6 +885,7 @@ void repo_reminder_add(const channel *c, const prog *p) {
     snprintf(r->title, sizeof r->title, "%s", p->title);
     r->num = c->num;
     r->playlist = repo_cur() ? repo_cur()->id : 0;
+    r->archive_days = repo_has_archive(c) ? c->archive_days : 0;
     r->start = p->start;
     r->stop = p->stop;
     repo_reminders_save();

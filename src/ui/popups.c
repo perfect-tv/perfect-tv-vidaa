@@ -342,8 +342,10 @@ static channel *rem_channel(const reminder *r) {
     return p && p->id == r->playlist ? repo_by_key(r->key) : NULL;
 }
 static int rem_archive(const reminder *r) {
-    channel *c = rem_channel(r);
-    return c && repo_has_archive(c) && r->start >= clock_now() - (int64_t)c->archive_days * 86400;
+    /* глубина архива записана при создании: у чужого плейлиста канала здесь нет */
+    int days = r->archive_days;
+    if (days <= 0) { channel *c = rem_channel(r); days = c && repo_has_archive(c) ? c->archive_days : 0; }
+    return days > 0 && r->start >= clock_now() - (int64_t)days * 86400;
 }
 static void rem_rebuild(void) {
     int64_t now = clock_now();

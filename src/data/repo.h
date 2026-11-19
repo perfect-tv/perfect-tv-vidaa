@@ -53,6 +53,7 @@ typedef struct {
 typedef struct {
     char key[160], name[200], logo[600];
     int num, playlist;
+    int archive_days;            /* глубина архива канала на момент напоминания: чужой плейлист не загружен */
     int64_t start, stop;
     char title[200];
     int64_t snooze;              /* показать не раньше */
