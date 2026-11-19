@@ -10,6 +10,7 @@
 #include "core/clock.h"
 #include "core/lang.h"
 #include "core/prefs.h"
+#include "core/logocache.h"
 #include "data/catchup.h"
 #include "data/loaders.h"
 #include "player/player.h"
@@ -683,6 +684,8 @@ void tv_tick(double now) {
     loaders_tick();
     layer_tick_all(now);
     if (d_marquee_active() && now >= mq_next) { mq_next = now + 0.033; app_dirty(); }   /* бегущая строка */
+    static double logo_trim_at;
+    if (now >= logo_trim_at) { logo_trim_at = now + 5; logo_trim(); }
     if (T.open_at && now >= T.open_at) { T.open_at = 0; start_stream(); }
     if (T.dig[0] && now - T.dig_at > DIGIT_SECONDS) digits_apply();
     subs_apply();

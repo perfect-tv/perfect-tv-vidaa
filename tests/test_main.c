@@ -38,6 +38,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include "core/http.h"
+#include "core/logocache.h"
+#include "img.h"
 
 extern const unsigned char ptv_font_regular[], ptv_font_regular_end[], ptv_font_bold[], ptv_font_bold_end[];
 
@@ -668,6 +670,20 @@ static void test_usb(const char *tmp) {
     usb_root r[4];
     CHECK(usb_roots(r, 4) >= 1 && !strcmp(r[0].path, d) && !strcmp(r[0].name, "usb"));
     unsetenv("PTV_USB_ROOT");
+}
+
+/* ---------- кэш логотипов: картинка с диска декодируется без сети ---------- */
+static void test_logocache(void) {
+    static const unsigned char png[] = {137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1,8,6,0,0,0,31,21,196,137,
+        0,0,0,13,73,68,65,84,120,218,99,252,207,192,80,15,0,4,133,1,128,132,169,140,33,0,0,0,0,73,69,78,68,174,66,96,130};
+    char path[700];
+    CHECK(logo_cache_path("http://logo.invalid/a.png", path, sizeof path) == 1);
+    if (!path[0]) return;
+    CHECK(!file_write_atomic(path, png, sizeof png));
+    const gfx_image *im = logo_img("http://logo.invalid/a.png", 8, 8, IMG_FIT);
+    CHECK(im && im->w == 8 && im->h == 8);
+    logo_clear();
+    CHECK(!file_exists(path));
 }
 
 /* ---------- напоминания: глубина архива хранится в самом напоминании ---------- */
@@ -2117,6 +2133,7 @@ int main(void) {
     }
     test_phone();
     test_usb(dir);
+    test_logocache();
     test_reminders();
     test_backup();
     test_tmdb();

@@ -10,6 +10,7 @@
 #include "core/clock.h"
 #include "core/lang.h"
 #include "core/prefs.h"
+#include "core/logocache.h"
 #include "core/relay.h"
 #include "data/epg.h"
 #include "player/player.h"
@@ -365,7 +366,7 @@ static void action(item *it) {
     case I_TMDB_REMOVE: confirm_open(tr(S_TMDB_REMOVE), tr(S_DELETE), tmdb_remove_yes, NULL); break;
     case I_BACKUP_SAVE: save_backup(); break;
     case I_BACKUP_RESTORE: restore_open(); break;
-    case I_CLEAR_LOGOS: img_cache_clear(); tv_toast(tr(S_LOGOS_CLEARED)); break;
+    case I_CLEAR_LOGOS: img_cache_clear(); logo_clear(); tv_toast(tr(S_LOGOS_CLEARED)); break;
     case I_CLEAR_EPG: confirm_open(tr(S_CLEAR_EPG), tr(S_DELETE), clear_epg_yes, NULL); break;
     case I_DIAG: diag_open(); break;
     default: break;

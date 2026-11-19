@@ -18,6 +18,7 @@
     "src/core/cookies.c",
     "src/core/unpack.c",
     "src/core/qr.c",
+    "src/core/logocache.c",
     "src/core/phone.c",
     "src/core/usb.c",
     "src/core/ttx.c",

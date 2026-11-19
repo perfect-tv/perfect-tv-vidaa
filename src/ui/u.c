@@ -2,6 +2,7 @@
 #include "app.h"
 #include "img.h"
 #include "core/prefs.h"
+#include "core/logocache.h"
 #include "data/repo.h"
 #include <math.h>
 #include <stdio.h>
@@ -513,16 +514,23 @@ int d_image(gfx_t *g, const char *url, int x, int y, int w, int h, int r, int co
     return 1;
 }
 
+static int logo_draw(gfx_t *g, const char *url, int x, int y, int w, int h) {
+    const gfx_image *im = logo_img(url, w, h, IMG_FIT);
+    if (!im) return 0;
+    gfx_image_draw(g, im, x, y, 0, 255);
+    return 1;
+}
+
 void d_logo(gfx_t *g, const channel *c, int x, int y, int w, int h, int r, int badge, int on_white) {
     const char *url = repo_logo(c);
     int pad = (int)(h * 0.14);
     int have = 0;
     if (url && *url) {
         d_round(g, x, y, w, h, r, on_white ? C_LOGO_PLATE : C_FILL_SOFT);
-        have = d_image(g, url, x + pad, y + pad, w - 2 * pad, h - 2 * pad, 0, 0);
+        have = logo_draw(g, url, x + pad, y + pad, w - 2 * pad, h - 2 * pad);
         if (!have) {   /* плейлист не отдал картинку — пробуем второй источник (программа/плейлист) */
             const char *alt = repo_logo_alt(c, url);
-            if (alt && *alt && strcmp(alt, url)) have = d_image(g, alt, x + pad, y + pad, w - 2 * pad, h - 2 * pad, 0, 0);
+            if (alt && *alt && strcmp(alt, url)) have = logo_draw(g, alt, x + pad, y + pad, w - 2 * pad, h - 2 * pad);
         }
     }
     if (!have) {
