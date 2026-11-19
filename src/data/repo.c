@@ -182,38 +182,74 @@ static void save_list(const strlist *l, const char *kind) {
     store_set(ukey(kind), s && *s ? s : NULL);
     free(s);
 }
-static void load_set(smap *m, const char *kind) {
+/* «Скрытое» и очки — общие для всех плейлистов (как в Android), в отличие от избранного/истории/замков. */
+static void load_list_key(strlist *l, const char *key) { sl_from_lines(l, store_get(key)); }
+static void save_list_key(const strlist *l, const char *key) {
+    char *s = sl_join(l, "\n");
+    store_set(key, s && *s ? s : NULL);
+    free(s);
+}
+static void load_set_key(smap *m, const char *key) {
     smap_free(m);
     smap_init(m, 16);
     strlist l = {0};
-    load_list(&l, kind);
+    load_list_key(&l, key);
     for (int i = 0; i < l.n; i++) smap_set(m, l.v[i], 1);
     sl_clear(&l);
 }
-static void save_set(const smap *m, const char *kind) {
+static void save_set_key(const smap *m, const char *key) {
     strlist l = {0};
     for (int i = 0; i < m->cap; i++) if (m->keys[i] && m->vals[i]) sl_add(&l, m->keys[i]);
-    save_list(&l, kind);
+    save_list_key(&l, key);
     sl_clear(&l);
 }
-static void load_scores(void) {
-    smap_free(&R.scores);
-    smap_init(&R.scores, 64);
+static void load_scores_key(const char *key, int add) {
+    if (!add) { smap_free(&R.scores); smap_init(&R.scores, 64); }
     strlist l = {0};
-    load_list(&l, "score");
+    load_list_key(&l, key);
     for (int i = 0; i < l.n; i++) {
         char *t = strrchr(l.v[i], '\t');
         if (!t) continue;
         *t = 0;
-        smap_set(&R.scores, l.v[i], atoi(t + 1));
+        int v = atoi(t + 1);
+        if (add) v += smap_get(&R.scores, l.v[i], 0);
+        smap_set(&R.scores, l.v[i], v);
     }
     sl_clear(&l);
 }
-static void save_scores(void) {
+static void save_scores_key(void) {
     sbuf b = {0};
     for (int i = 0; i < R.scores.cap; i++) if (R.scores.keys[i] && R.scores.vals[i] > 0) sb_printf(&b, "%s\t%d\n", R.scores.keys[i], R.scores.vals[i]);
-    store_set(ukey("score"), b.n ? b.s : NULL);
+    store_set("score", b.n ? b.s : NULL);
     sb_free(&b);
+}
+
+/* Старые hidc.<id>/hidg.<id>/score.<id> — слить в общие и убрать: до Android-паритета они были у плейлиста. */
+static void migrate_global_userdata(void) {
+    char key[48];
+    for (int i = 0; i < R.npl; i++) {
+        int id = R.pl[i].id;
+        strlist l = {0};
+        snprintf(key, sizeof key, "hidc.%d", id);
+        load_list_key(&l, key);
+        for (int k = 0; k < l.n; k++) smap_set(&R.hidden_ch, l.v[k], 1);
+        sl_clear(&l);
+        snprintf(key, sizeof key, "hidg.%d", id);
+        load_list_key(&l, key);
+        for (int k = 0; k < l.n; k++) smap_set(&R.hidden_gr, l.v[k], 1);
+        sl_clear(&l);
+        snprintf(key, sizeof key, "score.%d", id);
+        load_scores_key(key, 1);
+        snprintf(key, sizeof key, "hidc.%d", id);
+        store_set(key, NULL);
+        snprintf(key, sizeof key, "hidg.%d", id);
+        store_set(key, NULL);
+        snprintf(key, sizeof key, "score.%d", id);
+        store_set(key, NULL);
+    }
+    save_set_key(&R.hidden_ch, "hidc");
+    save_set_key(&R.hidden_gr, "hidg");
+    save_scores_key();
 }
 
 /* ---------- каналы ---------- */
@@ -494,7 +530,7 @@ int repo_recent(const channel *cur, channel **out, int max) {
 int repo_is_hidden(const channel *c) { return smap_get(&R.hidden_ch, c->key, 0) || smap_get(&R.hidden_gr, c->group, 0); }
 void repo_hide_channel(const channel *c) {
     smap_set(&R.hidden_ch, c->key, 1);
-    save_set(&R.hidden_ch, "hidc");
+    save_set_key(&R.hidden_ch, "hidc");
     /* название скрытого — для списка «Скрытое» */
     char k[200];
     snprintf(k, sizeof k, "hname.%s", c->key);
@@ -504,13 +540,13 @@ void repo_hide_channel(const channel *c) {
 void repo_hide_group(const char *key) {
     if (!strcmp(key, FAV_KEY) || !strcmp(key, ALL_KEY)) return;
     smap_set(&R.hidden_gr, key, 1);
-    save_set(&R.hidden_gr, "hidg");
+    save_set_key(&R.hidden_gr, "hidg");
     repo_apply_view();
 }
 void repo_unhide(int is_group, const char *key) {
     smap *m = is_group ? &R.hidden_gr : &R.hidden_ch;
     smap_set(m, key, 0);
-    save_set(m, is_group ? "hidg" : "hidc");
+    save_set_key(m, is_group ? "hidg" : "hidc");
     repo_apply_view();
 }
 int repo_hidden_count(void) {
@@ -531,12 +567,12 @@ void repo_set_locked(int is_group, const char *key, int on) {
 }
 void repo_add_score(const channel *c) {
     smap_set(&R.scores, c->key, smap_get(&R.scores, c->key, 0) + 1);
-    save_scores();
+    save_scores_key();
 }
 void repo_reset_scores(void) {
     smap_free(&R.scores);
     smap_init(&R.scores, 16);
-    save_scores();
+    save_scores_key();
     repo_apply_view();
 }
 
@@ -873,9 +909,6 @@ int repo_select(int index) {
     load_list(&R.history, "hist");
     load_list(&R.locked_ch, "lockc");
     load_list(&R.locked_gr, "lockg");
-    load_set(&R.hidden_ch, "hidc");
-    load_set(&R.hidden_gr, "hidg");
-    load_scores();
     int rc = load_channels(p->id);
     repo_apply_view();
     repo_open_epg();
@@ -906,9 +939,10 @@ void repo_reload(void) {
 void repo_init(void) {
     load_playlists();
     load_reminders();
-    smap_init(&R.hidden_ch, 16);
-    smap_init(&R.hidden_gr, 16);
-    smap_init(&R.scores, 16);
+    load_set_key(&R.hidden_ch, "hidc");
+    load_set_key(&R.hidden_gr, "hidg");
+    load_scores_key("score", 0);
+    migrate_global_userdata();
     R.cur = -1;
     repo_gc_epg();
     int idx = R.npl ? 0 : -1;
