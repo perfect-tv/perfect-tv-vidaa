@@ -41,8 +41,13 @@ enum {
     I_RELAY_ALL, I_RELAY_DIRECT,
     I_TMDB_KEY, I_TMDB_PHONE, I_TMDB_API, I_TMDB_IMG, I_TMDB_TEST, I_TMDB_REMOVE,
     I_BACKUP_SAVE, I_BACKUP_RESTORE, I_CLEAR_LOGOS, I_CLEAR_EPG, I_DATA_DIR, I_DIAG,
-    I_VERSION, I_SOURCE, I_LICENSE,
+    I_VERSION, I_TELEGRAM, I_DONATE, I_SOURCE, I_LICENSE,
 };
+
+/* ссылки «О программе» — как у Android-версии (core/About.kt) плюс репозиторий этого приложения */
+#define ABOUT_TELEGRAM "https://t.me/perfect_tv_app"
+#define ABOUT_DONATE "https://boosty.to/rootu/donate"
+#define ABOUT_SOURCE "https://github.com/perfect-tv/perfect-tv-vidaa"
 typedef struct { int id; char label[200], sub[300], value[200]; int choice; } item;
 
 static struct { int sec, zone, focus, top; item it[64]; int n; } ST;
@@ -184,9 +189,11 @@ static void build(void) {
         add(I_DIAG, tr(S_DIAGNOSTICS), tr(S_DIAGNOSTICS_SUB), NULL, 0);
         break;
     case SEC_ABOUT:
-        add(I_VERSION, tr(S_VERSION), NULL, PTV_VERSION, 0);
-        add(I_SOURCE, tr(S_SOURCE_CODE), "https://github.com/perfect-tv", NULL, 0);
-        add(I_LICENSE, tr(S_LICENSE), tr(S_LICENSE_TEXT), NULL, 0);
+        add(I_VERSION, "Perfect TV", tr(S_ABOUT_SUB), PTV_VERSION, 0);
+        add(I_TELEGRAM, tr(S_ABOUT_TELEGRAM), tr(S_ABOUT_TELEGRAM_SUB), "t.me/perfect_tv_app", 0);
+        add(I_DONATE, tr(S_ABOUT_DONATE), tr(S_ABOUT_DONATE_SUB), "boosty.to/rootu/donate", 0);
+        add(I_SOURCE, tr(S_SOURCE_CODE), tr(S_ABOUT_GITHUB_SUB), "github.com/perfect-tv/perfect-tv-vidaa", 0);
+        add(I_LICENSE, tr(S_LICENSE), tr(S_LICENSE_SHORT), NULL, 0);
         break;
     }
     if (ST.focus >= ST.n) ST.focus = ST.n - 1;
@@ -376,6 +383,10 @@ static void action(item *it) {
     case I_CLEAR_LOGOS: img_cache_clear(); logo_clear(); tv_toast(tr(S_LOGOS_CLEARED)); break;
     case I_CLEAR_EPG: confirm_open(tr(S_CLEAR_EPG), tr(S_DELETE), clear_epg_yes, NULL); break;
     case I_DIAG: diag_open(); break;
+    case I_TELEGRAM: qr_open(tr(S_ABOUT_TELEGRAM), ABOUT_TELEGRAM); break;
+    case I_DONATE: qr_open(tr(S_ABOUT_DONATE), ABOUT_DONATE); break;
+    case I_SOURCE: qr_open(tr(S_SOURCE_CODE), ABOUT_SOURCE); break;
+    case I_LICENSE: text_open(tr(S_LICENSE), tr(S_LICENSE_TEXT)); break;
     default: break;
     }
 }

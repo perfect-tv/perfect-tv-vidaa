@@ -9,6 +9,7 @@
 #include "core/clock.h"
 #include "core/lang.h"
 #include "core/prefs.h"
+#include "core/qr.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -16,6 +17,11 @@
 static void window(gfx_t *g, int x, int y, int w, int h) {
     d_fill(g, 0, 0, SW, SH, C_OVERLAY);
     d_round(g, x, y, w, h, E(1), C_POPUP);
+}
+/* то же, но панель плотная: окна «О программе» открываются поверх настроек, сквозь них не должно быть видно строк */
+static void window_solid(gfx_t *g, int x, int y, int w, int h) {
+    d_fill(g, 0, 0, SW, SH, C_OVERLAY);
+    d_round(g, x, y, w, h, E(1), C_POPUP | 0xff000000u);
 }
 static int button(gfx_t *g, int x, int y, const char *label, int focused) {
     int w = d_text_w(1.25, F_S, label) + E(3), h = E(3);
@@ -548,4 +554,74 @@ void choose_open(const char *title, const char *const *items, int n, int sel, ch
     CH.fn = fn;
     CH.ctx = ctx;
     layer_push(&CHL);
+}
+
+/* ================= ссылка QR-кодом ================= */
+/* На ТВ ссылку не нажать: показываем её QR-кодом, телефон наводят на экран (как в «Ввод с телефона»). */
+static struct { char title[160], url[400]; uint8_t m[QR_SIZE][QR_SIZE]; int ok; } QR;
+static layer QRL;
+
+static int qr_key(layer *l, int k, int ev) {
+    (void)l;
+    if (ev == EV_SHORT && (k == KEY_BACK || k == KEY_OK)) layer_pop(&QRL);
+    return 1;
+}
+static void qr_draw(layer *l, gfx_t *g) {
+    (void)l;
+    /* белая подложка с полем в 4 модуля: без него телефоны читают хуже; модуль — целое число пикселей */
+    int mod = E(24) / (QR_SIZE + 8), plate = mod * (QR_SIZE + 8);
+    int w = E(62), h = E(5.4) + plate + E(4), x = (SW - w) / 2, y = (SH - h) / 2;
+    window_solid(g, x, y, w, h);
+    d_text(g, x + E(2), y + E(1.6), 1.6, F_B, C_WHITE, QR.title, w - E(4));
+    int qx = x + E(2), qy = y + E(5.4);
+    int tx = qx + plate + E(2.4), tw = x + w - E(2) - tx;
+    if (QR.ok) {
+        d_round(g, qx, qy, plate, plate, E(0.6), 0xffffffffu);
+        for (int r = 0; r < QR_SIZE; r++)
+            for (int c = 0; c < QR_SIZE; c++)
+                if (QR.m[r][c]) d_fill(g, qx + (c + 4) * mod, qy + (r + 4) * mod, mod, mod, 0xff000000u);
+    } else d_round(g, qx, qy, plate, plate, E(0.6), C_FILL);
+    const char *shown = strstr(QR.url, "://");
+    shown = shown ? shown + 3 : QR.url;
+    int ty = qy;
+    ty += d_lines(g, tx, ty, tw - E(1), 1.3, F_S, C_WHITE, shown, 3, 0.1) * d_line_h(1.3, F_S) + E(1.2);
+    d_lines(g, tx, ty, tw - E(1), 1.2, F_R, C_TEXT3, tr(S_ABOUT_SCAN_HINT), 3, 0.2);
+    hint hs = {0, tr(S_K_OK), tr(S_H_CLOSE)};
+    d_hints(g, x + E(2), y + h - E(2), &hs, 1);
+}
+void qr_open(const char *title, const char *url) {
+    QRL.name = "qr";
+    QRL.key = qr_key;
+    QRL.draw = qr_draw;
+    snprintf(QR.title, sizeof QR.title, "%s", title ? title : "");
+    snprintf(QR.url, sizeof QR.url, "%s", url ? url : "");
+    QR.ok = !qr_encode(QR.url, QR.m);
+    layer_push(&QRL);
+}
+
+/* ================= текст с переносом (лицензии) ================= */
+static struct { char title[120], text[1600]; } TX;
+static layer TXL;
+
+static int tx_key(layer *l, int k, int ev) {
+    (void)l;
+    if (ev == EV_SHORT && (k == KEY_BACK || k == KEY_OK)) layer_pop(&TXL);
+    return 1;
+}
+static void tx_draw(layer *l, gfx_t *g) {
+    (void)l;
+    int w = E(64), h = E(30), x = (SW - w) / 2, y = (SH - h) / 2;
+    window_solid(g, x, y, w, h);
+    d_text(g, x + E(2), y + E(1.6), 1.5, F_B, C_WHITE, TX.title, w - E(4));
+    d_lines(g, x + E(2), y + E(5), w - E(4), 1.2, F_R, C_TEXT2, TX.text, 16, 0.35);
+    hint hs = {0, tr(S_K_OK), tr(S_H_CLOSE)};
+    d_hints(g, x + E(2), y + h - E(2), &hs, 1);
+}
+void text_open(const char *title, const char *text) {
+    TXL.name = "text";
+    TXL.key = tx_key;
+    TXL.draw = tx_draw;
+    snprintf(TX.title, sizeof TX.title, "%s", title ? title : "");
+    snprintf(TX.text, sizeof TX.text, "%s", text ? text : "");
+    layer_push(&TXL);
 }

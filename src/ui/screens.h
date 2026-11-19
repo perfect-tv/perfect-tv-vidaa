@@ -33,6 +33,9 @@ void confirm_open(const char *text, const char *yes, confirm_fn yes_fn, void *ct
 /* выбор из списка: OK — fn(index) */
 typedef void (*choose_fn)(int index, void *ctx);
 void choose_open(const char *title, const char *const *items, int n, int selected, choose_fn fn, void *ctx);
+/* Ссылка QR-кодом (Настройки → О программе) и текст с переносом (лицензии) */
+void qr_open(const char *title, const char *url);
+void text_open(const char *title, const char *text);
 
 /* pin.c */
 typedef void (*pin_fn)(void *ctx);

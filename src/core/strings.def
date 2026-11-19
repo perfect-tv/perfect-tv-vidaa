@@ -403,8 +403,18 @@ S(S_DIAG_FREE, "Free space", "Свободно")
 S(S_VERSION, "Version", "Версия")
 S(S_SOURCE_CODE, "Source code", "Исходный код")
 S(S_LICENSE, "License", "Лицензия")
-S(S_LICENSE_TEXT, "GNU GPL 3.0. Libraries: FreeType, zlib, OpenSSL (Apache 2.0), FFmpeg (LGPL 2.1+), stb_image; fonts Noto Sans and Onest (SIL OFL). This product uses the TMDB API but is not endorsed or certified by TMDB.",
-  "GNU GPL 3.0. Библиотеки: FreeType, zlib, OpenSSL (Apache 2.0), FFmpeg (LGPL 2.1+), stb_image; шрифты Noto Sans и Onest (SIL OFL). Приложение использует TMDB API, но не одобрено и не сертифицировано TMDB.")
+S(S_LICENSE_TEXT, "GNU GPL 3.0. Libraries: FreeType, zlib, OpenSSL (Apache 2.0), FFmpeg (LGPL 2.1+), stb_image; fonts Noto Sans and Onest (SIL OFL). This product uses the TMDB API but is not endorsed or certified by TMDB. VIDAA and Hisense are trademarks of their owners; Perfect TV is an independent app, the name and logo are not covered by the GPL.",
+  "GNU GPL 3.0. Библиотеки: FreeType, zlib, OpenSSL (Apache 2.0), FFmpeg (LGPL 2.1+), stb_image; шрифты Noto Sans и Onest (SIL OFL). Приложение использует TMDB API, но не одобрено и не сертифицировано TMDB. VIDAA и Hisense — товарные знаки их владельцев; Perfect TV — независимое приложение, название и логотип лицензией GPL не охвачены.")
+/* «О программе»: ссылок на ТВ не нажать — окно с QR-кодом (popups.c, qr_open) */
+S(S_ABOUT_SUB, "IPTV player for VIDAA: playlist, guide, archive",
+  "IPTV-плеер для VIDAA: плейлист, программа, архив")
+S(S_ABOUT_TELEGRAM, "Telegram channel", "Телеграм-канал")
+S(S_ABOUT_TELEGRAM_SUB, "news, new versions, questions", "новости, новые версии, вопросы")
+S(S_ABOUT_DONATE, "Support the project", "Поддержать проект")
+S(S_ABOUT_DONATE_SUB, "if you like the app — thank you!", "если программа нравится — спасибо!")
+S(S_ABOUT_GITHUB_SUB, "GitHub: code, bugs and suggestions", "GitHub: код, ошибки и предложения")
+S(S_ABOUT_SCAN_HINT, "Point your phone camera at the code", "Наведите камеру телефона на код")
+S(S_LICENSE_SHORT, "GNU GPL 3.0 and third-party libraries", "GNU GPL 3.0 и сторонние библиотеки")
 S(S_SETTINGS_HINT_SECTIONS, "↑ ↓ — section, → or OK — items, Back — exit", "↑ ↓ — раздел, → или OK — пункты, «Назад» — выйти")
 S(S_SETTINGS_HINT_ITEMS, "↑ ↓ — item, ← → — value, OK — next value or action, Back — sections", "↑ ↓ — пункт, ← → — значение, OK — следующее значение или действие, «Назад» — к разделам")
 S(S_HOURS_EVERY, "%d h", "%d ч")
