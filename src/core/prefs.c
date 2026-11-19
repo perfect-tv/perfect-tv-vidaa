@@ -22,6 +22,7 @@ static int_pref *ints(int *n) {
         {"guide_header", &P.guide_header, 0},
         {"guide_desc", &P.guide_desc, 0},
         {"marquee", &P.marquee, 1},
+        {"kbd_abc", &P.kbd_abc, 0},
         {"up_key", &P.up_key, UP_SCHEDULE},
         {"hints", &P.hints, 1},
         {"adaptive", &P.adaptive, 0},

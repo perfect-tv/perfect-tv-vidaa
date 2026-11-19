@@ -2,6 +2,7 @@
 #include "keys.h"
 #include "u.h"
 #include "core/lang.h"
+#include "core/prefs.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -12,6 +13,13 @@ static const char *const RU[3][COLS] = {{"й", "ц", "у", "к", "е", "н", "г
 static const char *const EN[3][COLS] = {{"q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "-"},
                                         {"a", "s", "d", "f", "g", "h", "j", "k", "l", ":", "_"},
                                         {"z", "x", "c", "v", "b", "n", "m", ".", "/", "?", "@"}};
+/* по алфавиту — как SearchLayer у Android (те же три строки) */
+static const char *const RU_ABC[3][COLS] = {{"а", "б", "в", "г", "д", "е", "ё", "ж", "з", "и", "й"},
+                                            {"к", "л", "м", "н", "о", "п", "р", "с", "т", "у", "ф"},
+                                            {"х", "ц", "ч", "ш", "щ", "ъ", "ы", "ь", "э", "ю", "я"}};
+static const char *const EN_ABC[3][COLS] = {{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"},
+                                            {"l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v"},
+                                            {"w", "x", "y", "z", "+", "'", ",", ".", "?", "*", ";"}};
 static const char *const SY[3][COLS] = {{"http://", "https://", "www.", ".m3u", ".m3u8", ".xml", ".gz", ".com", ".ru", ".tv", "/"},
                                         {"!", "#", "$", "%", "&", "*", "(", ")", "=", "+", ";"},
                                         {"'", "\"", ",", "~", "[", "]", "{", "}", "|", "\\", "^"}};
@@ -42,6 +50,7 @@ static int svc_col(int i) { int c = 0; for (int k = 0; k < i; k++) c += SVC_SPAN
 static const char *kb_label(const kb *k, int r, int c) {
     if (r == 3) return DG[c];
     if (k->sym) return SY[r][c];
+    if (P.kbd_abc) return k->lang ? RU_ABC[r][c] : EN_ABC[r][c];
     return k->lang ? RU[r][c] : EN[r][c];
 }
 int kb_long(const kb *k, int key) { return key == KEY_OK && k->row == 4 && svc_at(k->col) == K_BKSP; }
