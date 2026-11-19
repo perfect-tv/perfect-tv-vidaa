@@ -100,6 +100,13 @@ static void set_epg(const char *t, void *c) {
     else if (*t) sl_add(&PF.epg, t);
 }
 
+/* Режим программы сохраняется сразу при переключении: «Назад» не должен отменять выбор. */
+static void save_epg_mode(void) {
+    if (PF.index < 0 || PF.index >= R.npl) return;
+    R.pl[PF.index].epg_mode = PF.epg_mode;
+    repo_save_playlists();
+}
+
 static void save(void) {
     if (!PF.url[0]) { tv_toast(tr(S_ERR_NO_URL)); return; }
     playlist *p;
@@ -153,6 +160,7 @@ static void from_usb(const char *path, int epg, void *c) {
     if (epg) {
         if (sl_find(&PF.epg, path) < 0) sl_add(&PF.epg, path);
         if (PF.epg_mode == EPG_PLAYLIST) PF.epg_mode = EPG_BOTH;
+        save_epg_mode();
         tv_toast(tr(S_USB_EPG_ADDED));
         return;
     }
@@ -167,6 +175,7 @@ static void from_phone(const phone_result *r, void *c) {
     if (r->epg[0] && sl_find(&PF.epg, r->epg) < 0) {
         sl_add(&PF.epg, r->epg);
         if (PF.epg_mode == EPG_PLAYLIST) PF.epg_mode = EPG_BOTH;
+        save_epg_mode();
     }
     PF.focus = buttons_row();
     PF.btn = 0;
@@ -188,7 +197,11 @@ static int pf_key(layer *l, int k, int ev) {
         }
         return 1;
     }
-    if (f == F_EPG_MODE && (k == KEY_LEFT || k == KEY_RIGHT || k == KEY_OK)) { PF.epg_mode = (PF.epg_mode + (k == KEY_LEFT ? 2 : 1)) % 3; return 1; }
+    if (f == F_EPG_MODE && (k == KEY_LEFT || k == KEY_RIGHT || k == KEY_OK)) {
+        PF.epg_mode = (PF.epg_mode + (k == KEY_LEFT ? 2 : 1)) % 3;
+        save_epg_mode();
+        return 1;
+    }
     if (k != KEY_OK || ev != EV_SHORT) return 1;
     if (f == F_NAME) form_text(tr(S_PLAYLIST_NAME), PF.name, 0, set_name, NULL);
     else if (f == F_URL) form_text(tr(S_PLAYLIST_URL), PF.url, 0, set_url, NULL);
