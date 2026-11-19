@@ -58,7 +58,6 @@ static struct {
     int swallow;            /* после долгого — до отпускания ничего */
     int hold;               /* ↑/↓: свой повтор */
     double next;            /* следующий шаг повтора */
-    int colors;
 } K;
 
 static int top_has_long(int k) { return layer_count() ? layer_top_has_long(k) : tv_has_long(k); }
@@ -73,7 +72,6 @@ static int no_hold(void) { layer *t = layer_top(); return t && t->no_hold; }
 void keys_raw(int code, int value) {
     int k = keys_map(code);
     if (!k) return;
-    if (k >= KEY_RED && k <= KEY_BLUE) K.colors = 1;
     if (k == KEY_HOME) { if (value == 1) { fprintf(stderr, "exit_key=home\n"); app_quit(); } return; }
     double now = app_now();
     if (value == 1) {
@@ -123,4 +121,4 @@ void keys_tick(double now) {
     }
 }
 
-int keys_has_colors(void) { return K.colors; }
+

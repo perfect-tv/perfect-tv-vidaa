@@ -122,7 +122,7 @@ static void fb_draw(layer *l, gfx_t *g) {
         d_text_mid(g, x + E(2.2), ry + (rh - E(0.3)) / 2, 1.25, dir ? F_S : F_R, fg, name, w - E(4.4) - rw);
         if (right[0]) d_text_r(g, x + w - E(2.2) - (dir ? E(1.8) : 0), ry + (rh - E(0.3)) / 2 - d_line_h(1.1, F_R) / 2, 1.1, F_R, fg2, right);
     }
-    hint hs[2] = {{0, "OK", tr(S_USB_OPEN)}, {0, tr(S_K_BACK), tr(S_USB_UP)}};
+    hint hs[2] = {{0, tr(S_K_OK), tr(S_USB_OPEN)}, {0, tr(S_K_BACK), tr(S_USB_UP)}};
     d_hints(g, x + E(2), y + h - E(2.2), hs, 2);
 }
 

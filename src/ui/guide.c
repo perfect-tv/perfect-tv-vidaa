@@ -33,6 +33,8 @@ static struct {
 } G;
 
 static layer L;
+static char num_buf[6];      /* набор номера канала в гиде — сбрасывается при открытии */
+static double num_at;
 
 int guide_is_open(void) { return layer_has(&L); }
 static group *cur_group(void) { return G.gi >= 0 && G.gi < R.ngroups ? &R.groups[G.gi] : NULL; }
@@ -226,14 +228,12 @@ static int key(layer *l, int k, int ev) {
         else if (k == KEY_RIGHT) { if (list_mode()) { progs_to_now(); G.zone = Z_PROGS; } else grid_enter(); }
         else if (k == KEY_OK && ev == EV_SHORT) play_focused();
         else if (IS_DIGIT(k) && ev == EV_SHORT) {
-            static char buf[6];
-            static double at;
             double t = app_now();
-            if (t - at > 1.5) buf[0] = 0;
-            at = t;
-            size_t bl = strlen(buf);
-            if (bl < 4) { buf[bl] = (char)('0' + k - KEY_D0); buf[bl + 1] = 0; }
-            int num = atoi(buf);
+            if (t - num_at > 1.5) num_buf[0] = 0;
+            num_at = t;
+            size_t bl = strlen(num_buf);
+            if (bl < 4) { num_buf[bl] = (char)('0' + k - KEY_D0); num_buf[bl + 1] = 0; }
+            int num = atoi(num_buf);
             for (int i = 0; i < n; i++) if (g->ch[i]->num == num) { G.ci = i; fit(); break; }
         } else if (k == KEY_BACK && ev == EV_SHORT) layer_pop(&L);
         else if (k == KEY_GREEN || k == KEY_GUIDE) layer_pop(&L);
@@ -812,6 +812,8 @@ void guide_open(int to_programmes) {
     L.covers = 0;   /* под гидом видно видео (затемнение сверху плотнее) */
     G.rows = 10;
     G.rev = R.rev;
+    num_buf[0] = 0;
+    num_at = 0;
     sync_from_tv();
     G.zone = Z_CH;
     G.live_window = 1;

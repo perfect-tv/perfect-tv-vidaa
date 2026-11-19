@@ -83,7 +83,7 @@ static void ph_draw(layer *l, gfx_t *g) {
     } else {
         d_lines(g, tx, ty, tw, 1.3, F_S, C_ARCHIVE, PH.err[0] ? PH.err : tr(S_PHONE_EXPIRED), 3, 0.2);
     }
-    hint hs[2] = {{0, tr(S_K_BACK), tr(S_CLOSE)}, {0, "OK", tr(S_PHONE_NEW)}};
+    hint hs[2] = {{0, tr(S_K_BACK), tr(S_CLOSE)}, {0, tr(S_K_OK), tr(S_PHONE_NEW)}};
     d_hints(g, x + E(2), y + h - E(2.2), hs, PH.ok ? 1 : 2);
 }
 
