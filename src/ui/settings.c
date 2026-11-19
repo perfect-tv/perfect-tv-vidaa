@@ -321,6 +321,17 @@ static int key(layer *l, int k, int ev) {
     if (k == KEY_BACK && ev == EV_SHORT) { ST.zone = 0; return 1; }
     item *it = ST.n ? &ST.it[ST.focus] : NULL;
     if (!it) return 1;
+    /* порядок плейлистов — ←/→ на строке плейлиста (repo_move_playlist уже есть) */
+    if (it->id >= I_PL && it->id < I_PL + R.npl && (k == KEY_LEFT || k == KEY_RIGHT)) {
+        int i = it->id - I_PL, dir = k == KEY_RIGHT ? 1 : -1, j = i + dir;
+        if (j >= 0 && j < R.npl) {
+            repo_move_playlist(i, dir);
+            ST.focus = j;
+            build();
+            app_dirty();
+        }
+        return 1;
+    }
     if (k == KEY_LEFT) { if (it->choice) change(it, -1); else ST.zone = 0; return 1; }
     if (k == KEY_RIGHT) { if (it->choice) change(it, 1); return 1; }
     if (k == KEY_OK && ev == EV_SHORT) action(it);
