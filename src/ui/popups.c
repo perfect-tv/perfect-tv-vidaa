@@ -338,7 +338,8 @@ static layer RML;
 static int rem_missed(const reminder *r) { return r->start <= clock_now() - 60 && r->stop <= clock_now(); }
 static channel *rem_channel(const reminder *r) {
     playlist *p = repo_cur();
-    return p && p->id == r->playlist ? repo_by_key(r->key) : repo_by_key(r->key);
+    /* чужой плейлист: канал ищется только в нём, а не по одноимённому в текущем */
+    return p && p->id == r->playlist ? repo_by_key(r->key) : NULL;
 }
 static int rem_archive(const reminder *r) {
     channel *c = rem_channel(r);
@@ -346,9 +347,12 @@ static int rem_archive(const reminder *r) {
 }
 static void rem_rebuild(void) {
     int64_t now = clock_now();
+    playlist *cp = repo_cur();
+    int curid = cp ? cp->id : 0;
     RM.n = 0;
     for (int i = 0; i < R.nrem && RM.n < 32; i++) {
         reminder *r = &R.rem[i];
+        if (r->playlist != curid) continue;   /* показывать в своём плейлисте, не в чужом */
         if (r->snooze > now) continue;
         int due = r->start - (int64_t)P.remind_before * 60 <= now && now < r->stop;
         int missed = r->stop <= now && !r->shown && rem_archive(r);
@@ -425,11 +429,14 @@ static void rem_draw(layer *l, gfx_t *g) {
 }
 void reminders_check(void) {
     if (layer_has(&RML)) { int cur = RM.idx[RM.cur]; rem_rebuild(); if (!RM.user_moved) for (int i = 0; i < RM.n; i++) if (RM.idx[i] == cur) RM.cur = i; if (!RM.n) layer_pop(&RML); return; }
-    /* пропущенные без архива — убрать */
+    /* пропущенные без архива — убрать; напоминания другого плейлиста не трогаем:
+     * их канал здесь не загружен, а при переходе в тот плейлист они ещё нужны */
     int64_t now = clock_now();
+    playlist *cp = repo_cur();
+    int curid = cp ? cp->id : 0;
     for (int i = R.nrem - 1; i >= 0; i--) {
         reminder *r = &R.rem[i];
-        if (r->stop <= now && (!rem_archive(r) || r->start < now - 30 * 86400)) repo_reminder_remove(i);
+        if (r->playlist == curid && r->stop <= now && (!rem_archive(r) || r->start < now - 30 * 86400)) repo_reminder_remove(i);
     }
     rem_rebuild();
     if (!RM.n) return;
