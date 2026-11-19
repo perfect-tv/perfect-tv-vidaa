@@ -998,6 +998,14 @@ static void up_answer(int c, const char *req) {
             sent += w;
             atomic_store(&UP.big_sent, sent);
         }
+    } else if (strstr(req, "GET /live/slow.ts")) {   /* тело идёт кусками: первые байты — задолго до конца */
+        static char blk[8192];
+        memset(blk, 0x47, sizeof blk);
+        snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", (int)(2 * sizeof blk));
+        if (send(c, head, strlen(head), 0) < 0) return;
+        if (send(c, blk, sizeof blk, MSG_NOSIGNAL) < 0) return;
+        usleep(900000);
+        if (send(c, blk, sizeof blk, MSG_NOSIGNAL) < 0) return;
     } else if (strstr(req, "GET /live/subs/ru.m3u8") && strstr(req, "User-Agent: Test/1") && strstr(req, "\r\nCookie: sid=abc\r\n")) {
         const char *pl = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nru0.vtt\n#EXT-X-ENDLIST\n";
         snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", strlen(pl));
@@ -1115,6 +1123,29 @@ static void relay_backpressure(const char *bigurl, const char *segurl) {
     close(slow);
 }
 
+/* тело отдаётся по мере чтения, а не после конца ответа: провайдер молчит 0,9 с — байты уже у плеера */
+static void relay_streaming(const char *src) {
+    char rurl[4096];
+    CHECK(!relay_url(src, NULL, rurl, sizeof rurl));
+    int fd = relay_sock(rurl);
+    CHECK(fd >= 0);
+    double t0 = mono_now(), first = -1;
+    sbuf b = {0};
+    char buf[4096];
+    struct timeval tv = {3, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    ssize_t r;
+    while ((r = recv(fd, buf, sizeof buf, 0)) > 0) {
+        sb_addn(&b, buf, (size_t)r);
+        if (first < 0 && b.n >= 8192) first = mono_now() - t0;   /* первые 8 КБ — до конца ответа */
+        if (mono_now() - t0 > 2) break;
+    }
+    close(fd);
+    CHECK(first >= 0 && first < 0.6);   /* первые 8 КБ пришли, пока провайдер ещё спит */
+    CHECK(b.n >= 2 * 8192);
+    sb_free(&b);
+}
+
 /* несколько запросов в одном соединении с ретранслятором (keep-alive со стороны плеера) */
 static int two_on_one(const char *relay_url_a, const char *relay_url_b) {
     const char *pa = strstr(relay_url_a + 7, "/"), *pb = strstr(relay_url_b + 7, "/");
@@ -1201,6 +1232,11 @@ static void test_relay_http(void) {
     CHECK(body && n == UP.seg.n);
     free(body);
     EQI(atomic_load(&UP.conns), 2);
+    {   /* сквозная отдача: куски HLS/TS не копятся в ретрансляторе */
+        char slow[300];
+        snprintf(slow, sizeof slow, "http://127.0.0.1:%d/live/slow.ts", UP.port);
+        relay_streaming(slow);
+    }
     /* keep-alive к плееру: два запроса в одном соединении, второй — кусками (длина у провайдера неизвестна) */
     char churl[300], rch[4096];
     snprintf(churl, sizeof churl, "http://127.0.0.1:%d/live/chunked.ts", UP.port);

@@ -5,6 +5,7 @@
 #include "layer.h"
 #include "screens.h"
 #include "u.h"
+#include "core/http.h"
 #include "core/relay.h"
 #include "core/ttx.h"
 #include "core/clock.h"
@@ -15,6 +16,7 @@
 #include "data/loaders.h"
 #include "player/player.h"
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -111,6 +113,111 @@ static void open_url(const char *url, const char *hdr, double start) {
     pl_open(url, hdr, start, T.arc);
 }
 
+/* ---------- прогрев ретранслятора при листании ---------- */
+/* Пока идёт задержка переключения (ZAP_DELAY), тянем главный плейлист канала через ретранслятор: DNS, TCP и TLS
+ * к провайдеру, плейлист и соединение остаются в его пуле — плееру не платить за них при открытии. Прямой TS
+ * (не плейлист) читаем только началом: хватит DNS/TCP/TLS. Свой поток «ptv-warm», новая заявка отменяет прежнюю;
+ * интерфейс не ждёт. */
+typedef struct { char url[4096], hdr[1024]; volatile int *cancel; } warm_job;
+static pthread_mutex_t warm_mu = PTHREAD_MUTEX_INITIALIZER;
+static volatile int *warm_cur;
+
+static void warm_cancel(void) {
+    pthread_mutex_lock(&warm_mu);
+    if (warm_cur) *warm_cur = 1;
+    warm_cur = NULL;
+    pthread_mutex_unlock(&warm_mu);
+}
+
+/* Один запрос прогрева: читаем начало; плейлист (начинается с #EXTM3U) — целиком в body, чтобы вытащить вариант. */
+static long warm_read(const char *url, volatile int *cancel, int *hls, char **body) {
+    hs_req rq = {.url = url, .timeout_ms = 4000, .cancel = cancel};
+    char err[80] = "";
+    hs *h = hs_open(&rq, err, sizeof err);
+    if (!h) return 0;
+    sbuf b = {0};
+    char buf[4096], head[8];
+    size_t hn = 0;
+    int decided = 0;
+    long r, n = 0;
+    if (hls) *hls = 0;
+    while (!*cancel && (r = hs_read(h, buf, sizeof buf)) > 0) {
+        if (hls && !decided) {   /* первое чтение может прийти куском: ждём семь байт «#EXTM3U» */
+            for (long i = 0; i < r && hn < 7; i++) head[hn++] = buf[i];
+            if (hn >= 7) { *hls = !strncmp(head, "#EXTM3U", 7); decided = 1; }
+        }
+        n += r;
+        if (hls && *hls) { if (b.n < (1u << 20)) sb_addn(&b, buf, (size_t)r); }
+        else if (decided && n >= 4096) break;   /* не плейлист: хватит DNS/TCP/TLS */
+        if (n > (2l << 20)) break;              /* плейлисты маленькие: дальше — только зря тянуть */
+    }
+    hs_close(h);
+    if (body) *body = b.s;
+    else sb_free(&b);
+    return n;
+}
+
+static void *warm_thread(void *vp) {
+    warm_job *j = vp;
+    char relay[16384];
+    double t0 = app_now();
+    long total = 0, total2 = 0;
+    int hls = 0, hls2 = 0;
+    if (!relay_url(j->url, j->hdr, relay, sizeof relay) && !*j->cancel) {
+        char *body = NULL;
+        total = warm_read(relay, j->cancel, &hls, &body);
+        /* главный плейлист: вариант — тоже плейлист (обычно другой хост/CDN) — прогреем и его;
+         * у медиаплейлиста строка без «#» — это сегмент, его качать не будем */
+        if (hls && body && !*j->cancel && !strstr(body, "#EXTINF")) {
+            for (const char *l = body; l && *l && !*j->cancel;) {
+                const char *e = strchr(l, '\n');
+                size_t n = e ? (size_t)(e - l) : strlen(l);
+                while (n && (l[n - 1] == '\r' || l[n - 1] == ' ')) n--;
+                if (n && l[0] != '#' && n < sizeof relay) {
+                    char u[4096];
+                    snprintf(u, sizeof u, "%.*s", (int)n, l);
+                    total2 = warm_read(u, j->cancel, &hls2, NULL);
+                    break;
+                }
+                l = e ? e + 1 : NULL;
+            }
+        }
+        free(body);
+    }
+    fprintf(stderr, "relay_warm hls=%d bytes=%ld variant=%ld ms=%.0f\n", hls, total, total2, (app_now() - t0) * 1000);
+    pthread_mutex_lock(&warm_mu);
+    if (warm_cur == j->cancel) warm_cur = NULL;
+    pthread_mutex_unlock(&warm_mu);
+    free((void *)j->cancel);
+    free(j);
+    return NULL;
+}
+
+static void warm_start(const char *url, const char *hdr) {
+    if (!url || !*url) return;
+    warm_cancel();
+    warm_job *j = calloc(1, sizeof *j);
+    volatile int *c = calloc(1, sizeof *c);
+    if (!j || !c) { free(j); free((void *)c); return; }
+    snprintf(j->url, sizeof j->url, "%s", url);
+    snprintf(j->hdr, sizeof j->hdr, "%s", hdr ? hdr : "");
+    j->cancel = c;
+    pthread_mutex_lock(&warm_mu);
+    warm_cur = c;
+    pthread_mutex_unlock(&warm_mu);
+    pthread_t th;
+    if (pthread_create(&th, NULL, warm_thread, j)) {
+        pthread_mutex_lock(&warm_mu);
+        if (warm_cur == c) warm_cur = NULL;
+        pthread_mutex_unlock(&warm_mu);
+        free((void *)c);
+        free(j);
+        return;
+    }
+    pthread_setname_np(th, "ptv-warm");
+    pthread_detach(th);
+}
+
 static void start_stream(void);
 /* через ретранслятор не открылось — сразу напрямую (попыткой не считается) */
 static void relay_fallback(void) {
@@ -177,6 +284,7 @@ static void remember(void) {
 static void really_play(channel *c, const char *gkey, int arc, int64_t t, double delay) {
     if (!c) return;
     if (preview_active && c != T.cur) preview_commit();
+    T.switch_at = app_now();
     if (c != T.cur) {
         T.scored = 0;
         T.audio_pref_done = 0;
@@ -201,6 +309,12 @@ static void really_play(channel *c, const char *gkey, int arc, int64_t t, double
     tv_show_info(0);
     request_open(delay);
     remember();
+    /* задержка листания — время на прогрев: DNS, TCP, TLS и плейлист уже к открытию плеера */
+    if (!arc && delay >= 0.3 && (T.tap || (P.relay_all && !T.direct))) {
+        char hdr[1024];
+        repo_headers(c, hdr, sizeof hdr);
+        warm_start(c->url, hdr);
+    } else warm_cancel();
 }
 
 typedef struct { channel *c; char group[160]; int arc; int64_t t; int dir; } pin_ctx;
@@ -699,6 +813,11 @@ void tv_tick(double now) {
         if (st == PL_PLAYING) {
             if (!T.playing_since) {
                 T.playing_since = now;
+                if (T.switch_at) {
+                    /* нажатие → открытие потока → первый кадр: по этим числам видно, что тормозит на ТВ */
+                    fprintf(stderr, "switch_ms=%.0f open_ms=%.0f\n", (now - T.switch_at) * 1000, (now - T.opening_since) * 1000);
+                    T.switch_at = 0;
+                }
                 if (T.direct_pending && !T.relayed && T.cur) { set_direct(T.cur); fprintf(stderr, "relay_direct_saved\n"); }
                 T.direct_pending = 0;
                 app_dirty();
