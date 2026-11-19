@@ -171,8 +171,21 @@ void d_vgrad(gfx_t *g, int x, int y, int w, int h, uint32_t top, uint32_t bottom
     for (int j = 0; j < h; j++) d_fill(g, x, y + j, w, 1, mix(top, bottom, (unsigned)(j * 256 / h)));
 }
 void d_hgrad(gfx_t *g, int x, int y, int w, int h, uint32_t left, uint32_t right) {
-    if (w <= 0) return;
-    for (int i = 0; i < w; i++) d_fill(g, x + i, y, 1, h, mix(left, right, (unsigned)(i * 256 / w)));
+    if (w <= 0 || h <= 0) return;
+    int x0 = clipx0(g, x), x1 = clipx1(g, x + w), y0 = clipy0(g, y), y1 = clipy1(g, y + h);
+    int n = x1 - x0;
+    if (n <= 0 || y0 >= y1) return;
+    /* цвет зависит только от x: считаем полосу цветов один раз, дальше — построчно (столбец за столбцом —
+     * каждый пиксель в новой строке кэша, на ТВ это в разы дороже); так же, как d_vgrad, но по x */
+    static uint32_t cc[4096];
+    for (int i = 0; i < n && i < 4096; i++) cc[i] = mix(left, right, (unsigned)((x0 + i - x) * 256 / w));
+    for (int j = y0; j < y1; j++) {
+        uint32_t *r = g->px + (size_t)j * g->stride + x0;
+        for (int i = 0; i < n && i < 4096; i++) {
+            unsigned a = cc[i] >> 24;
+            if (a) r[i] = over(r[i], cc[i], a);
+        }
+    }
 }
 
 /* сглаживание многоугольника: 4×4 выборки на пиксель, правило чётности */
