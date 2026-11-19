@@ -1,3 +1,5 @@
+.idea/
+tools/__pycache__/
 build/
 *.ipk
 *.ppm
