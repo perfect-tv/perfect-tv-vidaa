@@ -662,7 +662,7 @@ static void rtsp_keepalive(up *u, double now);
 static void up_free(up *u) {
     if (u->dead) return;
     u->dead = 1;
-    if (u->dns) u->dns->cancelled = 1;   /* поток DNS ещё работает: итог выбросит цикл */
+    if (u->dns) { u->dns->cancelled = 1; u->dns = NULL; }   /* поток DNS ещё работает: итог выбросит цикл */
     if (u->rt) rtsp_teardown(u);
     if (u->fd >= 0) { epoll_ctl(ep, EPOLL_CTL_DEL, u->fd, NULL); }
     if (u->ssl) SSL_free(u->ssl);
@@ -734,7 +734,9 @@ static void *dns_thread(void *arg) {
         }
         freeaddrinfo(res);
     }
-    if (write(wake_w, &j, sizeof j) != sizeof j) free(j);
+    /* Труба не приняла задачу (переполнена/закрыта): не освобождаем j — на него ещё смотрит u->dns;
+     * цикл освободит его при отмене, иначе задача останется до завершения процесса. */
+    if (write(wake_w, &j, sizeof j) != sizeof j) j->cancelled = 1;
     return NULL;
 }
 
