@@ -1518,6 +1518,20 @@ static void hdr_val(const char *head, const char *name, char *out, size_t cap) {
         if (p) p += 2;
     }
 }
+
+/* Content-Length ответа/запроса RTSP: 0 — заголовка нет, -1 — битый/слишком большой. */
+#define RTSP_BODY_MAX (4u << 20)
+static int rtsp_body_len(const char *head, size_t *out) {
+    char cl_[32];
+    hdr_val(head, "Content-Length", cl_, sizeof cl_);
+    if (!cl_[0]) { *out = 0; return 0; }
+    char *end;
+    long long v = strtoll(cl_, &end, 10);
+    while (*end == ' ' || *end == '\t') end++;
+    if (end == cl_ || *end || v < 0 || v > RTSP_BODY_MAX) return -1;
+    *out = (size_t)v;
+    return 1;
+}
 static void auth_param(const char *h, const char *name, char *out, size_t cap) {
     out[0] = 0;
     const char *p = strcasestr(h, name);
@@ -1636,11 +1650,12 @@ static void rtsp_parse(up *u) {
             if (!e) { if (n > 64 * 1024) { rtsp_fail(u, 502, "head"); return; } break; }
             size_t hl = (size_t)(e - (char *)p) + 4;
             char *head = xstrndup((char *)p, hl);
-            char cl_[32];
-            hdr_val(head, "Content-Length", cl_, sizeof cl_);
-            size_t bl = (size_t)atol(cl_);
-            if (n < hl + bl) { free(head); break; }
+            if (!head) { rtsp_fail(u, 502, "memory"); return; }
+            size_t bl;
+            if (rtsp_body_len(head, &bl) < 0) { free(head); rtsp_fail(u, 502, "content_length"); return; }
+            if (bl > n - hl) { free(head); break; }
             char *body = xstrndup((char *)p + hl, bl);
+            if (!body) { free(head); rtsp_fail(u, 502, "memory"); return; }
             const char *sp = strchr(head, ' ');
             int status = sp ? atoi(sp + 1) : 0;
             pos += hl + bl;
@@ -1654,16 +1669,19 @@ static void rtsp_parse(up *u) {
             char *e = memmem(p, n, "\r\n\r\n", 4);
             if (!e) break;
             size_t hl = (size_t)(e - (char *)p) + 4;
-            char *head = xstrndup((char *)p, hl), cl_[32];
-            hdr_val(head, "Content-Length", cl_, sizeof cl_);
+            char *head = xstrndup((char *)p, hl);
+            if (!head) { rtsp_fail(u, 502, "memory"); return; }
+            size_t bl;
+            int bad = rtsp_body_len(head, &bl) < 0;
             free(head);
-            size_t bl = (size_t)atol(cl_);
-            if (n < hl + bl) break;
+            if (bad) { rtsp_fail(u, 502, "content_length"); return; }
+            if (bl > n - hl) break;
             pos += hl + bl;
             continue;
         }
         pos++;
     }
+    if (u->dead) return;   /* rtsp_fail/stream_data могли освободить u->in */
     memmove(u->in, u->in + pos, u->in_n - pos);
     u->in_n -= pos;
 }
