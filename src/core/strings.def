@@ -250,7 +250,7 @@ S(S_SUB_EDGE_OUTLINE, "Outline", "Контур")
 S(S_SUB_EDGE_SHADOW, "Shadow", "Тень")
 S(S_TTX_WAIT, "Waiting for teletext…", "Ждём телетекст…")
 S(S_TTX_NONE, "The stream has no teletext", "В потоке нет телетекста")
-S(S_TTX_DVB_ONLY, "The stream has only DVB (picture) subtitles — they are not shown yet", "В потоке только субтитры DVB (картинками) — их пока не показываем")
+S(S_TTX_DVB_ONLY, "The stream has only DVB (picture) subtitles — turn them on in Subtitles", "В потоке только субтитры DVB (картинками) — включите их в «Субтитры»")
 S(S_TTX_NO_PAGE, "Page %s is not received yet", "Страница %s ещё не пришла")
 /* TMDB */
 S(S_SEC_TMDB, "Descriptions (TMDB)", "Описания (TMDB)")
