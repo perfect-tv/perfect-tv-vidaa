@@ -677,10 +677,12 @@ static void begin(void) {
 
 /* ---------- такт ---------- */
 void tv_tick(double now) {
+    static double mq_next;
     keys_tick(now);
     pl_tick();
     loaders_tick();
     layer_tick_all(now);
+    if (d_marquee_active() && now >= mq_next) { mq_next = now + 0.033; app_dirty(); }   /* бегущая строка */
     if (T.open_at && now >= T.open_at) { T.open_at = 0; start_stream(); }
     if (T.dig[0] && now - T.dig_at > DIGIT_SECONDS) digits_apply();
     subs_apply();

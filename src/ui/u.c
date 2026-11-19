@@ -457,6 +457,38 @@ void d_fade_edges(gfx_t *g, int x, int y, int w, int h, int top, int bottom, uin
     if (bottom) d_vgrad(g, x, y + h - f, w, f, bg & 0xffffffu, bg);
 }
 
+/* ---------- бегущая строка (как MarqueeMath у Android) ---------- */
+#define MQ_PAUSE 1.5
+#define MQ_SPEED 7.0
+typedef struct { unsigned long long h; double t0; } mslot;
+static mslot mq[8];
+static double mq_last;
+static unsigned long long mq_hash(const char *s) {
+    unsigned long long h = 1469598103934665603ull;
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ull; }
+    return h;
+}
+int d_marquee(gfx_t *g, int x, int cy, double em, int face, uint32_t c, const char *s, int width, int active, int slot) {
+    if (!s || !*s || width <= 0) return 0;
+    int tw = d_text_w(em, face, s);
+    if (!active || !P.marquee || tw <= width) { d_text_mid(g, x, cy, em, face, c, s, width); return 0; }
+    double now = app_now(), speed = MQ_SPEED * EM, overflow = tw - width;
+    double scroll = overflow / speed, cycle = 2 * MQ_PAUSE + scroll;
+    mslot *m = &mq[slot & 7];
+    unsigned long long h = mq_hash(s) ^ ((unsigned long long)width << 32);
+    if (m->h != h) { m->h = h; m->t0 = now; }
+    double t = fmod(now - m->t0, cycle);
+    if (t < 0) t += cycle;
+    double off = t <= MQ_PAUSE ? 0 : t >= MQ_PAUSE + scroll ? overflow : (t - MQ_PAUSE) * speed;
+    int lh = d_line_h(em, face);
+    gfx_push_clip(g, x, cy - lh, width, 2 * lh);
+    d_text_mid(g, x - (int)off, cy, em, face, c, s, 0);
+    gfx_pop_clip(g);
+    mq_last = now;
+    return 1;
+}
+int d_marquee_active(void) { return mq_last > 0 && app_now() - mq_last < 0.08; }
+
 /* ---------- картинки и логотипы ---------- */
 /* Картинка ARGB (src: sw×sh) в прямоугольник x, y, w, h — масштаб ближайшим пикселем, честная прозрачность. */
 void d_bitmap(gfx_t *g, const uint32_t *src, int sw, int sh, int x, int y, int w, int h) {

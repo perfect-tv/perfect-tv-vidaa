@@ -75,6 +75,10 @@ int d_lines(gfx_t *g, int x, int y, int w, double em, int face, uint32_t c, cons
 int d_line_h(double em, int face);
 /* по базовой линии (как drawText у Android) */
 int d_text_base(gfx_t *g, int x, int base, double em, int face, uint32_t c, const char *s, int maxw);
+/* Бегущая строка: активная строка, не влезающая в width, едет (пауза 1,5 с → 7 em/с → пауза);
+ * slot — место на экране (0…7), у каждого свой отсчёт. Возвращает 1, пока строка едет. */
+int d_marquee(gfx_t *g, int x, int cy, double em, int face, uint32_t c, const char *s, int width, int active, int slot);
+int d_marquee_active(void);   /* в прошлом кадре что-то ехало — нужен следующий кадр */
 
 /* --- значки (векторные: в шрифтах нет ▶ ❚❚ ⟲ ★) --- */
 enum { I_PLAY, I_PAUSE, I_ARCHIVE, I_CLOCK, I_LOCK, I_HEART, I_STAR, I_CHECK, I_LEFT, I_RIGHT, I_UP, I_DOWN, I_CHEVRON, I_SEARCH,

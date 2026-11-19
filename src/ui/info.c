@@ -229,7 +229,7 @@ void info_draw(gfx_t *g) {
     if (has) snprintf(title, sizeof title, "%s", p.title);
     else if (arch || T.seeking) { char hm[8]; fmt_hm(ref, hm); snprintf(title, sizeof title, "%s %s", tr(S_ARCHIVE), hm); }
     else snprintf(title, sizeof title, "%s", tr(S_NO_PROGRAMME));
-    d_text_mid(g, tx, ct + E(2.4) + E(1.45), 2.2, F_B, C_WHITE, title, tw);
+    d_marquee(g, tx, ct + E(2.4) + E(1.45), 2.2, F_B, C_WHITE, title, tw, 1, 4);
     /* шкала: передача, а без неё — получасовой слот вокруг позиции */
     int64_t from = has ? p.start : ref - ((ref % SLOT) + SLOT) % SLOT, to = has ? p.stop : from + SLOT;
     char a1[8], a2[8], remain[64] = "";

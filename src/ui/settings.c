@@ -33,7 +33,7 @@ enum {
     I_PL = 1000,   /* I_PL + индекс плейлиста */
     I_PL_ADD = 1, I_EPG_SRC, I_EPG_REFRESH,
     I_ARCHIVE_DAYS, I_INFO_HIDE, I_UPKEY, I_START_LAST, I_REMIND, I_ANYCERT, I_ASPECT_P, I_EPG_HOURS, I_PL_HOURS,
-    I_LANG, I_TZ, I_SCALE, I_NUMBER, I_GUIDE_VIEW, I_GUIDE_HEADER, I_GUIDE_DESC, I_HINTS_P, I_LOGO_PRIO,
+    I_LANG, I_TZ, I_SCALE, I_NUMBER, I_GUIDE_VIEW, I_GUIDE_HEADER, I_GUIDE_DESC, I_HINTS_P, I_MARQUEE, I_LOGO_PRIO,
     I_SUB_SIZE, I_SUB_COLOR, I_SUB_BG, I_SUB_EDGE, I_SUB_BOTTOM,
     I_ADAPTIVE_P, I_RESET_SCORES, I_HIDDEN_P,
     I_PIN_SET, I_PIN_CLEAR, I_PIN_ASK, I_PIN_INPUT,
@@ -131,6 +131,7 @@ static void build(void) {
         add(I_GUIDE_HEADER, tr(S_GUIDE_HEADER), NULL, tr(P.guide_header == 1 ? S_HEADER_CHANNEL : P.guide_header == 2 ? S_HEADER_HIDE : S_HEADER_FULL), 1);
         add(I_GUIDE_DESC, tr(S_GUIDE_DESC), tr(S_GUIDE_DESC_SUB), tr(P.guide_desc ? S_ON : S_OFF), 1);
         add(I_HINTS_P, tr(S_HINTS), NULL, tr(P.hints ? S_ON : S_OFF), 1);
+        add(I_MARQUEE, tr(S_MARQUEE), tr(S_MARQUEE_SUB), tr(P.marquee ? S_ON : S_OFF), 1);
         add(I_LOGO_PRIO, tr(S_LOGO_PRIORITY), NULL, tr(P.logo_priority ? S_LOGO_EPG : S_LOGO_PLAYLIST), 1);
         snprintf(v, sizeof v, "%d%%", P.sub_size);
         add(I_SUB_SIZE, tr(S_SUB_SIZE), NULL, v, 1);
@@ -328,6 +329,7 @@ static void change(item *it, int dir) {
     case I_GUIDE_DESC: P.guide_desc = !P.guide_desc; break;
     case I_GUIDE_HEADER: P.guide_header = ((P.guide_header + d) % 3 + 3) % 3; break;
     case I_HINTS_P: P.hints = !P.hints; break;
+    case I_MARQUEE: P.marquee = !P.marquee; break;
     case I_LOGO_PRIO: P.logo_priority = !P.logo_priority; break;
     case I_SUB_SIZE: CYCLE(SUBSIZE, sub_size); break;
     case I_SUB_COLOR: { int i = sel_of(SUBCOL, (int)(sizeof SUBCOL / sizeof SUBCOL[0]), P.sub_color); int n_ = (int)(sizeof SUBCOL / sizeof SUBCOL[0]); i = (i + d + n_) % n_; P.sub_color = SUBCOL[i]; } break;

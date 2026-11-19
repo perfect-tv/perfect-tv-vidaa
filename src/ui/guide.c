@@ -422,7 +422,7 @@ static void draw_top_full(gfx_t *g, channel *c) {
     if (P.number_mode == NUM_NEAR_NAME) snprintf(name, sizeof name, "%d. %s", c->num, c->name);
     else snprintf(name, sizeof name, "%s", c->name);
     d_text_mid(g, x, t + E(0.6), 1.2, F_R, WA(0.7), name, w);
-    d_text_mid(g, x, t + E(2.35), 1.8, F_B, C_WHITE, has ? p.title : tr(S_NO_PROGRAMME), w);
+    d_marquee(g, x, t + E(2.35), 1.8, F_B, C_WHITE, has ? p.title : tr(S_NO_PROGRAMME), w, 1, 3);
     day_range(s, e, range, sizeof range);
     d_text_mid(g, x, t + E(4.05), 1.2, F_R, WA(0.8), range, w);
     if (has && p.desc[0]) d_lines(g, x, t + E(4.9), w, 1.15, F_R, WA(0.65), p.desc, 2, 0);
@@ -436,7 +436,7 @@ static void draw_top_channel(gfx_t *g, channel *c) {
     char name[300], sub[300];
     if (P.number_mode == NUM_NEAR_NAME) snprintf(name, sizeof name, "%d. %s", c->num, c->name);
     else snprintf(name, sizeof name, "%s", c->name);
-    d_text_mid(g, x, t + E(1.5), 1.8, F_B, C_WHITE, name, w);
+    d_marquee(g, x, t + E(1.5), 1.8, F_B, C_WHITE, name, w, 1, 3);
     group *gr = repo_group_of(c, NULL);
     if (repo_has_archive(c)) snprintf(sub, sizeof sub, "%s · %s %s", group_title(gr), tr(S_ARCHIVE), trp(S_DAYS_SHORT, c->archive_days));
     else snprintf(sub, sizeof sub, "%s", group_title(gr));
@@ -499,7 +499,7 @@ static void draw_row(gfx_t *g, channel *c, int l, int y, int r, int h, int focus
     } else x += E(0.5);
     int fav = repo_is_fav(c), locked = repo_is_locked(c), arc = repo_has_archive(c);
     int isz = E(1.5), iw = (fav + locked + arc) * (isz + E(0.35));
-    d_text_mid(g, x, cy, 1.35, c == T.cur ? F_B : F_R, fg, c->name, r - x - E(0.8) - iw);
+    d_marquee(g, x, cy, 1.35, c == T.cur ? F_B : F_R, fg, c->name, r - x - E(0.8) - iw, ch_focus, 0);
     uint32_t ic = ch_focus ? 0xff101010u : WA(0.7);
     int ix = r - E(0.8);
     if (arc) { ix -= isz; d_icon(g, I_ARCHIVE, ix + isz / 2, cy, isz, ic); ix -= E(0.35); }
@@ -538,7 +538,7 @@ static void draw_cells(gfx_t *g, channel *c, int y, int h, int gl, int gr, int64
         }
         if (tw > E(1)) {
             uint32_t fg = foc ? 0xff101010u : past ? WA(0.45) : C_WHITE;
-            if (is_prog) d_text_mid(g, tl, cy, 1.25, F_R, fg, p.title, tw);
+            if (is_prog) d_marquee(g, tl, cy, 1.25, F_R, fg, p.title, tw, foc, 2);
             else if (foc) {
                 char a[8], b[8], t[24];
                 fmt_hm(s, a);
@@ -638,7 +638,7 @@ static void draw_progs(gfx_t *g, int l, int r) {
             }
             if (p.start > now && repo_reminder_find(c->key, p.start) >= 0) { ix -= isz; d_icon(g, I_CLOCK, ix + isz / 2, cy, isz, ic); ix -= E(0.5); }
             int tx = l + E(5.4);
-            d_text_mid(g, tx, cy, 1.35, tall ? F_B : F_R, fg, p.title, ix - tx - E(0.3));
+            d_marquee(g, tx, cy, 1.35, tall ? F_B : F_R, fg, p.title, ix - tx - E(0.3), pf, 1);
             if (tall) {
                 int by = yi + h - E(0.95), bw = r - E(0.8) - tx, bh = E(0.25) > 2 ? E(0.25) : 2;
                 d_round(g, tx, by, bw, bh, bh / 2, pf ? 0x33000000u : WA(0.22));
