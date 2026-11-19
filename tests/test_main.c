@@ -1546,6 +1546,25 @@ static void test_teletext(void) {
     }
     EQI(ttx_glyph(0x41, 0x24), 0x410);   /* «А» */
     EQI(ttx_glyph(0x23, 0), 0xA3);       /* «£» в английском */
+    /* X/26: «е» + ¨ = «ё», знак G2, конец пачки; мозаика и правая половина двойной ширины не трогаются */
+    {
+        ttx_page xp;
+        memset(&xp, 0, sizeof xp);
+        xp.charset = 0x24;
+        xp.has[1] = 1;
+        memset(xp.rows[1], 0x20, 40);
+        xp.rows[1][5] = 0x65;                                 /* е */
+        xp.enh_has = 1;                                        /* пришло обозначение 0 */
+        xp.enh[0][0] = 41 | (0x04 << 6);                       /* группа строки: 41 − 40 = строка 1 */
+        xp.enh[0][1] = 5 | (0x18 << 6) | (0x65 << 11);         /* столбец 5: е + диакритика ¨ */
+        xp.enh[0][2] = 6 | (0x0F << 6) | (0x60 << 11);         /* столбец 6: знак G2 0x60 — «Ω» */
+        xp.enh[0][3] = 40 | (0x1F << 6);                       /* конец */
+        ttx_grid xg;
+        ttx_layout(&xp, NULL, &xg);
+        EQI(xg.ch[40 + 5], 0x451);
+        EQI(xg.ch[40 + 6], 0x3A9);
+        EQI(ttx_g2(0x7F), 0x25A0);
+    }
     relay_reset();
     CHECK(!relay_has_teletext() && ttx_count(relay_ttx()) == 0);
     sb_free(&UP.seg);
