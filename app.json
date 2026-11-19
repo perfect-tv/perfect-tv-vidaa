@@ -19,6 +19,7 @@
     "src/core/unpack.c",
     "src/core/qr.c",
     "src/core/phone.c",
+    "src/core/fwopen.c",
     "src/core/usb.c",
     "src/core/ttx.c",
     "src/core/dvbsub.c",
