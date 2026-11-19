@@ -537,15 +537,28 @@ int mp4sub_parse(const uint8_t *d, size_t n, const mp4sub_init *in, webvtt_cue_f
                 const uint8_t *f = xb + 8;
                 int32_t doff = 0;
                 if ((fl & 1) && xe - f >= 4) { doff = (int32_t)be32(f); f += 4; }
-                if (fl & 4) f += 4;
-                uint64_t off = data_base + (uint64_t)(int64_t)doff, tm = base;
+                if (fl & 4) { if (xe - f < 4) continue; f += 4; }
+                uint64_t off;
+                if (doff < 0) {
+                    uint64_t back = (uint64_t)(-(int64_t)doff);
+                    off = data_base >= back ? data_base - back : UINT64_MAX;
+                } else {
+                    off = data_base > UINT64_MAX - (uint64_t)doff ? UINT64_MAX : data_base + (uint64_t)doff;
+                }
+                uint64_t tm = base;
+                /* trun без полей и без размера по умолчанию не двигает ни f, ни off — цикл был бы до 4·10⁹ */
+                if (!(fl & (0x100 | 0x200 | 0x400 | 0x800)) && !def_size) continue;
+                if (cnt > (1u << 20)) continue;
                 for (uint32_t i = 0; i < cnt && f <= xe; i++) {
                     uint32_t dur = def_dur, size = def_size;
-                    if (fl & 0x100) { if (xe - f < 4) break; dur = be32(f); f += 4; }
-                    if (fl & 0x200) { if (xe - f < 4) break; size = be32(f); f += 4; }
-                    if (fl & 0x400) f += 4;
-                    if (fl & 0x800) f += 4;
-                    if (off + size <= n && size) count += sample(d + off, size, kind, tm / ts, dur / ts, cb, ctx);
+                    size_t left = (size_t)(xe - f);
+                    if (fl & 0x100) { if (left < 4) break; dur = be32(f); f += 4; left -= 4; }
+                    if (fl & 0x200) { if (left < 4) break; size = be32(f); f += 4; left -= 4; }
+                    if (fl & 0x400) { if (left < 4) break; f += 4; left -= 4; }
+                    if (fl & 0x800) { if (left < 4) break; f += 4; }
+                    if (size && off <= n && (uint64_t)size <= (uint64_t)n - off)
+                        count += sample(d + off, size, kind, tm / ts, dur / ts, cb, ctx);
+                    if (off > UINT64_MAX - size) break;
                     off += size;
                     tm += dur;
                 }
