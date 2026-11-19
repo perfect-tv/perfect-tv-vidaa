@@ -233,6 +233,7 @@ static int key(layer *l, int k, int ev) {
         tv_preview_back();
         return 1;
     }
+    if (k == KEY_SEARCH && ev == EV_SHORT) { search_open(); return 1; }   /* поиск из любой зоны гида */
     if (k == KEY_MENU || (k == KEY_OK && ev == EV_LONG && G.zone != Z_PROGS)) {
         channel *c = cur_channel();
         if (c) tv_open_menu(c, g ? g->key : NULL, 1);

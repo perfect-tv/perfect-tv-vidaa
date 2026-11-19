@@ -104,7 +104,12 @@ static void build(void) {
             if (s->loaded_at) { fmt_day(s->loaded_at, d, sizeof d); fmt_hm(s->loaded_at, hm); }
             char when[48];
             snprintf(when, sizeof when, "%s %s", d, hm);
-            if (s->loading) snprintf(sub, sizeof sub, "%s", tr(S_EPG_STATUS_LOADING));
+            if (s->loading) {
+                long progs = 0;
+                int pr = loaders_epg_progress(&progs);   /* общий прогресс загрузки программы */
+                if (pr >= 0) snprintf(sub, sizeof sub, tr(S_EPG_LOADING), pr);
+                else snprintf(sub, sizeof sub, "%s", tr(S_EPG_STATUS_LOADING));
+            }
             else if (s->error[0]) snprintf(sub, sizeof sub, "%s", loaders_error_text(s->error));
             else if (epg_has_data(s)) snprintf(sub, sizeof sub, tr(S_EPG_STATUS_OK), trp(S_PROGRAMMES_N, s->programmes), when);
             else snprintf(sub, sizeof sub, "%s", tr(S_EPG_STATUS_NONE));
