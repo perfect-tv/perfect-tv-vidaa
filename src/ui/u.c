@@ -488,6 +488,10 @@ void d_logo(gfx_t *g, const channel *c, int x, int y, int w, int h, int r, int b
     if (url && *url) {
         d_round(g, x, y, w, h, r, on_white ? C_LOGO_PLATE : C_FILL_SOFT);
         have = d_image(g, url, x + pad, y + pad, w - 2 * pad, h - 2 * pad, 0, 0);
+        if (!have) {   /* плейлист не отдал картинку — пробуем второй источник (программа/плейлист) */
+            const char *alt = repo_logo_alt(c, url);
+            if (alt && *alt && strcmp(alt, url)) have = d_image(g, alt, x + pad, y + pad, w - 2 * pad, h - 2 * pad, 0, 0);
+        }
     }
     if (!have) {
         uint32_t col = c->color;

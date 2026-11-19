@@ -751,6 +751,13 @@ const char *repo_logo(const channel *c) {
     return a && *a ? a : b ? b : "";
 }
 
+const char *repo_logo_alt(const channel *c, const char *used) {
+    const char *a = c->logo, *b = repo_epg_icon(c);
+    if (used && a && !strcmp(used, a)) return b && *b ? b : "";
+    if (used && b && !strcmp(used, b)) return a && *a ? a : "";
+    return "";
+}
+
 /* ---------- воспроизведение ---------- */
 void repo_headers(const channel *c, char *out, size_t cap) {
     sbuf b = {0};

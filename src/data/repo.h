@@ -121,6 +121,7 @@ int repo_prog_at(const channel *c, int64_t t);        /* индекс перед
 int repo_prog_after(const channel *c, int64_t t);     /* первая, начинающаяся не раньше t; -1 */
 const char *repo_epg_icon(const channel *c);
 const char *repo_logo(const channel *c);              /* по приоритету логотипов; "" — нет */
+const char *repo_logo_alt(const channel *c, const char *used);   /* второй источник, если первый не загрузился */
 int repo_epg_loading(void);
 void repo_gc_epg(void);                  /* удалить программу источников, не нужных ни одному плейлисту */
 int repo_epg_users(const char *url, int *ids, int max);   /* id плейлистов с этим источником */
