@@ -55,9 +55,9 @@ python3 tools/pack.py             # build/arm/tv.rootu.perfecttv.ipk (не по�
 
 ### AppId и имя пакета
 
-`appId` (`99009990`) и `package` (`tv.rootu.perfecttv`) в `app.json` — **заглушки**. Их выдаёт сертификат автора
-магазина VIDAA; чужой AppId перезапишет установленное приложение. Перед публикацией заменить на свои
-(или `python3 tools/pack.py --app-id N --package tv.x.y`). `registerName` (`PerfectTVNative`) должен совпадать
+`appId` (`99010100`) и `package` (`tv.rootu.perfecttv`) в `app.json` — из сертификата автора `rootu` в VidaApp Store
+(пакеты `tv.rootu.*`, AppId 99010100–99010199). AppId вне этого диапазона магазин не подпишет, а чужой
+перезапишет установленное приложение. Для другой сборки — `python3 tools/pack.py --app-id N --package tv.x.y`. `registerName` (`PerfectTVNative`) должен совпадать
 со строкой в `src/main.c`.
 
 ## Проверка на ПК

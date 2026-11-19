@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "phone.h"
+#include "fwopen.h"
 #include "lang.h"
 #include "prefs.h"
 #include "util.h"
@@ -46,6 +47,7 @@ void phone_stop(void) {
     for (int i = 0; i < MAX_CONN; i++) if (S.c[i].fd > 0 || S.c[i].buf) conn_close(&S.c[i]);
     if (S.lfd >= 0) close(S.lfd);
     S.lfd = -1;
+    fw_close();
 }
 
 /* Предпочтение: проводная/беспроводная сеть, затем любая не петля; мосты и виртуальные — в последнюю очередь. */
@@ -104,6 +106,7 @@ int phone_start(int kind, char *url, size_t cap, char *err, size_t errn) {
     make_token(S.token);
     S.t_start = mono_now();
     snprintf(url, cap, "http://%s:%d/%s", ip, port, S.token);
+    fw_open(ip, port, (int)LIFETIME + 60);   /* без правила телефон до ТВ не достучится; ошибка не фатальна */
     fprintf(stderr, "phone_start port=%d\n", port);
     return 0;
 }
