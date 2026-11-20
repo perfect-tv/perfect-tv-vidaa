@@ -2,7 +2,7 @@
   "package": "tv.rootu.perfecttv",
   "appId": "99010100",
   "name": "Perfect TV",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "registerName": "PerfectTVNative",
   "binary": "perfecttv-app",
   "envPrefix": "PTV",
